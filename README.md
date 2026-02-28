@@ -1,115 +1,139 @@
+<h1 align="center">VoiceLink</h1>
 <p align="center">
-  <h1 align="center">🔗 VoiceLink</h1>
-  <p align="center">
-    <strong>A bridge between neural TTS models and the Windows system voice API.</strong>
-  </p>
-  <p align="center">
-    Use AI-powered voices in any Windows app — Thorium Reader, Microsoft Edge, Narrator, Balabolka, and more.
-  </p>
+  <strong>Give your Windows apps a voice that actually sounds human.</strong>
 </p>
 
----
+<br>
 
-## The Problem
+## Ever tried listening to an ebook and wanted to throw your laptop?
 
-Windows apps that support text-to-speech (like Thorium Reader for ebooks) rely on **Windows SAPI** (Speech API) to discover and use voices. The built-in Microsoft voices sound robotic and unnatural — fine for notifications, painful for listening to a full book.
+You open Thorium Reader, find a great book, hit "Read Aloud" and... **Microsoft David** starts talking. Flat. Robotic. Zero emotion. Like a GPS navigator reading Shakespeare.
 
-Meanwhile, incredible open-source neural TTS models exist (Kokoro, Piper, Qwen-3 TTS, etc.) that sound nearly human — but **no Windows app can use them** because they don't speak SAPI.
+The same story with Windows Narrator, Edge Read Aloud, or any app that uses the built in Windows voices. They all share the same pool of voices that Microsoft ships, and honestly, they sound like they were recorded in 2005. Because they were.
 
-## The Solution
+Here is the frustrating part: **AI voices that sound almost human already exist.** Open source models like [Kokoro](https://github.com/hexgrad/kokoro), Piper, and Qwen TTS can read text with natural pauses, emotions, and rhythm. The kind of voice you would actually enjoy listening to for hours.
 
-**VoiceLink** is a SAPI-compliant COM driver that acts as a bridge:
+But none of your Windows apps can use them. The apps only know how to talk to Microsoft's voice system (called SAPI). And these AI models don't speak SAPI.
+
+**That is the gap VoiceLink fills.**
+
+<br>
+
+## What VoiceLink actually does
+
+VoiceLink makes AI voices show up as regular Windows voices. No hacks, no workarounds. Your apps do not even know the difference.
+
+Here is how it works:
 
 ```
-┌──────────────────┐       SAPI/COM        ┌──────────────────┐      HTTP/WS       ┌──────────────────┐
-│   Any Windows    │ ───────────────────►  │    VoiceLink     │ ────────────────►  │  TTS Inference   │
-│   App (SAPI)     │   ISpTTSEngine        │   COM Driver     │   localhost:7860   │  Server (Python) │
-│                  │                       │                  │                    │                  │
-│  Thorium Reader  │ ◄─────────────────── │                  │ ◄──────────────── │  Kokoro / Piper  │
-│  Edge Read Aloud │     PCM audio          │                  │    PCM/WAV audio   │  Qwen-3 TTS      │
-│  Narrator        │     streamed back      │                  │    streamed back   │  Any ONNX model  │
-└──────────────────┘                       └──────────────────┘                    └──────────────────┘
+Your App                    VoiceLink                    AI Voice Engine
+(Thorium, Edge, etc.)       (the bridge)                 (Kokoro, Piper, etc.)
+                                                        
+  "Read this text"                                      
+       |                                                
+       +-----> Talks to Windows -----> VoiceLink        
+               voice system           receives the text  
+                                           |            
+                                           +-----> Sends text to the
+                                                   AI model running
+                                                   on your computer
+                                                        |
+                                           <-----+     
+                                      Gets back natural  
+                                      sounding audio     
+       <-----+                             |            
+  Plays the audio            Streams it back to your app 
+  through your speakers                                  
 ```
 
-When Thorium Reader (or any app) asks Windows for a voice, VoiceLink shows up as a system voice. When it receives text, it forwards it to a local inference server running the neural model, receives the audio, and streams it back — all transparently.
+From your app's point of view, VoiceLink is just another voice option in the dropdown list, right next to Microsoft David and Zira. But when you select it, you get studio quality AI speech instead.
 
-## Project Goals
+<br>
 
-1. **Learning-first** — This project is built to deeply understand every layer: COM, SAPI, audio pipelines, TTS models, streaming, and system integration.
-2. **Production-ready** — Clean architecture, proper error handling, installers, CI/CD — not a hacky prototype.
-3. **Universal** — Any Windows SAPI app gets upgraded voices for free.
-4. **Extensible** — Swap TTS models easily. Add new voices without recompiling the driver.
+## Hear the difference
 
-## Architecture
+| Voice | What it sounds like |
+|-------|-------------------|
+| Microsoft David (built in) | Monotone, robotic, reads every sentence the same way |
+| Microsoft Zira (built in) | Slightly better, but still clearly a machine |
+| **VoiceLink + Kokoro** | Natural rhythm, proper emphasis, sounds like a real person reading to you |
 
-The project has three main components:
+*(Audio samples coming soon)*
 
-### 1. TTS Inference Server (`/server`)
-- Python-based HTTP/WebSocket server
-- Loads neural TTS models (Kokoro, Piper, Qwen-3 TTS, etc.)
-- Accepts text → returns streaming PCM audio
-- Can run on CPU or GPU
+<br>
 
-### 2. SAPI COM Bridge (`/bridge`)
-- C++ or Rust COM DLL implementing `ISpTTSEngine` and related interfaces
-- Registers as a Windows system voice
-- Forwards speech requests to the inference server
-- Streams audio back to the SAPI audio sink
+## How to set it up
 
-### 3. System Tray App / Installer (`/app`)
-- Windows installer (NSIS/WiX/MSIX)
-- System tray app for configuration
-- Voice management (download, enable, disable)
-- Health monitoring (is the server running? GPU available?)
+> **Note:** VoiceLink is still being built. A one click installer is coming. For now, here is what the setup will look like.
 
-## Tech Stack
+### What you need
+1. Windows 10 or 11
+2. About 500 MB of free space (for the AI voice model)
+3. A reasonably modern computer (a dedicated GPU helps but is not required)
 
-| Component | Technology | Why |
-|-----------|-----------|-----|
-| Inference Server | Python, FastAPI/WebSocket | Fast prototyping, ML ecosystem |
-| TTS Models | Kokoro, Piper, ONNX Runtime | Open-source, high quality |
-| COM Bridge | C++ or Rust | COM interop, performance |
-| Installer | WiX / MSIX | Windows-native packaging |
-| Tray App | C# WPF or Tauri | Lightweight system UI |
-| CI/CD | GitHub Actions | Automated builds and releases |
+### Installation (coming soon)
+1. Download the VoiceLink installer
+2. Run it (it handles everything: the voice engine, the AI model, and the Windows registration)
+3. Open your favorite app (Thorium Reader, Edge, Narrator, Balabolka, anything with Read Aloud)
+4. Pick a VoiceLink voice from the voice list
+5. Enjoy actually pleasant text to speech
 
-## Current Status
+No terminal. No Python. No configuration files. Just install and go.
 
-🟡 **Phase 0 — Research and Specification**
+<br>
 
-We are currently in the research phase, understanding the Windows SAPI interface, surveying TTS models, and defining the architecture. See [TASKS.md](TASKS.md) for detailed progress.
+## What works today
 
-## Getting Started
+The project is being built in stages. Here is where we are:
 
-> 🚧 The project is in early development. Setup instructions will be added as components are built.
+| Stage | Status | What it means |
+|-------|--------|--------------|
+| Research and understanding | Done | We know exactly how Windows voices work under the hood |
+| AI voice server | Working | A local server that takes text and returns AI generated audio |
+| Windows voice driver | In progress | The piece that makes Windows think our AI voice is a regular system voice |
+| Installer | Planned | The one click setup experience |
+| System tray app | Planned | A little icon in your taskbar to manage voices and settings |
 
-### Prerequisites
-- Windows 10/11
-- Python 3.10+ (for inference server)
-- Visual Studio 2022 or Rust toolchain (for COM bridge)
-- CUDA toolkit (optional, for GPU inference)
+Check [TASKS.md](TASKS.md) for the full breakdown of every single task.
 
-## Learning Journal
+<br>
 
-This project is built with a learning-first approach. Key concepts we are exploring:
+## Under the hood (for the curious)
 
-- **COM (Component Object Model)** — How Windows plugins work at the binary level
-- **SAPI (Speech API)** — Microsoft's speech interface standard
-- **Neural TTS** — How modern text-to-speech models work (transformers, vocoders, mel spectrograms)
-- **Audio Pipelines** — PCM, sample rates, streaming, buffering
-- **System Integration** — COM registration, Windows services, installers
-- **Production Engineering** — CI/CD, error handling, monitoring, auto-updates
+You do not need to understand any of this to use VoiceLink. But if you are the kind of person who likes to know how things work:
 
-## Contributing
+**VoiceLink has three parts:**
 
-This is an open project built for learning. Contributions, questions, and discussions are welcome. Open an issue or start a discussion!
+1. **The Voice Server** runs on your computer and loads the AI model. When it gets text, it generates audio that sounds like a real person. Built with Python and FastAPI.
+
+2. **The Windows Driver** is a small file (a DLL) that registers itself as a Windows voice. When any app asks it to speak, it quietly passes the text to the voice server and streams the audio back. Built with C++.
+
+3. **The Installer** bundles everything together so you never have to touch code. It sets up the server, registers the driver, and downloads the AI model.
+
+The whole thing runs 100% on your computer. No internet needed after setup. No cloud. Your text never leaves your machine.
+
+<br>
+
+## Why this exists
+
+I was reading ebooks in Thorium Reader and the built in voices were genuinely painful to listen to. AI voices that sound incredible exist as open source projects, but there was no simple way to plug them into Windows apps.
+
+So I am building the bridge myself, and learning every layer of how it works along the way. This project is as much about understanding the technology deeply as it is about shipping something useful.
+
+<br>
+
+## Want to help?
+
+This is an open project. Whether you are a developer, a designer, or just someone who wants better voices on Windows, you are welcome here. Open an issue, start a discussion, or just star the repo if you think this should exist.
+
+<br>
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
+MIT. See [LICENSE](LICENSE) for details.
 
----
+<br>
 
 <p align="center">
-  <em>Built by <a href="https://github.com/ManveerAnand">Manveer Anand</a> — learning in public, one component at a time.</em>
+  Built by <a href="https://github.com/ManveerAnand">Manveer Anand</a>. Learning in public, one piece at a time.
 </p>
