@@ -35,6 +35,10 @@
 #include <objbase.h> // CoTaskMemAlloc
 #include <string>
 #include <sstream>
+#include <cmath>     // powf
+#include <algorithm> // std::min, std::max
+#include <vector>    // for volume scaling buffer
+#include <cstdint>   // int16_t
 
 // ============================================================================
 // Constructor / Destructor
@@ -352,12 +356,51 @@ STDMETHODIMP VoiceLinkEngine::Speak(
     VLOG(L"Text to synthesize: %zu bytes (UTF-8)", textUtf8.size());
 
     // -----------------------------------------------------------------------
-    // Step 2: Build the JSON request for the inference server
+    // Step 2: Get rate and volume from SAPI
+    //
+    // ISpTTSEngineSite provides rate and volume that the app or user set:
+    //   GetRate()   → LONG from -10 to +10 (0 = normal)
+    //   GetVolume() → USHORT from 0 to 100 (100 = full volume)
+    //
+    // RATE MAPPING:
+    //   SAPI rate is an abstract scale. We convert it to a speed multiplier:
+    //     speed = 3^(rate/10)
+    //   This gives:
+    //     Rate -10 → 0.33x (very slow)
+    //     Rate  -5 → 0.58x
+    //     Rate   0 → 1.0x  (normal)
+    //     Rate   5 → 1.73x
+    //     Rate  10 → 3.0x  (very fast)
+    //   Clamped to [0.25, 4.0] to match server limits.
+    //
+    // VOLUME MAPPING:
+    //   We scale each PCM sample by (volume / 100.0).
+    //   Volume 100 = no change, Volume 50 = half amplitude, Volume 0 = silence.
     // -----------------------------------------------------------------------
-    std::string jsonBody = BuildTtsRequestJson(textUtf8, m_voiceId, 1.0f);
+
+    LONG sapiRate = 0;
+    pOutputSite->GetRate(&sapiRate);
+
+    USHORT sapiVolume = 100;
+    pOutputSite->GetVolume(&sapiVolume);
+
+    // Convert SAPI rate (-10..+10) to speed multiplier
+    float speed = powf(3.0f, static_cast<float>(sapiRate) / 10.0f);
+    speed = (std::max)(0.25f, (std::min)(4.0f, speed)); // Clamp to server limits
+
+    // Volume as a fraction for PCM scaling
+    float volumeScale = static_cast<float>(sapiVolume) / 100.0f;
+
+    VLOG(L"SAPI rate=%ld → speed=%.2f, volume=%u → scale=%.2f",
+         sapiRate, speed, sapiVolume, volumeScale);
 
     // -----------------------------------------------------------------------
-    // Step 3: Send to server and stream audio back
+    // Step 3: Build the JSON request for the inference server
+    // -----------------------------------------------------------------------
+    std::string jsonBody = BuildTtsRequestJson(textUtf8, m_voiceId, speed);
+
+    // -----------------------------------------------------------------------
+    // Step 4: Send to server and stream audio back
     //
     // The onChunk callback writes each chunk of PCM audio to SAPI.
     // The checkAbort callback checks if the app wants us to stop.
@@ -376,6 +419,37 @@ STDMETHODIMP VoiceLinkEngine::Speak(
         // onChunk: called for each chunk of PCM audio from the server
         [&](const BYTE *data, DWORD size) -> HRESULT
         {
+            // ---------------------------------------------------------------
+            // Apply volume scaling if needed
+            //
+            // The audio is 16-bit signed PCM (int16). To adjust volume,
+            // we multiply each sample by the volume fraction.
+            //
+            // We only do this work if volume != 100 (the common case
+            // skips the copy entirely — zero overhead).
+            // ---------------------------------------------------------------
+
+            const BYTE *writeData = data;
+            std::vector<BYTE> scaledBuf;
+
+            if (volumeScale < 0.999f) // Only scale if volume < 100
+            {
+                scaledBuf.resize(size);
+                const int16_t *src = reinterpret_cast<const int16_t *>(data);
+                int16_t *dst = reinterpret_cast<int16_t *>(scaledBuf.data());
+                DWORD sampleCount = size / sizeof(int16_t);
+
+                for (DWORD i = 0; i < sampleCount; ++i)
+                {
+                    // Scale and clamp to int16 range
+                    float scaled = static_cast<float>(src[i]) * volumeScale;
+                    scaled = (std::max)(-32768.0f, (std::min)(32767.0f, scaled));
+                    dst[i] = static_cast<int16_t>(scaled);
+                }
+
+                writeData = scaledBuf.data();
+            }
+
             // Write audio data to SAPI's output site.
             //
             // ISpTTSEngineSite::Write() is like writing to a pipe:
@@ -386,7 +460,7 @@ STDMETHODIMP VoiceLinkEngine::Speak(
             // The &written output tells us how many bytes SAPI accepted.
             // Usually it's all of them, but we should check.
             ULONG written = 0;
-            HRESULT writeHr = pOutputSite->Write(data, size, &written);
+            HRESULT writeHr = pOutputSite->Write(writeData, size, &written);
 
             if (FAILED(writeHr))
             {
