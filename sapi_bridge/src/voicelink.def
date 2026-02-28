@@ -1,0 +1,29 @@
+; ============================================================================
+; VoiceLink SAPI Bridge — Module Definition File
+; ============================================================================
+;
+; This file tells the linker which functions to export from the DLL.
+;
+; WHY DO WE NEED THIS?
+;   C++ "mangles" function names. A function called "DllGetClassObject"
+;   might become "?DllGetClassObject@@YAJAEBU_GUID@@0PEAPEAX@Z" in the
+;   compiled DLL. COM can't find that!
+;
+;   The .def file forces the linker to export functions with their exact
+;   plain names. This is the standard approach for COM DLLs.
+;
+;   Alternative: Use extern "C" __declspec(dllexport) on each function.
+;   The .def file approach is cleaner and more explicit.
+;
+; PRIVATE keyword means the functions are exported but not part of an
+; import library. Other DLLs won't link against these — only COM's
+; runtime loader uses them.
+; ============================================================================
+
+LIBRARY "voicelink_sapi"
+
+EXPORTS
+    DllGetClassObject   PRIVATE
+    DllCanUnloadNow     PRIVATE
+    DllRegisterServer   PRIVATE
+    DllUnregisterServer PRIVATE
