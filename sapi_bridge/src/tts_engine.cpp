@@ -331,21 +331,22 @@ STDMETHODIMP VoiceLinkEngine::Speak(
     }
 
     // -----------------------------------------------------------------------
-    // Step 1: Extract text from the SPVTEXTFRAG linked list
+    // Step 1: Extract text and fragment-level rate from SPVTEXTFRAG list
     //
     // SAPI doesn't give us a simple string. It gives us a linked list of
     // "text fragments", each with:
     //   - pTextStart: pointer to the text (NOT null-terminated!)
     //   - ulTextLen: number of characters
     //   - State.eAction: what to do (speak, silence, spell out, etc.)
+    //   - State.RateAdj: per-fragment rate adjustment (additive with base rate)
     //   - pNext: next fragment
     //
-    // Example for "Hello, World!":
-    //   Fragment 1: pTextStart="Hello, ", ulTextLen=7, eAction=SPVA_Speak
-    //   Fragment 2: pTextStart="World!", ulTextLen=6, eAction=SPVA_Speak
-    //   Fragment 3: nullptr (end of list)
+    // Some apps (like Chromium/Thorium) pass speed through the fragment's
+    // RateAdj field rather than (or in addition to) ISpVoice::SetRate().
+    // We capture the max RateAdj to combine with the base rate.
     // -----------------------------------------------------------------------
-    std::string textUtf8 = ExtractText(pTextFragList);
+    LONG maxFragRateAdj = 0;
+    std::string textUtf8 = ExtractText(pTextFragList, &maxFragRateAdj);
 
     if (textUtf8.empty())
     {
@@ -359,19 +360,30 @@ STDMETHODIMP VoiceLinkEngine::Speak(
     // Step 2: Get rate and volume from SAPI
     //
     // ISpTTSEngineSite provides rate and volume that the app or user set:
-    //   GetRate()   → LONG from -10 to +10 (0 = normal)
+    //   GetRate()   → LONG from -10 to +10 (0 = normal, base rate)
     //   GetVolume() → USHORT from 0 to 100 (100 = full volume)
     //
-    // RATE MAPPING:
-    //   SAPI rate is an abstract scale. We convert it to a speed multiplier:
-    //     speed = 3^(rate/10)
+    // RATE MAPPING (Thorium/Chromium compatible):
+    //   Chromium maps its Web Speech API rate (0.5x-3x) to SAPI rate using
+    //   approximately: sapi_rate = (int)((web_rate - 1) * 2)
+    //   So Thorium 3x → SAPI rate 4, Thorium 2x → rate 2, etc.
+    //
+    //   To reverse this, we use a linear mapping:
+    //     speed = 1.0 + effectiveRate * 0.5
+    //
     //   This gives:
-    //     Rate -10 → 0.33x (very slow)
-    //     Rate  -5 → 0.58x
-    //     Rate   0 → 1.0x  (normal)
-    //     Rate   5 → 1.73x
-    //     Rate  10 → 3.0x  (very fast)
+    //     Rate -1 → 0.50x (Thorium 0.5x)
+    //     Rate  0 → 1.00x (normal)
+    //     Rate  1 → 1.50x (Thorium 1.5x)
+    //     Rate  2 → 2.00x (Thorium 2x)
+    //     Rate  3 → 2.50x (Thorium 2.5x)
+    //     Rate  4 → 3.00x (Thorium 3x)
+    //     Rate  6 → 4.00x (clamped to server max)
     //   Clamped to [0.25, 4.0] to match server limits.
+    //
+    //   The effective rate combines the base rate (GetRate) with the
+    //   per-fragment RateAdj from the SPVTEXTFRAG state. Some apps set
+    //   one, some set the other, some set both.
     //
     // VOLUME MAPPING:
     //   We scale each PCM sample by (volume / 100.0).
@@ -384,15 +396,19 @@ STDMETHODIMP VoiceLinkEngine::Speak(
     USHORT sapiVolume = 100;
     pOutputSite->GetVolume(&sapiVolume);
 
-    // Convert SAPI rate (-10..+10) to speed multiplier
-    float speed = powf(3.0f, static_cast<float>(sapiRate) / 10.0f);
+    // Combine base rate with fragment-level rate adjustment
+    LONG effectiveRate = sapiRate + maxFragRateAdj;
+
+    // Linear mapping: speed = 1 + rate * 0.5
+    // Matches Chromium's inverse: when Thorium says 3x, rate=4, speed=3.0
+    float speed = 1.0f + static_cast<float>(effectiveRate) * 0.5f;
     speed = (std::max)(0.25f, (std::min)(4.0f, speed)); // Clamp to server limits
 
     // Volume as a fraction for PCM scaling
     float volumeScale = static_cast<float>(sapiVolume) / 100.0f;
 
-    VLOG(L"SAPI rate=%ld → speed=%.2f, volume=%u → scale=%.2f",
-         sapiRate, speed, sapiVolume, volumeScale);
+    VLOG(L"SAPI baseRate=%ld, fragRateAdj=%ld, effective=%ld → speed=%.2f, volume=%u → scale=%.2f",
+         sapiRate, maxFragRateAdj, effectiveRate, speed, sapiVolume, volumeScale);
 
     // -----------------------------------------------------------------------
     // Step 3: Build the JSON request for the inference server
@@ -513,9 +529,11 @@ STDMETHODIMP VoiceLinkEngine::Speak(
 // Private Helpers
 // ============================================================================
 
-std::string VoiceLinkEngine::ExtractText(const SPVTEXTFRAG *pTextFragList)
+std::string VoiceLinkEngine::ExtractText(const SPVTEXTFRAG *pTextFragList, LONG *pMaxRateAdj)
 {
     // Walk the linked list and concatenate all speakable text.
+    // Also capture the maximum RateAdj across all fragments, so we can
+    // factor it into the speed calculation.
     //
     // SPVTEXTFRAG::State.eAction tells us what each fragment represents:
     //   SPVA_Speak   — Normal text to speak (most common)
@@ -527,11 +545,22 @@ std::string VoiceLinkEngine::ExtractText(const SPVTEXTFRAG *pTextFragList)
     // For v1, we handle Speak and SpellOut. Everything else is skipped.
 
     std::wstring fullText;
+    LONG maxRate = 0;
 
     for (const SPVTEXTFRAG *frag = pTextFragList; frag; frag = frag->pNext)
     {
         if (!frag->pTextStart || frag->ulTextLen == 0)
             continue;
+
+        // Log fragment-level rate and volume for diagnostics
+        VLOG(L"Fragment: action=%d, rateAdj=%ld, volume=%u, len=%lu",
+             frag->State.eAction, frag->State.RateAdj,
+             frag->State.Volume, frag->ulTextLen);
+
+        // Track the highest RateAdj across fragments
+        // (Use absolute max — if any fragment wants faster, honor it)
+        if (frag->State.RateAdj > maxRate || frag == pTextFragList)
+            maxRate = frag->State.RateAdj;
 
         switch (frag->State.eAction)
         {
@@ -566,6 +595,10 @@ std::string VoiceLinkEngine::ExtractText(const SPVTEXTFRAG *pTextFragList)
     {
         fullText.pop_back();
     }
+
+    // Output the max fragment rate adjustment
+    if (pMaxRateAdj)
+        *pMaxRateAdj = maxRate;
 
     // Convert UTF-16 (Windows native) to UTF-8 (HTTP server expects)
     return WideToUtf8(fullText.c_str(), static_cast<int>(fullText.size()));

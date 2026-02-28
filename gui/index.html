@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VoiceLink</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+
+  <body>
+    <!-- ===== Sidebar Navigation ===== -->
+    <nav id="sidebar">
+      <div class="sidebar-header">
+        <h2>VoiceLink</h2>
+        <span class="version">v0.1.0</span>
+      </div>
+      <ul class="nav-items">
+        <li class="nav-item active" data-page="dashboard">
+          <svg
+            viewBox="0 0 24 24"
+            width="20"
+            height="20"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+          >
+            <rect x="3" y="3" width="7" height="7" rx="1" />
+            <rect x="14" y="3" width="7" height="7" rx="1" />
+            <rect x="3" y="14" width="7" height="7" rx="1" />
+            <rect x="14" y="14" width="7" height="7" rx="1" />
+          </svg>
+          <span>Dashboard</span>
+        </li>
+        <li class="nav-item" data-page="voices">
+          <svg
+            viewBox="0 0 24 24"
+            width="20"
+            height="20"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+          >
+            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+            <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+            <line x1="12" y1="19" x2="12" y2="23" />
+            <line x1="8" y1="23" x2="16" y2="23" />
+          </svg>
+          <span>Voices</span>
+        </li>
+        <li class="nav-item" data-page="settings">
+          <svg
+            viewBox="0 0 24 24"
+            width="20"
+            height="20"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+          >
+            <circle cx="12" cy="12" r="3" />
+            <path
+              d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"
+            />
+          </svg>
+          <span>Settings</span>
+        </li>
+      </ul>
+    </nav>
+
+    <!-- ===== Main Content ===== -->
+    <main id="content">
+      <!-- Dashboard Page -->
+      <section id="page-dashboard" class="page active">
+        <h1>Dashboard</h1>
+
+        <div class="status-cards">
+          <div class="card server-card">
+            <div class="card-header">
+              <h3>Inference Server</h3>
+              <span id="server-indicator" class="indicator offline"></span>
+            </div>
+            <div class="card-body">
+              <div class="stat-row">
+                <span class="label">Status</span>
+                <span id="server-status" class="value">Checking...</span>
+              </div>
+              <div class="stat-row">
+                <span class="label">Model</span>
+                <span id="server-model" class="value">—</span>
+              </div>
+              <div class="stat-row">
+                <span class="label">Device</span>
+                <span id="server-device" class="value">—</span>
+              </div>
+              <div class="stat-row">
+                <span class="label">Uptime</span>
+                <span id="server-voices" class="value">—</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="card info-card">
+            <div class="card-header">
+              <h3>SAPI Bridge</h3>
+              <span id="sapi-indicator" class="indicator offline"></span>
+            </div>
+            <div class="card-body">
+              <div class="stat-row">
+                <span class="label">Registry</span>
+                <span id="sapi-registry" class="value">Checking...</span>
+              </div>
+              <div class="stat-row">
+                <span class="label">COM DLL</span>
+                <span id="sapi-dll" class="value">—</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card quick-test">
+          <div class="card-header"><h3>Quick Test</h3></div>
+          <div class="card-body">
+            <textarea
+              id="test-text"
+              rows="2"
+              placeholder="Type text to preview..."
+            >
+Hello! VoiceLink is ready.</textarea
+            >
+            <div class="test-controls">
+              <select id="test-voice"></select>
+              <button id="btn-preview" class="btn btn-primary">
+                <svg
+                  viewBox="0 0 24 24"
+                  width="16"
+                  height="16"
+                  fill="currentColor"
+                >
+                  <polygon points="5 3 19 12 5 21 5 3" />
+                </svg>
+                Preview
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Voices Page -->
+      <section id="page-voices" class="page">
+        <div class="page-header">
+          <h1>Voice Manager</h1>
+          <button id="btn-refresh-voices" class="btn btn-secondary">
+            Refresh
+          </button>
+        </div>
+        <div id="voices-list" class="voices-grid">
+          <p class="placeholder">Loading voices...</p>
+        </div>
+      </section>
+
+      <!-- Settings Page -->
+      <section id="page-settings" class="page">
+        <h1>Settings</h1>
+        <div class="card">
+          <div class="card-header"><h3>Server</h3></div>
+          <div class="card-body settings-form">
+            <div class="setting-row">
+              <label>Server URL</label>
+              <input
+                type="text"
+                id="setting-server-url"
+                value="http://127.0.0.1:7860"
+              />
+            </div>
+            <div class="setting-row">
+              <label>Auto-start server</label>
+              <label class="switch">
+                <input type="checkbox" id="setting-autostart" />
+                <span class="slider"></span>
+              </label>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header"><h3>About</h3></div>
+          <div class="card-body">
+            <p>VoiceLink v0.1.0</p>
+            <p class="muted">Neural TTS for Windows SAPI</p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- ===== Rename Modal ===== -->
+    <div id="modal-overlay" class="modal-overlay hidden">
+      <div class="modal">
+        <h3 id="modal-title">Rename Voice</h3>
+        <input type="text" id="modal-input" placeholder="New name..." />
+        <div class="modal-actions">
+          <button id="modal-cancel" class="btn btn-secondary">Cancel</button>
+          <button id="modal-ok" class="btn btn-primary">Save</button>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

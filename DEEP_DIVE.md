@@ -2,7 +2,7 @@
 
 > A living document. This is our knowledge base — everything we learn about TTS, COM, audio, companies, models, and system internals goes here. Not a README. A reference manual built through exploration.
 
-**Last updated:** 2026-02-28 (v2 — added prior art, architecture decision, UX design)
+**Last updated:** 2026-03-01 (v3 — added Tauri GUI architecture, voice toggle design)
 
 ---
 
@@ -20,6 +20,7 @@
 - [10. Architecture Decision](#10-architecture-decision)
 - [11. User Experience Design](#11-user-experience-design)
 - [12. Glossary](#12-glossary)
+- [13. Management GUI (Tauri v2)](#13-management-gui-tauri-v2)
 
 ---
 
@@ -868,6 +869,11 @@ C:\Program Files\VoiceLink\
 | **NSIS** | Nullsoft Scriptable Install System. Free installer builder (used by VLC, Notepad++). |
 | **Embedded Python** | Official Python distribution as a standalone zip (~15MB). No system install needed. |
 | **FastAPI** | Python web framework for building APIs. Supports async, WebSocket, streaming. |
+| **Tauri** | Framework for building desktop apps with Rust backend + web frontend. Uses system WebView2 on Windows. ~5MB binary vs. Electron's ~100MB. |
+| **WebView2** | Microsoft Edge-based web rendering engine. Pre-installed on Windows 10/11. Used by Tauri for the frontend UI. |
+| **invoke()** | Tauri's IPC mechanism. Frontend calls `invoke("command_name", args)` to run Rust functions. |
+| **winreg** | Rust crate for Windows registry access. Used to read/write SAPI voice tokens. |
+| **AudioContext** | Web Audio API interface. Used in the frontend to play PCM audio bytes from voice previews. |
 | **sherpa-onnx** | C++ toolkit for running TTS/STT models via ONNX Runtime. Supports Kokoro. |
 | **SPVTEXTFRAG** | SAPI struct — linked list of text fragments passed to `Speak()`. Contains text + SSML attributes. |
 | **SPVES_ABORT** | SAPI action flag. When set, the engine should stop speaking immediately. |
@@ -876,3 +882,112 @@ C:\Program Files\VoiceLink\
 ---
 
 *This document grows as we learn. Every experiment, every discovery gets added here.*
+
+---
+
+## 13. Management GUI (Tauri v2)
+
+### Why Tauri?
+
+We evaluated several options for the desktop GUI:
+
+| Option | Pros | Cons | Verdict |
+|--------|------|------|---------|
+| **C# WPF** | Native Windows, small binary | C# adds another language to the stack, no cross-platform | Good but adds complexity |
+| **Electron** | Easy web UI, huge ecosystem | 100MB+ binary, memory hog | Too heavy |
+| **Tauri v2** | Rust backend, web frontend, ~5MB binary, uses system WebView2 | Smaller ecosystem than Electron | **Chosen** — Rust matches our systems-level work, tiny binary |
+| **Python + tkinter** | Same language as server | Ugly UIs, hard to make modern dark theme | No |
+
+Tauri v2 was the clear winner: the Rust backend gives us direct `winreg` access for registry operations (no shelling out to `reg.exe`), `reqwest` for HTTP calls to the inference server, and the web frontend lets us build a polished dark-theme UI with standard HTML/CSS/TypeScript.
+
+### Architecture
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│  Tauri App (voicelink-gui)                                      │
+│                                                                 │
+│  ┌─────────────────────────────┐  ┌─────────────────────────────┐  │
+│  │  Frontend (WebView2)         │  │  Rust Backend               │  │
+│  │                             │  │                             │  │
+│  │  index.html                  │  │  lib.rs                      │  │
+│  │  main.ts (Vite + TypeScript) │  │  ─ get_server_status()       │  │
+│  │  styles.css (dark theme)     │  │  ─ get_sapi_status()         │  │
+│  │                             │  │  ─ get_voices()              │  │
+│  │  invoke("get_voices")  ────┼──┾  ─ rename_voice()            │  │
+│  │  invoke("toggle_voice") ───┼──┾  ─ preview_voice()           │  │
+│  │  invoke("preview_voice") ──┼──┾  ─ toggle_voice()            │  │
+│  │                             │  │  ─ get_registered_voice_ids()│  │
+│  └─────────────────────────────┘  └─────────────────────────────┘  │
+│         │ PCM bytes (WebAudio)             │ winreg + reqwest  │
+└─────────┼─────────────────────────────────┼──────────────────┘
+          │                                 │
+          v                                 v
+   ┌─────────────────┐          ┌─────────────────────┐
+   │  Speakers        │          │  Windows Registry     │
+   │  (AudioContext)  │          │  Speech\Voices\Tokens  │
+   └─────────────────┘          │  Speech_OneCore\...    │
+                                 └─────────────────────┘
+```
+
+### Voice Toggle Design
+
+The toggle feature lets users enable/disable individual voices in SAPI without uninstalling anything. This is important because:
+- Users may not want all 11 voices cluttering their voice dropdown in Thorium/Edge
+- Different workflows may need different voice subsets
+- Disabling is reversible — no data loss
+
+**How it works:**
+
+| Action | What happens in the registry |
+|--------|-----------------------------|
+| **Enable voice** | Creates `VoiceLink_{id}` token under both `Speech\Voices\Tokens\` and `Speech_OneCore\Voices\Tokens\` with full structure: CLSID, VoiceLinkVoiceId, VoiceLinkServerPort, and Attributes subkey (Name, Gender, Language LCID, Age, Vendor) |
+| **Disable voice** | Deletes the `VoiceLink_{id}` token and all subkeys from both registries |
+
+**Language/gender inference from voice ID:**
+```
+Voice ID prefix → Language + Gender
+  af_*  → en-US (409), Female      bf_*  → en-GB (809), Female
+  am_*  → en-US (409), Male        bm_*  → en-GB (809), Male
+```
+
+**Admin privileges required:** Writing to `HKLM` needs elevation. The GUI must run as administrator (same requirement as `regsvr32` for the COM DLL).
+
+### Audio Preview Pipeline
+
+When the user clicks "Test" on a voice card:
+
+```
+1. main.ts reads text from Quick Test textarea (or uses fallback)
+2. invoke("preview_voice", { voiceId, text })
+3. Rust: HTTP POST to localhost:7860/v1/tts with {text, voice_id}
+4. Server: Kokoro generates 24kHz 16-bit mono PCM
+5. Rust: returns Vec<u8> of PCM bytes to frontend
+6. main.ts: PCM bytes → Int16Array → Float32Array (divide by 32768)
+7. AudioContext.createBuffer(1, length, 24000) → play through speakers
+```
+
+### File Structure
+
+```
+gui/
+├── index.html              # Single-page app: sidebar + 3 pages + modal overlay
+├── src/
+│   ├── main.ts              # Navigation, status polling, voice management, audio playback
+│   └── styles.css           # Dark theme, cards, toggle switches, modal, scrollbar
+├── src-tauri/
+│   ├── src/
+│   │   └── lib.rs           # Tauri commands + tray icon setup
+│   ├── Cargo.toml           # Rust deps: tauri, reqwest, winreg, tokio, serde
+│   ├── tauri.conf.json      # App config: window size, tray, identifier
+│   └── icons/               # App icons (PNG, ICO)
+├── package.json             # npm scripts: dev, build
+└── vite.config.ts           # Vite config for frontend bundling
+```
+
+### Key CSS Lessons Learned
+
+1. **Scroll fix:** `body { min-height: 100vh; display: flex; overflow: hidden; }` prevents child `overflow-y: auto` from working because `min-height` lets body grow beyond viewport. Fix: use `height: 100vh` to constrain it.
+
+2. **Modal in flex body:** A `position: fixed` overlay inside a `display: flex` body can still participate in flex layout in some WebView2 edge cases. Fix: explicit `width: 100vw; height: 100vh; top: 0; left: 0` plus `display: none !important` for the hidden state.
+
+3. **Browser `prompt()` in Tauri:** Shows "localhost:1420 says" which looks unprofessional. Always use custom in-app modals for user input.

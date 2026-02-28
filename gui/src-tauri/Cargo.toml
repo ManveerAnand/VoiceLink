@@ -1,0 +1,23 @@
+[package]
+name = "voicelink-gui"
+version = "0.1.0"
+description = "VoiceLink — AI TTS Management App"
+authors = ["Manveer Anand"]
+edition = "2021"
+
+[lib]
+name = "voicelink_gui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+winreg = "0.55"
+

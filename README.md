@@ -89,10 +89,10 @@ The project is being built in stages. Here is where we are:
 | Stage | Status | What it means |
 |-------|--------|--------------|
 | Research and understanding | Done | We know exactly how Windows voices work under the hood |
-| AI voice server | Working | A local server that takes text and returns AI generated audio |
-| Windows voice driver | In progress | The piece that makes Windows think our AI voice is a regular system voice |
+| AI voice server | Working | A local server that takes text and returns AI generated audio (Kokoro, 11 voices) |
+| Windows voice driver | Working | COM DLL registered as SAPI voice — works in Thorium Reader, PowerShell, and other apps |
+| Management GUI | Working | Tauri desktop app — dashboard, voice manager with rename/toggle/test, system tray icon |
 | Installer | Planned | The one click setup experience |
-| System tray app | Planned | A little icon in your taskbar to manage voices and settings |
 
 Check [TASKS.md](TASKS.md) for the full breakdown of every single task.
 

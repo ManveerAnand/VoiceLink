@@ -168,7 +168,9 @@
 - [x] Implement `ISpObjectWithToken::SetObjectToken()` — reads VoiceLinkVoiceId from registry
 - [x] Forward text to inference server via HTTP chunked transfer (WinHTTP)
 - [x] Stream audio back via `ISpTTSEngineSite::Write()` — 8KB chunks (~170ms audio)
-- [ ] Handle SAPI rate/volume controls *(playback rate doesn't work yet)*
+- [x] Handle SAPI rate mapping — `speed = 1.0 + effectiveRate * 0.5`, clamped [0.25, 4.0]
+- [x] Handle SAPI volume control — maps 0-100 to float 0.0-1.0
+- [ ] Rate control in Thorium Reader *(rate works in PowerShell but Thorium behavior TBD)*
 
 ### 2.3 — Integration Testing
 - [x] Test with PowerShell SAPI — end-to-end speech confirmed (2.5x realtime)
@@ -179,20 +181,53 @@
 
 ---
 
-## Phase 3: System Integration and Installer
-**Goal:** Make it easy for anyone to install and use VoiceLink.
+## Phase 3: Management GUI (Tauri v2)
+**Goal:** Build a desktop app to manage VoiceLink — monitor server, configure voices, control SAPI registration.
 
-### 3.1 — Installer
+### 3.1 — GUI Foundation
+- [x] Choose framework: **Tauri v2** (Rust backend + web frontend, small binary)
+- [x] Scaffold project with `create-tauri-app` — `gui/` directory
+- [x] Configure `tauri.conf.json` — window 900×650, centered, tray icon
+- [x] Set up Rust backend with `reqwest`, `winreg`, `tokio`, `serde` deps
+- [x] Set up Vite + TypeScript frontend
+
+### 3.2 — Dashboard
+- [x] Sidebar navigation: Dashboard, Voices, Settings
+- [x] Inference Server status card — polls `/v1/health` every 5s (status, model, GPU, uptime)
+- [x] SAPI Bridge status card — checks registry CLSID + counts VoiceLink_ tokens
+- [x] Quick Test panel — textarea + voice dropdown + Preview button with PCM→WebAudio playback
+
+### 3.3 — Voice Manager
+- [x] Voice grid — loads from `/v1/voices`, displays name, gender badge, description, tags, language, model
+- [x] Rename voice — custom in-app modal (replaced browser `prompt()`), updates Attributes\Name in both registries
+- [x] Test voice — plays voice preview using Quick Test textarea text (shared text), falls back to default
+- [x] Toggle voice on/off — registers/unregisters voice token in both Speech and Speech_OneCore registries
+  - Enable: creates full token structure (CLSID, VoiceLinkVoiceId, VoiceLinkServerPort, Attributes with Name/Gender/Language/Age/Vendor)
+  - Disable: deletes token recursively with `delete_subkey_all`
+  - Language/gender inferred from voice_id prefix (a*=en-US, b*=en-GB, *m_*=Male)
+- [x] Registered state tracking — `get_registered_voice_ids` returns current SAPI-registered voices
+- [ ] **Test toggle feature end-to-end** *(next session — toggle compiles but not yet verified in app)*
+
+### 3.4 — UI Polish
+- [x] Dark theme with CSS variables (purple accent, card-based layout)
+- [x] Custom scrollbar styling
+- [x] Fixed scroll issue — `body { height: 100vh }` constrains flex layout so `#content { overflow-y: auto }` works
+- [x] Custom modal overlay for rename/errors (replaced ugly browser prompt)
+- [x] Disabled voice visual feedback — dimmed cards with strikethrough name
+- [x] System tray icon — "Open" and "Quit" menu, double-click shows window
+- [ ] Responsive grid at different window sizes
+
+### 3.5 — Settings Page
+- [x] Server URL display (localhost:7860)
+- [x] Auto-start toggle (UI only — not yet functional)
+- [x] About section
+- [ ] Persist settings to config file
+
+### 3.6 — Installer
 - [ ] Research installer technologies (WiX, NSIS, MSIX)
-- [ ] Build installer that registers COM DLL
+- [ ] Build installer that bundles GUI + registers COM DLL
 - [ ] Install inference server as Windows service
 - [ ] Include model downloader in first-run experience
-
-### 3.2 — System Tray App
-- [ ] System tray icon with status indicator
-- [ ] Voice selection and configuration
-- [ ] Server start/stop controls
-- [ ] Model management (download, delete, update)
 
 ### 3.3 — Auto-start and Reliability
 - [ ] Server auto-starts on login
@@ -250,8 +285,13 @@
 | 2026-02-28 | Audio format: 24kHz 16-bit mono | Matches both Kokoro output and SAPI SPSF_24kHz16BitMono — no resampling |
 | 2026-02-28 | Dual registry registration | Must register in both Speech and Speech_OneCore for Thorium/Electron apps |
 | 2026-02-28 | Phase 2 complete | COM DLL working end-to-end in PowerShell and Thorium Reader |
+| 2026-03-01 | GUI framework: Tauri v2 | Rust backend for registry/HTTP ops, web frontend for UI, small binary (~5MB) |
+| 2026-03-01 | Custom modal over browser prompt | `prompt()` shows ugly "localhost:1420 says" — built in-app modal with backdrop |
+| 2026-03-01 | Scroll fix: height vs min-height | `body { min-height: 100vh }` let body grow beyond viewport, defeating `overflow-y: auto` |
+| 2026-03-01 | Voice toggle architecture | Enable/disable voices in SAPI registry. Toggle creates/deletes full token structure. |
+| 2026-03-01 | Shared test text | Voice card "Test" and Quick Test panel share the same textarea — no hardcoded strings |
 | | | |
 
 ---
 
-*Last updated: 2026-02-28 (Phase 0-2 complete, voices working in Thorium Reader)*
+*Last updated: 2026-03-01 (Phase 3 GUI largely complete, toggle feature needs end-to-end testing)*

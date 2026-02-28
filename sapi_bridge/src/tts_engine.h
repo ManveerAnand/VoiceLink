@@ -151,7 +151,8 @@ private:
 
     // Walk the SPVTEXTFRAG linked list and extract all speakable text.
     // Handles SPVA_Speak fragments, skips bookmarks/silence/etc.
-    std::string ExtractText(const SPVTEXTFRAG *pTextFragList);
+    // Also captures the max RateAdj across fragments via pMaxRateAdj output.
+    std::string ExtractText(const SPVTEXTFRAG *pTextFragList, LONG *pMaxRateAdj = nullptr);
 
     // Read a string attribute from our voice token's registry entry.
     std::wstring ReadTokenAttribute(const wchar_t *attrName);
