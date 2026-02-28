@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+
+# Audio samples (generated, not source)
+research/audio_samples/
+
+# Model files (too large for git)
+research/models/
+*.onnx
+*.bin
+*.pt
+*.pth
+*.safetensors
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Conda
+.conda/
