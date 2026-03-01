@@ -223,17 +223,41 @@
 - [x] About section
 - [ ] Persist settings to config file
 
-### 3.6 — Installer
-- [ ] Research installer technologies (WiX, NSIS, MSIX)
-- [ ] Build installer that bundles GUI + registers COM DLL
-- [ ] Install inference server as Windows service
-- [ ] Include model downloader in first-run experience
+### 3.6 — Installer & Setup Wizard
+- [x] Research installer technologies — Tauri v2 NSIS bundler selected
+- [x] Build NSIS installer with `tauri.conf.json` config
+  - `installMode: perMachine` (writes to `C:\Program Files\VoiceLink`)
+  - Resources: COM DLL + server/ directory bundled into installer
+  - NSIS hooks for COM registration/unregistration (`hooks.nsh`)
+- [x] Auto-uninstall previous version via `NSIS_HOOK_PREINSTALL`
+  - Reads `QuietUninstallString` from registry, runs silently before new install
+- [x] COM DLL registration via `NSIS_HOOK_POSTINSTALL` (regsvr32)
+- [x] COM DLL unregistration via `NSIS_HOOK_PREUNINSTALL` (regsvr32 /u)
+- [x] Static CRT linking (`/MT`) — DLL has zero external dependencies
+- [x] First-run setup wizard (5 steps):
+  1. Download + extract embedded Python 3.11 (~15 MB)
+  2. Enable pip, install dependencies from `requirements.txt`
+  3. Copy server files to data directory
+  4. Download Kokoro ONNX model (~310 MB) + voices (~27 MB) from GitHub
+  5. Start inference server
+- [x] Configurable data directory (`C:\ProgramData\VoiceLink` default)
+- [x] `setup_enable_pip` — modifies `._pth` file, adds data dir to Python path
+- [x] `setup_download_file` — streaming download with progress events
+- [x] `setup_run_command` — async stdout/stderr streaming with line-by-line progress
+- [x] `CREATE_NO_WINDOW` flag on all subprocess spawns (no CMD flashes)
+- [x] Model download reliability — checks file size (not just existence), cleans up 0-byte partials
+- [x] Embedded Python `._pth` fix — adds data directory so `python -m server.main` works
+- [ ] Auto-start server on login (Windows Task Scheduler or startup folder)
 
 ### 3.3 — Auto-start and Reliability
 - [ ] Server auto-starts on login
 - [ ] Graceful fallback if server is down
 - [ ] Auto-restart on crash
 - [ ] Logging and diagnostics
+
+### 3.7 — Toggle Feature
+- [x] Toggle voice on/off — tested end-to-end
+- [x] Voices visible/hidden in SAPI after toggle
 
 ---
 
@@ -290,8 +314,14 @@
 | 2026-03-01 | Scroll fix: height vs min-height | `body { min-height: 100vh }` let body grow beyond viewport, defeating `overflow-y: auto` |
 | 2026-03-01 | Voice toggle architecture | Enable/disable voices in SAPI registry. Toggle creates/deletes full token structure. |
 | 2026-03-01 | Shared test text | Voice card "Test" and Quick Test panel share the same textarea — no hardcoded strings |
+| 2026-03-01 | NSIS installer built | Tauri v2 NSIS bundler with hooks for COM registration. 2.8 MB installer. |
+| 2026-03-01 | Static CRT (`/MT`) | COM DLL dynamically linked to vcruntime140.dll, failed on clean machines. `/MT` embeds it. |
+| 2026-03-01 | Embedded Python `._pth` | Embedded Python ignores `PYTHONPATH` when `._pth` exists. Must add data dir to `._pth` file directly. |
+| 2026-03-01 | NSIS resource path | Tauri v2 installs resources to `$INSTDIR\` root, not `$INSTDIR\resources\`. Hooks must use correct path. |
+| 2026-03-01 | Data dir persists | Uninstaller removes app from Program Files but preserves `C:\ProgramData\VoiceLink` (~1.3 GB) for fast reinstalls. |
+| 2026-03-01 | `CREATE_NO_WINDOW` | GUI app spawning console subprocesses flashes CMD windows. `0x08000000` creation flag prevents this. |
 | | | |
 
 ---
 
-*Last updated: 2026-03-01 (Phase 3 GUI largely complete, toggle feature needs end-to-end testing)*
+*Last updated: 2026-03-02 (Installer working, setup wizard tested on clean machine, server startup fix in progress)*

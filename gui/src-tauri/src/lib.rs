@@ -640,6 +640,8 @@ fn setup_enable_pip(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<(), St
         // Uncomment "import site" line and add Lib\site-packages
         let mut new_lines: Vec<String> = Vec::new();
         let mut has_import_site = false;
+        let data_dir_str = cfg.data_dir().to_string_lossy().to_string();
+        let mut has_data_dir = false;
         for line in content.lines() {
             if line.trim() == "#import site" {
                 new_lines.push("import site".to_string());
@@ -650,9 +652,19 @@ fn setup_enable_pip(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<(), St
             } else {
                 new_lines.push(line.to_string());
             }
+            // Check if data dir is already listed
+            if line.trim() == data_dir_str {
+                has_data_dir = true;
+            }
         }
         if !has_import_site {
             new_lines.push("import site".to_string());
+        }
+        // Add the data directory so "python -m server.main" can find
+        // the server package. Embedded Python ignores PYTHONPATH when
+        // a ._pth file exists, so this is the only way.
+        if !has_data_dir {
+            new_lines.push(data_dir_str);
         }
 
         std::fs::write(&pth_path, new_lines.join("\n"))

@@ -64,21 +64,36 @@ From your app's point of view, VoiceLink is just another voice option in the dro
 
 ## How to set it up
 
-> **Note:** VoiceLink is still being built. A one click installer is coming. For now, here is what the setup will look like.
-
 ### What you need
-1. Windows 10 or 11
-2. About 500 MB of free space (for the AI voice model)
-3. A reasonably modern computer (a dedicated GPU helps but is not required)
+1. Windows 10 or 11 (64-bit)
+2. About 1.5 GB of free space (Python runtime + AI voice model + dependencies)
+3. An internet connection for the first setup (downloads the model)
+4. A reasonably modern computer (a dedicated GPU helps but is not required)
 
-### Installation (coming soon)
-1. Download the VoiceLink installer
-2. Run it (it handles everything: the voice engine, the AI model, and the Windows registration)
-3. Open your favorite app (Thorium Reader, Edge, Narrator, Balabolka, anything with Read Aloud)
-4. Pick a VoiceLink voice from the voice list
-5. Enjoy actually pleasant text to speech
+### Installation
+1. Download `VoiceLink_0.1.0_x64-setup.exe` from [Releases](https://github.com/ManveerAnand/VoiceLink/releases)
+2. Run it as Administrator (right-click → Run as administrator)
+3. The setup wizard handles everything automatically:
+   - Downloads and extracts embedded Python 3.11
+   - Installs pip and all dependencies (FastAPI, Kokoro, PyTorch, etc.)
+   - Copies the TTS server files
+   - Downloads the Kokoro ONNX model (~310 MB) and voice data (~27 MB)
+   - Starts the inference server
+   - Registers 11 AI voices in the Windows SAPI registry
+4. Open your favorite app (Thorium Reader, Edge, Narrator, Balabolka, anything with Read Aloud)
+5. Pick a VoiceLink voice from the voice list
+6. Enjoy actually pleasant text to speech
 
-No terminal. No Python. No configuration files. Just install and go.
+No terminal. No Python installation. No configuration files. Just install and go.
+
+### Data location
+
+VoiceLink stores its data in `C:\ProgramData\VoiceLink\`:
+- `python/` — Embedded Python 3.11 with all packages
+- `models/` — Kokoro ONNX model and voice data
+- `server/` — TTS inference server source
+
+The app itself installs to `C:\Program Files\VoiceLink\`.
 
 <br>
 
@@ -92,7 +107,7 @@ The project is being built in stages. Here is where we are:
 | AI voice server | Working | A local server that takes text and returns AI generated audio (Kokoro, 11 voices) |
 | Windows voice driver | Working | COM DLL registered as SAPI voice — works in Thorium Reader, PowerShell, and other apps |
 | Management GUI | Working | Tauri desktop app — dashboard, voice manager with rename/toggle/test, system tray icon |
-| Installer | Planned | The one click setup experience |
+| Installer | Working | NSIS installer with setup wizard — downloads Python, installs deps, fetches model, starts server |
 
 Check [TASKS.md](TASKS.md) for the full breakdown of every single task.
 
@@ -106,9 +121,9 @@ You do not need to understand any of this to use VoiceLink. But if you are the k
 
 1. **The Voice Server** runs on your computer and loads the AI model. When it gets text, it generates audio that sounds like a real person. Built with Python and FastAPI.
 
-2. **The Windows Driver** is a small file (a DLL) that registers itself as a Windows voice. When any app asks it to speak, it quietly passes the text to the voice server and streams the audio back. Built with C++.
+2. **The Windows Driver** is a small file (a DLL) that registers itself as a Windows voice. When any app asks it to speak, it quietly passes the text to the voice server and streams the audio back. Built with C++, statically linked (no runtime dependencies).
 
-3. **The Installer** bundles everything together so you never have to touch code. It sets up the server, registers the driver, and downloads the AI model.
+3. **The Management App** is a desktop GUI that handles setup, voice management, and server monitoring. It includes a setup wizard that downloads everything automatically on first run. Built with Tauri v2 (Rust + HTML/CSS/TypeScript).
 
 The whole thing runs 100% on your computer. No internet needed after setup. No cloud. Your text never leaves your machine.
 

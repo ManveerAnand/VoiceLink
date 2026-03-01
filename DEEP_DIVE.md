@@ -2,7 +2,7 @@
 
 > A living document. This is our knowledge base — everything we learn about TTS, COM, audio, companies, models, and system internals goes here. Not a README. A reference manual built through exploration.
 
-**Last updated:** 2026-03-01 (v3 — added Tauri GUI architecture, voice toggle design)
+**Last updated:** 2026-03-02 (v4 — added installer architecture, setup wizard, deployment lessons)
 
 ---
 
@@ -21,6 +21,7 @@
 - [11. User Experience Design](#11-user-experience-design)
 - [12. Glossary](#12-glossary)
 - [13. Management GUI (Tauri v2)](#13-management-gui-tauri-v2)
+- [14. Installer & Deployment](#14-installer--deployment)
 
 ---
 
@@ -991,3 +992,119 @@ gui/
 2. **Modal in flex body:** A `position: fixed` overlay inside a `display: flex` body can still participate in flex layout in some WebView2 edge cases. Fix: explicit `width: 100vw; height: 100vh; top: 0; left: 0` plus `display: none !important` for the hidden state.
 
 3. **Browser `prompt()` in Tauri:** Shows "localhost:1420 says" which looks unprofessional. Always use custom in-app modals for user input.
+
+---
+
+## 14. Installer & Deployment
+
+### Technology Choice
+
+Tauri v2's built-in NSIS bundler was selected over standalone WiX/MSIX because:
+- Zero extra tooling — `npx tauri build` produces the NSIS installer directly
+- Hook system (`installerHooks` in `tauri.conf.json`) lets us run custom NSIS macros at install/uninstall time
+- Resources (`resources` in `tauri.conf.json`) automatically bundles files into the installer
+- Produces a single `.exe` (~2.8 MB) that extracts and installs everything
+
+### Installer Architecture
+
+```
+VoiceLink_0.1.0_x64-setup.exe (NSIS)
+│
+├── PREINSTALL hook
+│   └── Reads QuietUninstallString from registry
+│       └── Runs previous uninstaller silently → clean upgrade
+│
+├── File extraction → C:\Program Files\VoiceLink\
+│   ├── voicelink-gui.exe          (Tauri app, ~13 MB)
+│   ├── voicelink_sapi.dll         (COM DLL, ~283 KB, static CRT)
+│   ├── uninstall.exe              (NSIS uninstaller)
+│   └── server/                    (TTS server source files)
+│       ├── main.py, config.py, __init__.py
+│       ├── models/ (base.py, kokoro_model.py)
+│       ├── routers/ (tts.py)
+│       └── requirements.txt
+│
+├── POSTINSTALL hook
+│   └── regsvr32 /s "$INSTDIR\voicelink_sapi.dll"
+│       └── Registers CLSID + 11 voice tokens in SAPI registry
+│
+└── First-run → setup wizard in Tauri app handles the rest
+```
+
+### Setup Wizard (First-Run Experience)
+
+The management app includes a 5-step setup wizard that runs on first launch:
+
+```
+Step 1: Python Runtime
+  └── Download python-3.11.9-embed-amd64.zip (~15 MB) from python.org
+  └── Extract to C:\ProgramData\VoiceLink\python\
+  └── Modify ._pth file: uncomment "import site", add data dir path
+
+Step 2: Python Packages
+  └── Download get-pip.py, install pip
+  └── pip install -r requirements.txt (FastAPI, Kokoro, PyTorch, etc.)
+  └── ~900 MB of packages — takes 5-10 minutes
+  └── Live pip output streamed line-by-line to frontend
+
+Step 3: TTS Server
+  └── Copy server/ from install dir to C:\ProgramData\VoiceLink\server/
+
+Step 4: Voice Model
+  └── Download kokoro-v1.0.onnx (~310 MB) from GitHub releases
+  └── Download voices-v1.0.bin (~27 MB)
+  └── Progress bar shows download percentage
+
+Step 5: Start Server
+  └── Launch: python -m server.main (with PYTHONPATH set)
+  └── Wait for health endpoint (localhost:7860/v1/health)
+  └── Mark setup complete
+```
+
+### Deployment Lessons Learned
+
+These were discovered by testing on a clean Windows 11 laptop with no developer tools:
+
+| Issue | Root Cause | Fix |
+|-------|-----------|-----|
+| regsvr32 error 3 | DLL dynamically linked to `vcruntime140.dll`, missing on clean machines | Compile with `/MT` (static CRT) — DLL becomes self-contained |
+| regsvr32 error 3 (still) | NSIS hooks referenced `$INSTDIR\resources\voicelink_sapi.dll` but Tauri puts resources in `$INSTDIR\` root | Remove `resources\` prefix from all hook paths |
+| "No module named server" | Embedded Python's `._pth` file restricts `sys.path`; ignores `PYTHONPATH` env var entirely | Add data directory to `._pth` file during `setup_enable_pip` |
+| Blank CMD windows | GUI app spawning console subprocesses (`python.exe`, `pip`) creates visible console | `CREATE_NO_WINDOW` (0x08000000) creation flag on all `Command::new()` calls |
+| Progress bar stuck at 0% | `setup_run_command` used `.output()` which blocks until process exits | Rewrote with `tokio::spawn` + `AsyncBufReadExt` to stream stdout/stderr line-by-line |
+| 0-byte model ghost file | Download creates file immediately, interruption leaves empty file; `.exists()` returns true | Check `file.metadata().len() > 1000`, delete partial files on error |
+| Multiple installs stacking | No check for previous installation before installing new version | `NSIS_HOOK_PREINSTALL` reads `QuietUninstallString` from registry, runs previous uninstaller silently |
+
+### COM DLL Dependencies (After `/MT` Fix)
+
+```
+dumpbin /dependents voicelink_sapi.dll:
+  WINHTTP.dll      ← HTTP client for inference server
+  ole32.dll        ← COM infrastructure
+  ADVAPI32.dll     ← Registry access
+  KERNEL32.dll     ← Base Windows API
+```
+
+No `vcruntime140.dll`, no `ucrtbase.dll`, no `msvcp*.dll`. Fully self-contained.
+
+### Data Directory Structure
+
+```
+C:\ProgramData\VoiceLink\          (~1.3 GB total)
+├── config.json                     (data_dir setting)
+├── python/                         (~950 MB)
+│   ├── python.exe                  (embedded Python 3.11)
+│   ├── python311.dll
+│   ├── python311._pth              (modified: import site + data dir)
+│   ├── Lib/site-packages/          (pip packages: torch, kokoro, fastapi, etc.)
+│   └── Scripts/                    (pip, uvicorn, etc.)
+├── models/                         (~337 MB)
+│   ├── kokoro-v1.0.onnx            (310 MB ONNX model)
+│   └── voices-v1.0.bin             (27 MB voice embeddings)
+└── server/                         (~30 KB, copied from install dir)
+    ├── main.py, config.py, __init__.py
+    ├── models/
+    └── routers/
+```
+
+The data directory is **preserved across uninstall/reinstall** so users don't re-download 1.3 GB on upgrades. Only `C:\Program Files\VoiceLink\` is removed by the uninstaller.
