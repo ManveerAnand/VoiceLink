@@ -864,9 +864,12 @@ async fn start_server(app: AppHandle) -> Result<(), String> {
     // Start server as a detached background process
     // DETACHED_PROCESS (0x08) + CREATE_NO_WINDOW (0x08000000) ensures
     // no console window flashes on screen when the server starts.
+    // PYTHONPATH must include the data dir so embedded Python can find
+    // the "server" package (embedded Python's ._pth restricts sys.path).
     let child = std::process::Command::new(python.to_string_lossy().to_string())
         .args(["-m", "server.main"])
         .current_dir(cfg.data_dir())
+        .env("PYTHONPATH", cfg.data_dir())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .creation_flags(0x00000008 | 0x08000000) // DETACHED_PROCESS | CREATE_NO_WINDOW
