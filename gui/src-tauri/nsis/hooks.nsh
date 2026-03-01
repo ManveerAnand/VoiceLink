@@ -22,8 +22,8 @@
         DetailPrint "Removing previous VoiceLink installation..."
         ; Unregister the old COM DLL first (the old uninstaller hook may not
         ; fire correctly if the DLL path changed between versions)
-        ${If} ${FileExists} "$INSTDIR\resources\voicelink_sapi.dll"
-            ExecWait 'regsvr32 /u /s "$INSTDIR\resources\voicelink_sapi.dll"'
+        ${If} ${FileExists} "$INSTDIR\voicelink_sapi.dll"
+            ExecWait 'regsvr32 /u /s "$INSTDIR\voicelink_sapi.dll"'
         ${EndIf}
         ; Run the previous uninstaller silently
         ExecWait '$0' $1
@@ -44,7 +44,7 @@
     ; Register the SAPI COM DLL so Windows sees our TTS voices
     ; regsvr32 writes to HKLM (admin required — installMode is perMachine)
     DetailPrint "Registering VoiceLink SAPI bridge..."
-    ExecWait 'regsvr32 /s "$INSTDIR\resources\voicelink_sapi.dll"' $0
+    ExecWait 'regsvr32 /s "$INSTDIR\voicelink_sapi.dll"' $0
     ${If} $0 == 0
         DetailPrint "SAPI bridge registered successfully."
     ${Else}
@@ -56,7 +56,7 @@
 !macro NSIS_HOOK_PREUNINSTALL
     ; Unregister the COM DLL (removes CLSID + voice tokens from registry)
     DetailPrint "Unregistering VoiceLink SAPI bridge..."
-    ExecWait 'regsvr32 /u /s "$INSTDIR\resources\voicelink_sapi.dll"' $0
+    ExecWait 'regsvr32 /u /s "$INSTDIR\voicelink_sapi.dll"' $0
     ${If} $0 == 0
         DetailPrint "SAPI bridge unregistered."
     ${Else}
