@@ -474,9 +474,13 @@ async fn get_setup_status(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<
 
         let server_ok = cfg.server_dir().join("main.py").exists();
 
-        let model_ok = cfg.model_dir().join("kokoro-v1.0.onnx").exists()
-            || cfg.model_dir().join("kokoro-v0_19.pth").exists()
-            || cfg.model_dir().join("model").exists();
+        // Check that files actually have content (not 0-byte ghosts from failed downloads)
+        let file_has_content = |p: PathBuf| -> bool {
+            p.metadata().map(|m| m.len() > 1000).unwrap_or(false)
+        };
+        let model_ok = file_has_content(cfg.model_dir().join("kokoro-v1.0.onnx"))
+            || file_has_content(cfg.model_dir().join("kokoro-v0_19.pth"))
+            || cfg.model_dir().join("model").is_dir();
 
         (python_ok, deps_ok, server_ok, model_ok, cfg.data_dir.clone())
     }; // MutexGuard dropped here — safe to do async IO now
@@ -540,28 +544,38 @@ async fn setup_download_file(
 
     let mut stream = resp.bytes_stream();
     use futures_util::StreamExt;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("Download error: {}", e))?;
-        file.write_all(&chunk)
-            .map_err(|e| format!("Write error: {}", e))?;
-        downloaded += chunk.len() as u64;
+    let result: Result<(), String> = async {
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| format!("Download error: {}", e))?;
+            file.write_all(&chunk)
+                .map_err(|e| format!("Write error: {}", e))?;
+            downloaded += chunk.len() as u64;
 
-        // Emit progress event to frontend
-        let progress = if total_size > 0 {
-            (downloaded as f64 / total_size as f64 * 100.0) as u32
-        } else {
-            0
-        };
-        let _ = app.emit(
-            "setup-progress",
-            serde_json::json!({
-                "step": step_name,
-                "progress": progress,
-                "downloaded": downloaded,
-                "total": total_size,
-            }),
-        );
+            // Emit progress event to frontend
+            let progress = if total_size > 0 {
+                (downloaded as f64 / total_size as f64 * 100.0) as u32
+            } else {
+                0
+            };
+            let _ = app.emit(
+                "setup-progress",
+                serde_json::json!({
+                    "step": step_name,
+                    "progress": progress,
+                    "downloaded": downloaded,
+                    "total": total_size,
+                }),
+            );
+        }
+        Ok(())
+    }.await;
+
+    // If download failed, remove the partial/empty file so it doesn't
+    // trick the status check into thinking the model is downloaded.
+    if result.is_err() {
+        let _ = std::fs::remove_file(&dest_path);
     }
+    result?;
 
     Ok(dest_path.to_string_lossy().to_string())
 }
@@ -649,6 +663,8 @@ fn setup_enable_pip(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<(), St
 }
 
 /// Run a command and return its output (used for pip install, etc.)
+/// Streams stdout/stderr line-by-line and emits progress events so the
+/// frontend can show real-time status instead of being stuck at 0%.
 #[tauri::command]
 async fn setup_run_command(
     app: AppHandle,
@@ -656,6 +672,8 @@ async fn setup_run_command(
     args: Vec<String>,
     step_name: String,
 ) -> Result<String, String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
     let _ = app.emit(
         "setup-progress",
         serde_json::json!({
@@ -665,27 +683,82 @@ async fn setup_run_command(
         }),
     );
 
-    let output = tokio::process::Command::new(&program)
+    // CREATE_NO_WINDOW (0x08000000) prevents a visible console window
+    // from appearing when a GUI app spawns a console subprocess.
+    let mut child = tokio::process::Command::new(&program)
         .args(&args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .output()
-        .await
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .spawn()
         .map_err(|e| format!("Failed to run {}: {}", program, e))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    // Read stdout and stderr line-by-line, emitting progress events
+    // so the frontend shows real-time status during long pip installs.
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+
+    let step_clone = step_name.clone();
+    let app_clone = app.clone();
+    let stdout_task = tokio::spawn(async move {
+        let mut lines = Vec::new();
+        if let Some(stdout) = stdout_handle {
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                // Emit the latest line as status text so user sees activity
+                let _ = app_clone.emit(
+                    "setup-progress",
+                    serde_json::json!({
+                        "step": step_clone,
+                        "progress": 50,
+                        "status": "running",
+                        "line": line,
+                    }),
+                );
+                lines.push(line);
+            }
+        }
+        lines.join("\n")
+    });
+
+    let step_clone2 = step_name.clone();
+    let app_clone2 = app.clone();
+    let stderr_task = tokio::spawn(async move {
+        let mut lines = Vec::new();
+        if let Some(stderr) = stderr_handle {
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let _ = app_clone2.emit(
+                    "setup-progress",
+                    serde_json::json!({
+                        "step": step_clone2,
+                        "progress": 50,
+                        "status": "running",
+                        "line": line,
+                    }),
+                );
+                lines.push(line);
+            }
+        }
+        lines.join("\n")
+    });
+
+    let status = child.wait().await
+        .map_err(|e| format!("Failed to wait for {}: {}", program, e))?;
+
+    let stdout = stdout_task.await.unwrap_or_default();
+    let stderr = stderr_task.await.unwrap_or_default();
 
     let _ = app.emit(
         "setup-progress",
         serde_json::json!({
             "step": step_name,
             "progress": 100,
-            "status": if output.status.success() { "done" } else { "error" },
+            "status": if status.success() { "done" } else { "error" },
         }),
     );
 
-    if output.status.success() {
+    if status.success() {
         Ok(stdout)
     } else {
         Err(format!("Command failed:\nstdout: {}\nstderr: {}", stdout, stderr))
@@ -789,12 +862,14 @@ async fn start_server(app: AppHandle) -> Result<(), String> {
     }
 
     // Start server as a detached background process
+    // DETACHED_PROCESS (0x08) + CREATE_NO_WINDOW (0x08000000) ensures
+    // no console window flashes on screen when the server starts.
     let child = std::process::Command::new(python.to_string_lossy().to_string())
         .args(["-m", "server.main"])
         .current_dir(cfg.data_dir())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .creation_flags(0x00000008) // DETACHED_PROCESS on Windows
+        .creation_flags(0x00000008 | 0x08000000) // DETACHED_PROCESS | CREATE_NO_WINDOW
         .spawn()
         .map_err(|e| format!("Failed to start server: {}", e))?;
 

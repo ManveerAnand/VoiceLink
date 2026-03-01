@@ -701,16 +701,22 @@ function setupSetupWizard() {
   });
 
   // Listen for progress events from Rust backend
-  listen<{ step: string; progress: number; downloaded?: number; total?: number; status?: string }>(
+  listen<{ step: string; progress: number; downloaded?: number; total?: number; status?: string; line?: string }>(
     "setup-progress",
     (event) => {
-      const { step, progress, downloaded, total } = event.payload;
+      const { step, progress, downloaded, total, line } = event.payload;
       const stepName = step as StepName;
 
       if (downloaded && total && total > 0) {
+        // File download — show MB progress
         const mb = (downloaded / 1024 / 1024).toFixed(1);
         const totalMb = (total / 1024 / 1024).toFixed(1);
         setStepProgress(stepName, progress, `${mb} / ${totalMb} MB`);
+      } else if (line) {
+        // Command output — show the last meaningful line (e.g. pip activity)
+        // Truncate long lines and show a pulsing progress bar at 50%
+        const shortLine = line.length > 60 ? line.substring(0, 57) + "..." : line;
+        setStepProgress(stepName, progress, shortLine);
       } else {
         setStepProgress(stepName, progress);
       }

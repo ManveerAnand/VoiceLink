@@ -696,6 +696,20 @@ body {
   transition: width 0.3s ease;
 }
 
+/* Indeterminate/pulsing progress bar for long-running commands (pip install).
+   When the bar is at ~50% with no known total, it pulses to show activity. */
+.progress-fill.indeterminate {
+  width: 100% !important;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  background-size: 200% 100%;
+  animation: progressPulse 1.5s ease-in-out infinite;
+}
+
+@keyframes progressPulse {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
 .progress-text {
   font-size: 11px;
   color: var(--text-secondary);
@@ -703,6 +717,11 @@ body {
   min-width: 80px;
   text-align: right;
   font-variant-numeric: tabular-nums;
+  /* Allow wider text for pip output lines */
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Spinner animation */
