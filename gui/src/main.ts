@@ -2,6 +2,7 @@
 // VoiceLink GUI — Frontend Logic
 // ============================================================================
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 // ============================================================================
 // Types (mirrors Rust structs)
@@ -38,6 +39,23 @@ interface SapiStatus {
   voice_count: number;
 }
 
+interface SetupStatus {
+  python_installed: boolean;
+  deps_installed: boolean;
+  server_installed: boolean;
+  model_downloaded: boolean;
+  server_running: boolean;
+  data_dir: string;
+}
+
+interface SetupPaths {
+  data_dir: string;
+  python_dir: string;
+  python_exe: string;
+  server_dir: string;
+  model_dir: string;
+}
+
 // ============================================================================
 // State
 // ============================================================================
@@ -64,6 +82,7 @@ function setupNavigation() {
       });
 
       if (page === "voices") loadVoices();
+      if (page === "setup") refreshSetupStatus();
     });
   });
 }
@@ -245,6 +264,7 @@ async function handleToggleVoice(voiceId: string, enabled: boolean) {
     }
     const container = document.getElementById("voices-list");
     if (container) renderVoices(container);
+    populateTestVoiceSelect();
     // Refresh dashboard SAPI status
     checkSapiStatus();
   } catch (e) {
@@ -297,7 +317,9 @@ function populateTestVoiceSelect() {
   const select = document.getElementById("test-voice") as HTMLSelectElement | null;
   if (!select) return;
 
-  select.innerHTML = currentVoices
+  // Only show registered (enabled) voices in Quick Test dropdown
+  const enabledVoices = currentVoices.filter((v) => registeredVoiceIds.has(v.id));
+  select.innerHTML = enabledVoices
     .map((v) => `<option value="${v.id}">${escapeHtml(v.name)}</option>`)
     .join("");
 }
@@ -387,6 +409,319 @@ function showModal(title: string, defaultValue: string, alertOnly = false): Prom
 }
 
 // ============================================================================
+// Setup Wizard
+// ============================================================================
+
+const PYTHON_ZIP_URL = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip";
+const GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py";
+// Kokoro model from HuggingFace (ONNX version, ~82MB)
+const MODEL_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx";
+const VOICES_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin";
+
+type StepName = "python" | "deps" | "server" | "model" | "start";
+
+let setupRunning = false;
+
+function setStepIcon(step: StepName, state: "pending" | "running" | "done" | "error") {
+  const icon = document.getElementById(`step-icon-${step}`);
+  if (!icon) return;
+
+  icon.className = `step-icon step-${state}`;
+
+  const svgMap: Record<string, string> = {
+    pending: `<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" /></svg>`,
+    running: `<div class="spinner"></div>`,
+    done: `<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M20 6L9 17l-5-5" /></svg>`,
+    error: `<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>`,
+  };
+  icon.innerHTML = svgMap[state];
+}
+
+function showStepProgress(step: StepName, show: boolean) {
+  const el = document.getElementById(`progress-${step}`);
+  if (el) el.classList.toggle("hidden", !show);
+}
+
+function setStepProgress(step: StepName, percent: number, text?: string) {
+  const fill = document.getElementById(`fill-${step}`) as HTMLElement;
+  const txt = document.getElementById(`text-${step}`);
+  if (fill) fill.style.width = `${Math.min(100, percent)}%`;
+  if (txt && text) txt.textContent = text;
+  else if (txt) txt.textContent = `${percent}%`;
+}
+
+function setOverallStatus(msg: string, type: "info" | "success" | "error" = "info") {
+  const el = document.getElementById("setup-overall-status");
+  if (!el) return;
+  el.textContent = msg;
+  el.className = `setup-status-msg status-${type}`;
+}
+
+async function refreshSetupStatus() {
+  const banner = document.getElementById("external-server-banner");
+  const stepsContainer = document.getElementById("setup-steps-container");
+
+  try {
+    const status: SetupStatus = await invoke("get_setup_status");
+    setStepIcon("python", status.python_installed ? "done" : "pending");
+    setStepIcon("deps", status.deps_installed ? "done" : "pending");
+    setStepIcon("server", status.server_installed ? "done" : "pending");
+    setStepIcon("model", status.model_downloaded ? "done" : "pending");
+    setStepIcon("start", status.server_running ? "done" : "pending");
+
+    const dataDirInput = document.getElementById("setup-data-dir") as HTMLInputElement;
+    if (dataDirInput) dataDirInput.value = status.data_dir;
+
+    const allDone = status.python_installed && status.deps_installed && status.server_installed && status.model_downloaded;
+    const externalServer = status.server_running && !allDone;
+
+    // Show/hide external-server banner and dim step list when running externally
+    if (banner) banner.classList.toggle("hidden", !externalServer);
+    if (stepsContainer) stepsContainer.classList.toggle("dimmed", externalServer);
+
+    // Update button text based on status
+    const btn = document.getElementById("btn-run-setup") as HTMLButtonElement;
+    if (btn && !setupRunning) {
+      if (allDone && status.server_running) {
+        btn.innerHTML = `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5" /></svg> All Set!`;
+        btn.disabled = true;
+        setOverallStatus("Everything is installed and running.", "success");
+      } else if (externalServer) {
+        btn.innerHTML = `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5" /></svg> Server Active`;
+        btn.disabled = true;
+        setOverallStatus("", "success");
+      } else if (allDone) {
+        btn.textContent = "Start Server";
+        btn.disabled = false;
+      } else {
+        btn.innerHTML = `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" /></svg> Run Setup`;
+        btn.disabled = false;
+      }
+    }
+  } catch (e) {
+    console.error("Failed to check setup status:", e);
+    // On error, ensure banner is hidden and steps are not dimmed
+    if (banner) banner.classList.add("hidden");
+    if (stepsContainer) stepsContainer.classList.remove("dimmed");
+  }
+}
+
+async function runSetup() {
+  if (setupRunning) return;
+  setupRunning = true;
+
+  const btn = document.getElementById("btn-run-setup") as HTMLButtonElement;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Setting up...";
+  }
+
+  try {
+    const status: SetupStatus = await invoke("get_setup_status");
+    const paths: SetupPaths = await invoke("get_setup_paths");
+
+    // Step 1: Download & install Python
+    if (!status.python_installed) {
+      setStepIcon("python", "running");
+      showStepProgress("python", true);
+      setOverallStatus("Downloading Python runtime...");
+
+      const zipDest = `${paths.data_dir}\\python-embed.zip`;
+      await invoke("setup_download_file", {
+        url: PYTHON_ZIP_URL,
+        dest: zipDest,
+        stepName: "python",
+      });
+
+      setStepProgress("python", 100, "Extracting...");
+      await invoke("setup_extract_zip", {
+        zipPath: zipDest,
+        destDir: paths.python_dir,
+      });
+
+      // Enable pip by modifying ._pth file
+      await invoke("setup_enable_pip");
+
+      // Download get-pip.py and run it
+      setStepProgress("python", 100, "Installing pip...");
+      const getPipDest = `${paths.python_dir}\\get-pip.py`;
+      await invoke("setup_download_file", {
+        url: GET_PIP_URL,
+        dest: getPipDest,
+        stepName: "python",
+      });
+
+      await invoke("setup_run_command", {
+        program: paths.python_exe,
+        args: [getPipDest, "--no-warn-script-location"],
+        stepName: "python",
+      });
+
+      setStepIcon("python", "done");
+      showStepProgress("python", false);
+    } else {
+      setStepIcon("python", "done");
+    }
+
+    // Step 2: Install Python dependencies
+    if (!status.deps_installed) {
+      setStepIcon("deps", "running");
+      showStepProgress("deps", true);
+      setStepProgress("deps", 0, "Installing packages...");
+      setOverallStatus("Installing Python packages...");
+
+      // Install main deps
+      await invoke("setup_run_command", {
+        program: paths.python_exe,
+        args: [
+          "-m", "pip", "install", "--no-warn-script-location",
+          "fastapi>=0.115.0",
+          "uvicorn[standard]>=0.34.0",
+          "pydantic-settings>=2.7.0",
+          "pyyaml>=6.0",
+          "soundfile>=0.13.0",
+          "numpy>=1.26.0,<2.0",
+          "loguru>=0.7.0",
+        ],
+        stepName: "deps",
+      });
+
+      setStepProgress("deps", 60, "Installing Kokoro...");
+
+      // Install kokoro separately (it's a bigger install)
+      await invoke("setup_run_command", {
+        program: paths.python_exe,
+        args: ["-m", "pip", "install", "--no-warn-script-location", "kokoro>=0.3"],
+        stepName: "deps",
+      });
+
+      setStepIcon("deps", "done");
+      showStepProgress("deps", false);
+    } else {
+      setStepIcon("deps", "done");
+    }
+
+    // Step 3: Install server files
+    if (!status.server_installed) {
+      setStepIcon("server", "running");
+      showStepProgress("server", true);
+      setStepProgress("server", 50, "Copying server files...");
+      setOverallStatus("Installing server files...");
+
+      await invoke("setup_install_server");
+
+      setStepIcon("server", "done");
+      showStepProgress("server", false);
+    } else {
+      setStepIcon("server", "done");
+    }
+
+    // Step 4: Download model
+    if (!status.model_downloaded) {
+      setStepIcon("model", "running");
+      showStepProgress("model", true);
+      setOverallStatus("Downloading voice model (~82 MB)...");
+
+      // Download the ONNX model
+      await invoke("setup_download_file", {
+        url: MODEL_URL,
+        dest: `${paths.model_dir}\\kokoro-v1.0.onnx`,
+        stepName: "model",
+      });
+
+      setStepProgress("model", 90, "Downloading voices...");
+
+      // Download voices.bin
+      await invoke("setup_download_file", {
+        url: VOICES_URL,
+        dest: `${paths.model_dir}\\voices-v1.0.bin`,
+        stepName: "model",
+      });
+
+      setStepIcon("model", "done");
+      showStepProgress("model", false);
+    } else {
+      setStepIcon("model", "done");
+    }
+
+    // Step 5: Start the server
+    setStepIcon("start", "running");
+    showStepProgress("start", true);
+    setStepProgress("start", 50, "Starting server...");
+    setOverallStatus("Starting TTS server...");
+
+    await invoke("start_server");
+
+    // Verify server is running
+    await new Promise((r) => setTimeout(r, 3000));
+    const finalStatus: SetupStatus = await invoke("get_setup_status");
+
+    if (finalStatus.server_running) {
+      setStepIcon("start", "done");
+      showStepProgress("start", false);
+      setOverallStatus("Setup complete! VoiceLink is ready.", "success");
+      if (btn) {
+        btn.innerHTML = `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5" /></svg> All Set!`;
+      }
+    } else {
+      setStepIcon("start", "error");
+      setOverallStatus("Server started but may still be loading. Check Dashboard.", "info");
+    }
+  } catch (e) {
+    console.error("Setup failed:", e);
+    setOverallStatus(`Setup failed: ${e}`, "error");
+    if (btn) {
+      btn.textContent = "Retry Setup";
+      btn.disabled = false;
+    }
+  } finally {
+    setupRunning = false;
+  }
+}
+
+function setupSetupWizard() {
+  const btn = document.getElementById("btn-run-setup");
+  btn?.addEventListener("click", runSetup);
+
+  // Save path button — lets user change the data directory
+  const savePathBtn = document.getElementById("btn-save-path");
+  savePathBtn?.addEventListener("click", async () => {
+    const input = document.getElementById("setup-data-dir") as HTMLInputElement;
+    if (!input) return;
+    const newDir = input.value.trim();
+    if (!newDir) return;
+
+    try {
+      await invoke("set_data_dir", { newDir });
+      setOverallStatus("Path saved. Refreshing status...", "success");
+      await refreshSetupStatus();
+    } catch (e) {
+      setOverallStatus(`Failed to save path: ${e}`, "error");
+    }
+  });
+
+  // Listen for progress events from Rust backend
+  listen<{ step: string; progress: number; downloaded?: number; total?: number; status?: string }>(
+    "setup-progress",
+    (event) => {
+      const { step, progress, downloaded, total } = event.payload;
+      const stepName = step as StepName;
+
+      if (downloaded && total && total > 0) {
+        const mb = (downloaded / 1024 / 1024).toFixed(1);
+        const totalMb = (total / 1024 / 1024).toFixed(1);
+        setStepProgress(stepName, progress, `${mb} / ${totalMb} MB`);
+      } else {
+        setStepProgress(stepName, progress);
+      }
+    }
+  );
+
+  // Initial status check
+  refreshSetupStatus();
+}
+
+// ============================================================================
 // Refresh voices button
 // ============================================================================
 
@@ -421,6 +756,7 @@ window.addEventListener("DOMContentLoaded", () => {
   setupNavigation();
   setupQuickTest();
   setupRefreshButton();
+  setupSetupWizard();
   startStatusPolling();
 
   // Initial voice load for the dashboard quick-test dropdown

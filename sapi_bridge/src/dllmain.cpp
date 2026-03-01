@@ -82,23 +82,23 @@ struct VoiceDefinition
 // All 11 Kokoro voices, matching server/models/kokoro_model.py
 static const VoiceDefinition g_voices[] = {
     // American English Female voices
-    {L"VoiceLink_af_heart", L"VoiceLink Heart (Kokoro)", L"af_heart", L"Female", L"409", L"Adult"},
-    {L"VoiceLink_af_bella", L"VoiceLink Bella (Kokoro)", L"af_bella", L"Female", L"409", L"Adult"},
-    {L"VoiceLink_af_nicole", L"VoiceLink Nicole (Kokoro)", L"af_nicole", L"Female", L"409", L"Adult"},
-    {L"VoiceLink_af_sarah", L"VoiceLink Sarah (Kokoro)", L"af_sarah", L"Female", L"409", L"Adult"},
-    {L"VoiceLink_af_sky", L"VoiceLink Sky (Kokoro)", L"af_sky", L"Female", L"409", L"Adult"},
+    {L"VoiceLink_af_heart", L"Heart (Kokoro)", L"af_heart", L"Female", L"409", L"Adult"},
+    {L"VoiceLink_af_bella", L"Bella (Kokoro)", L"af_bella", L"Female", L"409", L"Adult"},
+    {L"VoiceLink_af_nicole", L"Nicole (Kokoro)", L"af_nicole", L"Female", L"409", L"Adult"},
+    {L"VoiceLink_af_sarah", L"Sarah (Kokoro)", L"af_sarah", L"Female", L"409", L"Adult"},
+    {L"VoiceLink_af_sky", L"Sky (Kokoro)", L"af_sky", L"Female", L"409", L"Adult"},
 
     // American English Male voices
-    {L"VoiceLink_am_adam", L"VoiceLink Adam (Kokoro)", L"am_adam", L"Male", L"409", L"Adult"},
-    {L"VoiceLink_am_michael", L"VoiceLink Michael (Kokoro)", L"am_michael", L"Male", L"409", L"Adult"},
+    {L"VoiceLink_am_adam", L"Adam (Kokoro)", L"am_adam", L"Male", L"409", L"Adult"},
+    {L"VoiceLink_am_michael", L"Michael (Kokoro)", L"am_michael", L"Male", L"409", L"Adult"},
 
     // British English Female voices
-    {L"VoiceLink_bf_emma", L"VoiceLink Emma (Kokoro)", L"bf_emma", L"Female", L"809", L"Adult"},
-    {L"VoiceLink_bf_isabella", L"VoiceLink Isabella (Kokoro)", L"bf_isabella", L"Female", L"809", L"Adult"},
+    {L"VoiceLink_bf_emma", L"Emma (Kokoro)", L"bf_emma", L"Female", L"809", L"Adult"},
+    {L"VoiceLink_bf_isabella", L"Isabella (Kokoro)", L"bf_isabella", L"Female", L"809", L"Adult"},
 
     // British English Male voices
-    {L"VoiceLink_bm_george", L"VoiceLink George (Kokoro)", L"bm_george", L"Male", L"809", L"Adult"},
-    {L"VoiceLink_bm_lewis", L"VoiceLink Lewis (Kokoro)", L"bm_lewis", L"Male", L"809", L"Adult"},
+    {L"VoiceLink_bm_george", L"George (Kokoro)", L"bm_george", L"Male", L"809", L"Adult"},
+    {L"VoiceLink_bm_lewis", L"Lewis (Kokoro)", L"bm_lewis", L"Male", L"809", L"Adult"},
 };
 
 static constexpr size_t g_voiceCount = _countof(g_voices);

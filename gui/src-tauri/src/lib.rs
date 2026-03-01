@@ -7,15 +7,19 @@
 //   2. Tauri commands callable from the web frontend
 //   3. Server health monitoring
 //   4. Voice registry management (rename, enable/disable)
+//   5. First-run setup (download Python, install deps, start server)
 //
 // The frontend (HTML/CSS/JS) calls these via tauri::invoke("command_name").
 // ============================================================================
 
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::os::windows::process::CommandExt;
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::TrayIconEvent,
-    Manager,
+    AppHandle, Emitter, Manager,
 };
 
 // ============================================================================
@@ -62,6 +66,94 @@ pub struct SapiStatus {
     pub dll_path: Option<String>,
     pub voice_count: u32,
 }
+
+// ============================================================================
+// Setup Types & Paths
+// ============================================================================
+
+/// Persistent config stored at C:\ProgramData\VoiceLink\config.json
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct AppConfig {
+    data_dir: String,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        let base = std::env::var("ProgramData")
+            .unwrap_or_else(|_| r"C:\ProgramData".to_string());
+        Self {
+            data_dir: PathBuf::from(base)
+                .join("VoiceLink")
+                .to_string_lossy()
+                .to_string(),
+        }
+    }
+}
+
+impl AppConfig {
+    /// Config file lives at a fixed location so we can always find it
+    fn config_path() -> PathBuf {
+        let base = std::env::var("ProgramData")
+            .unwrap_or_else(|_| r"C:\ProgramData".to_string());
+        PathBuf::from(base).join("VoiceLink").join("config.json")
+    }
+
+    fn load() -> Self {
+        let path = Self::config_path();
+        if path.exists() {
+            if let Ok(data) = std::fs::read_to_string(&path) {
+                if let Ok(cfg) = serde_json::from_str::<AppConfig>(&data) {
+                    return cfg;
+                }
+            }
+        }
+        Self::default()
+    }
+
+    fn save(&self) -> Result<(), String> {
+        let path = Self::config_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create config dir: {}", e))?;
+        }
+        let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+        std::fs::write(&path, json).map_err(|e| format!("Failed to save config: {}", e))
+    }
+
+    fn data_dir(&self) -> PathBuf {
+        PathBuf::from(&self.data_dir)
+    }
+
+    fn python_dir(&self) -> PathBuf {
+        self.data_dir().join("python")
+    }
+
+    fn python_exe(&self) -> PathBuf {
+        self.python_dir().join("python.exe")
+    }
+
+    fn server_dir(&self) -> PathBuf {
+        self.data_dir().join("server")
+    }
+
+    fn model_dir(&self) -> PathBuf {
+        self.data_dir().join("models")
+    }
+}
+
+/// Status of each setup step
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SetupStatus {
+    pub python_installed: bool,
+    pub deps_installed: bool,
+    pub server_installed: bool,
+    pub model_downloaded: bool,
+    pub server_running: bool,
+    pub data_dir: String,
+}
+
+/// Holds the server process handle so we can stop it later
+struct ServerProcess(Option<std::process::Child>);
 
 // ============================================================================
 // Tauri Commands — Called from the frontend via invoke()
@@ -133,7 +225,7 @@ async fn get_server_status() -> Result<ServerStatus, String> {
     }
 }
 
-/// Get list of voices from the inference server
+/// Get list of voices from the inference server, with registry name overrides
 #[tauri::command]
 async fn get_voices() -> Result<Vec<VoiceInfo>, String> {
     let client = reqwest::Client::builder()
@@ -147,7 +239,37 @@ async fn get_voices() -> Result<Vec<VoiceInfo>, String> {
         .await
         .map_err(|e| format!("Server not reachable: {}", e))?;
 
-    let voices: Vec<VoiceInfo> = resp.json().await.map_err(|e| e.to_string())?;
+    let mut voices: Vec<VoiceInfo> = resp.json().await.map_err(|e| e.to_string())?;
+
+    // Read custom names from registry and override server names
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+
+        let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+        if let Ok(tokens_key) =
+            hklm.open_subkey_with_flags(r"SOFTWARE\Microsoft\Speech\Voices\Tokens", KEY_READ)
+        {
+            for voice in voices.iter_mut() {
+                let token_name = format!("VoiceLink_{}", voice.id);
+                if let Ok(token_key) = tokens_key.open_subkey_with_flags(&token_name, KEY_READ) {
+                    // Read the (Default) value — this is the display name
+                    if let Ok(name) = token_key.get_value::<String, _>("") {
+                        if !name.is_empty() {
+                            // Strip legacy "VoiceLink " prefix if present
+                            let clean = if let Some(stripped) = name.strip_prefix("VoiceLink ") {
+                                stripped.to_string()
+                            } else {
+                                name
+                            };
+                            voice.name = clean;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok(voices)
 }
 
@@ -169,18 +291,21 @@ fn rename_voice(voice_id: String, new_name: String) -> Result<(), String> {
     for root in &token_roots {
         let token_path = format!("{}\\{}", root, token_name);
 
-        // Open the Attributes subkey and update the Name value
+        // Update the token's (Default) value — this is what SAPI apps display
+        match hklm.open_subkey_with_flags(&token_path, KEY_SET_VALUE) {
+            Ok(key) => {
+                key.set_value("", &new_name).map_err(|e| e.to_string())?;
+            }
+            Err(_) => {}
+        }
+
+        // Also update the Attributes\Name subkey
         let attrs_path = format!("{}\\Attributes", token_path);
         match hklm.open_subkey_with_flags(&attrs_path, KEY_SET_VALUE) {
             Ok(key) => {
                 key.set_value("Name", &new_name).map_err(|e| e.to_string())?;
             }
-            Err(_) => {
-                // Try setting Name at the token level (some tokens store it there)
-                if let Ok(key) = hklm.open_subkey_with_flags(&token_path, KEY_SET_VALUE) {
-                    let _ = key.set_value("Name", &new_name);
-                }
-            }
+            Err(_) => {}
         }
     }
 
@@ -241,7 +366,21 @@ fn toggle_voice(voice_id: String, enabled: bool) -> Result<(), String> {
     use winreg::enums::*;
     use winreg::RegKey;
 
+    // Check if we have admin privileges by trying to open HKLM with write access
     let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    if hklm
+        .open_subkey_with_flags(
+            r"SOFTWARE\Microsoft\Speech\Voices\Tokens",
+            KEY_WRITE,
+        )
+        .is_err()
+    {
+        return Err(
+            "Administrator privileges required. Please restart VoiceLink as Administrator to toggle voices."
+                .to_string(),
+        );
+    }
+
     let token_name = format!("VoiceLink_{}", voice_id);
 
     let token_roots = [
@@ -275,7 +414,7 @@ fn toggle_voice(voice_id: String, enabled: bool) -> Result<(), String> {
         };
         // Capitalize voice name from ID (e.g. af_heart -> Heart)
         let raw_name = voice_id.split('_').last().unwrap_or(&voice_id);
-        let display_name = format!("VoiceLink {} (Kokoro)",
+        let display_name = format!("{} (Kokoro)",
             raw_name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default()
                 + &raw_name[1..]
         );
@@ -316,6 +455,378 @@ fn toggle_voice(voice_id: String, enabled: bool) -> Result<(), String> {
 }
 
 // ============================================================================
+// Setup Commands — First-run automated setup
+// ============================================================================
+
+/// Check what's already installed and return setup status
+#[tauri::command]
+async fn get_setup_status(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<SetupStatus, String> {
+    // Collect file-based checks while holding the lock, then drop it before network IO
+    let (python_ok, deps_ok, server_ok, model_ok, data_dir_str) = {
+        let cfg = config.lock().unwrap();
+
+        let python_ok = cfg.python_exe().exists();
+
+        let embedded_deps = cfg.python_dir()
+            .join("Lib").join("site-packages").join("fastapi").exists();
+        let deps_marker = cfg.data_dir().join(".deps_installed");
+        let deps_ok = embedded_deps || deps_marker.exists();
+
+        let server_ok = cfg.server_dir().join("main.py").exists();
+
+        let model_ok = cfg.model_dir().join("kokoro-v1.0.onnx").exists()
+            || cfg.model_dir().join("kokoro-v0_19.pth").exists()
+            || cfg.model_dir().join("model").exists();
+
+        (python_ok, deps_ok, server_ok, model_ok, cfg.data_dir.clone())
+    }; // MutexGuard dropped here — safe to do async IO now
+
+    // Check if server is actually running via HTTP health endpoint (same as Dashboard)
+    let server_running = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+    {
+        Ok(client) => client
+            .get("http://127.0.0.1:7860/v1/health")
+            .send()
+            .await
+            .map_or(false, |r| r.status().is_success()),
+        Err(_) => false,
+    };
+
+    Ok(SetupStatus {
+        python_installed: python_ok,
+        deps_installed: deps_ok,
+        server_installed: server_ok,
+        model_downloaded: model_ok,
+        server_running,
+        data_dir: data_dir_str,
+    })
+}
+
+/// Download a file from a URL to a local path, with progress reporting via events
+#[tauri::command]
+async fn setup_download_file(
+    app: AppHandle,
+    url: String,
+    dest: String,
+    step_name: String,
+) -> Result<String, String> {
+    use std::io::Write;
+
+    let dest_path = PathBuf::from(&dest);
+    // Create parent directories
+    if let Some(parent) = dest_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create directory: {}", e))?;
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Download failed: {}", e))?;
+
+    let total_size = resp.content_length().unwrap_or(0);
+    let mut downloaded: u64 = 0;
+
+    let mut file = std::fs::File::create(&dest_path)
+        .map_err(|e| format!("Failed to create file {}: {}", dest, e))?;
+
+    let mut stream = resp.bytes_stream();
+    use futures_util::StreamExt;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("Download error: {}", e))?;
+        file.write_all(&chunk)
+            .map_err(|e| format!("Write error: {}", e))?;
+        downloaded += chunk.len() as u64;
+
+        // Emit progress event to frontend
+        let progress = if total_size > 0 {
+            (downloaded as f64 / total_size as f64 * 100.0) as u32
+        } else {
+            0
+        };
+        let _ = app.emit(
+            "setup-progress",
+            serde_json::json!({
+                "step": step_name,
+                "progress": progress,
+                "downloaded": downloaded,
+                "total": total_size,
+            }),
+        );
+    }
+
+    Ok(dest_path.to_string_lossy().to_string())
+}
+
+/// Extract a zip file to a destination directory
+#[tauri::command]
+async fn setup_extract_zip(zip_path: String, dest_dir: String) -> Result<(), String> {
+    let zip_path = PathBuf::from(&zip_path);
+    let dest_dir = PathBuf::from(&dest_dir);
+
+    std::fs::create_dir_all(&dest_dir)
+        .map_err(|e| format!("Failed to create dir: {}", e))?;
+
+    let file = std::fs::File::open(&zip_path)
+        .map_err(|e| format!("Failed to open zip: {}", e))?;
+
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| format!("Failed to read zip: {}", e))?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+        let out_path = dest_dir.join(
+            entry.mangled_name()
+        );
+
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path).map_err(|e| e.to_string())?;
+        } else {
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let mut out_file = std::fs::File::create(&out_path)
+                .map_err(|e| format!("Failed to create {}: {}", out_path.display(), e))?;
+            std::io::copy(&mut entry, &mut out_file).map_err(|e| e.to_string())?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Enable pip in the embedded Python by modifying the ._pth file
+#[tauri::command]
+fn setup_enable_pip(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<(), String> {
+    let cfg = config.lock().map_err(|e| e.to_string())?;
+    let python = cfg.python_dir();
+
+    // Find the ._pth file (e.g. python311._pth)
+    let pth_file = std::fs::read_dir(&python)
+        .map_err(|e| e.to_string())?
+        .filter_map(|e| e.ok())
+        .find(|e| {
+            e.path()
+                .extension()
+                .map(|ext| ext == "_pth")
+                .unwrap_or(false)
+        });
+
+    if let Some(pth_entry) = pth_file {
+        let pth_path = pth_entry.path();
+        let content = std::fs::read_to_string(&pth_path).map_err(|e| e.to_string())?;
+
+        // Uncomment "import site" line and add Lib\site-packages
+        let mut new_lines: Vec<String> = Vec::new();
+        let mut has_import_site = false;
+        for line in content.lines() {
+            if line.trim() == "#import site" {
+                new_lines.push("import site".to_string());
+                has_import_site = true;
+            } else if line.trim() == "import site" {
+                new_lines.push(line.to_string());
+                has_import_site = true;
+            } else {
+                new_lines.push(line.to_string());
+            }
+        }
+        if !has_import_site {
+            new_lines.push("import site".to_string());
+        }
+
+        std::fs::write(&pth_path, new_lines.join("\n"))
+            .map_err(|e| format!("Failed to write {}: {}", pth_path.display(), e))?;
+    }
+
+    Ok(())
+}
+
+/// Run a command and return its output (used for pip install, etc.)
+#[tauri::command]
+async fn setup_run_command(
+    app: AppHandle,
+    program: String,
+    args: Vec<String>,
+    step_name: String,
+) -> Result<String, String> {
+    let _ = app.emit(
+        "setup-progress",
+        serde_json::json!({
+            "step": step_name,
+            "progress": 0,
+            "status": "running",
+        }),
+    );
+
+    let output = tokio::process::Command::new(&program)
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run {}: {}", program, e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    let _ = app.emit(
+        "setup-progress",
+        serde_json::json!({
+            "step": step_name,
+            "progress": 100,
+            "status": if output.status.success() { "done" } else { "error" },
+        }),
+    );
+
+    if output.status.success() {
+        Ok(stdout)
+    } else {
+        Err(format!("Command failed:\nstdout: {}\nstderr: {}", stdout, stderr))
+    }
+}
+
+/// Change the data directory and persist to config
+#[tauri::command]
+fn set_data_dir(config: tauri::State<'_, Mutex<AppConfig>>, new_dir: String) -> Result<(), String> {
+    let mut cfg = config.lock().map_err(|e| e.to_string())?;
+    cfg.data_dir = new_dir;
+    cfg.save()
+}
+
+/// Copy the server/ directory into the data dir.
+/// Resolves source automatically: bundled resource (production) or repo path (dev).
+#[tauri::command]
+fn setup_install_server(app: AppHandle, config: tauri::State<'_, Mutex<AppConfig>>) -> Result<(), String> {
+    let cfg = config.lock().map_err(|e| e.to_string())?;
+    let dest = cfg.server_dir();
+
+    // Try 1: Bundled resource path (production install)
+    let resource_path = app.path().resource_dir()
+        .map(|p| p.join("server"))
+        .unwrap_or_default();
+
+    // Try 2: Dev path relative to the Cargo project
+    let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent().unwrap_or(std::path::Path::new("."))
+        .parent().unwrap_or(std::path::Path::new("."))
+        .join("server");
+
+    let source = if resource_path.join("main.py").exists() {
+        resource_path
+    } else if dev_path.join("main.py").exists() {
+        dev_path
+    } else {
+        return Err(format!(
+            "Server source not found.\n  Checked resource: {}\n  Checked dev: {}",
+            resource_path.display(), dev_path.display()
+        ));
+    };
+
+    // Copy the server directory recursively
+    fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+        std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
+        for entry in std::fs::read_dir(src).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let src_path = entry.path();
+            let dst_path = dst.join(entry.file_name());
+
+            if src_path.is_dir() {
+                // Skip __pycache__ and .pyc files
+                if entry.file_name() == "__pycache__" {
+                    continue;
+                }
+                copy_dir_recursive(&src_path, &dst_path)?;
+            } else {
+                std::fs::copy(&src_path, &dst_path)
+                    .map_err(|e| format!("Copy failed: {}", e))?;
+            }
+        }
+        Ok(())
+    }
+
+    copy_dir_recursive(&source, &dest)
+}
+
+/// Get the paths used by the setup system
+#[tauri::command]
+fn get_setup_paths(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<serde_json::Value, String> {
+    let cfg = config.lock().map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "data_dir": cfg.data_dir(),
+        "python_dir": cfg.python_dir(),
+        "python_exe": cfg.python_exe(),
+        "server_dir": cfg.server_dir(),
+        "model_dir": cfg.model_dir(),
+    }))
+}
+
+/// Start the inference server using the bundled Python
+#[tauri::command]
+async fn start_server(app: AppHandle) -> Result<(), String> {
+    let config = app.state::<Mutex<AppConfig>>();
+    let cfg = config.lock().map_err(|e| e.to_string())?.clone();
+
+    let python = cfg.python_exe();
+    if !python.exists() {
+        return Err("Python not installed. Run setup first.".to_string());
+    }
+
+    let server = cfg.server_dir();
+    if !server.join("main.py").exists() {
+        return Err("Server not installed. Run setup first.".to_string());
+    }
+
+    // Check if already running
+    if std::net::TcpStream::connect("127.0.0.1:7860").is_ok() {
+        return Ok(()); // Already running
+    }
+
+    // Start server as a detached background process
+    let child = std::process::Command::new(python.to_string_lossy().to_string())
+        .args(["-m", "server.main"])
+        .current_dir(cfg.data_dir())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(0x00000008) // DETACHED_PROCESS on Windows
+        .spawn()
+        .map_err(|e| format!("Failed to start server: {}", e))?;
+
+    // Store the child process handle (drop the lock before await)
+    {
+        let state = app.state::<Mutex<ServerProcess>>();
+        let mut proc = state.lock().map_err(|e| e.to_string())?;
+        proc.0 = Some(child);
+    }
+
+    // Wait a moment for server to start
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    Ok(())
+}
+
+/// Stop the inference server
+#[tauri::command]
+async fn stop_server(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<Mutex<ServerProcess>>();
+    let mut proc = state.lock().map_err(|e| e.to_string())?;
+
+    if let Some(ref mut child) = proc.0 {
+        let _ = child.kill();
+        let _ = child.wait();
+        proc.0 = None;
+    }
+
+    Ok(())
+}
+
+// ============================================================================
 // App Setup — Tray icon, window management
 // ============================================================================
 
@@ -323,6 +834,8 @@ fn toggle_voice(voice_id: String, enabled: bool) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .manage(Mutex::new(ServerProcess(None)))
+        .manage(Mutex::new(AppConfig::load()))
         .invoke_handler(tauri::generate_handler![
             get_server_status,
             get_sapi_status,
@@ -331,6 +844,16 @@ pub fn run() {
             rename_voice,
             toggle_voice,
             preview_voice,
+            get_setup_status,
+            get_setup_paths,
+            set_data_dir,
+            setup_download_file,
+            setup_extract_zip,
+            setup_enable_pip,
+            setup_run_command,
+            setup_install_server,
+            start_server,
+            stop_server,
         ])
         .setup(|app| {
             // Build tray menu
