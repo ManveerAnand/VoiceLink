@@ -140,10 +140,13 @@ target_compile_definitions(voicelink_sapi PRIVATE
     $<$<CONFIG:Debug>:_ITERATOR_DEBUG_LEVEL=2>
 )
 
-# In Release builds, optimize for speed
+# In Release builds, optimize for speed and statically link the CRT.
+# /MT embeds the C runtime into the DLL so it has zero external dependencies.
+# Without this, the DLL needs vcruntime140.dll which clean machines don't have.
 target_compile_options(voicelink_sapi PRIVATE
     $<$<CONFIG:Release>:/O2>    # Maximum speed optimization
     $<$<CONFIG:Release>:/GL>    # Whole program optimization
+    $<$<CONFIG:Release>:/MT>    # Static CRT — no vcruntime140.dll dependency
 )
 
 # Link-time code generation for Release (pairs with /GL)
