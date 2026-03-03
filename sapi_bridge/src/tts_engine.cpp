@@ -39,6 +39,7 @@
 #include <algorithm> // std::min, std::max
 #include <vector>    // for volume scaling buffer
 #include <cstdint>   // int16_t
+#include <cwctype>   // iswspace (word boundary parsing)
 
 // ============================================================================
 // Constructor / Destructor
@@ -411,6 +412,79 @@ STDMETHODIMP VoiceLinkEngine::Speak(
          sapiRate, maxFragRateAdj, effectiveRate, speed, sapiVolume, volumeScale);
 
     // -----------------------------------------------------------------------
+    // Step 2b: Parse word boundaries for SAPI text-tracking events
+    //
+    // SAPI clients (notably Edge Read Aloud) use SPEI_WORD_BOUNDARY events
+    // to highlight the currently-spoken word. Without these events, Edge
+    // shows no text highlighting even though the audio plays correctly.
+    //
+    // We also fire SPEI_SENTENCE_BOUNDARY events at sentence starts so
+    // Edge can jump between sentences when the user clicks in the text.
+    //
+    // We walk the fragment list, split on whitespace, and record each word's
+    // character position (via ulTextSrcOffset) and length. During streaming
+    // we fire events proportionally based on each word's position as a
+    // fraction of total text length.
+    // -----------------------------------------------------------------------
+    struct WordBoundary
+    {
+        ULONG charPos;  // Character offset in original input text
+        ULONG charLen;  // Word length in characters
+        bool sentStart; // Is this the first word of a sentence?
+    };
+    std::vector<WordBoundary> wordBoundaries;
+    ULONG totalTextChars = 0; // Total character span of all fragments
+
+    for (const SPVTEXTFRAG *frag = pTextFragList; frag; frag = frag->pNext)
+    {
+        if (frag->State.eAction != SPVA_Speak || !frag->pTextStart || frag->ulTextLen == 0)
+            continue;
+
+        ULONG baseOff = frag->ulTextSrcOffset;
+        const wchar_t *t = frag->pTextStart;
+        ULONG len = frag->ulTextLen;
+
+        // Track total text span (last char position + 1)
+        if (baseOff + len > totalTextChars)
+            totalTextChars = baseOff + len;
+
+        bool nextIsSentStart = true; // First word of a fragment starts a sentence
+        ULONG i = 0;
+        while (i < len)
+        {
+            while (i < len && std::iswspace(t[i]))
+                i++;
+            if (i >= len)
+                break;
+
+            ULONG ws = i;
+            while (i < len && !std::iswspace(t[i]))
+                i++;
+
+            wordBoundaries.push_back({baseOff + ws, i - ws, nextIsSentStart});
+            nextIsSentStart = false;
+
+            // Check if this word ends with sentence-ending punctuation
+            wchar_t lastChar = t[i - 1];
+            if (lastChar == L'.' || lastChar == L'!' || lastChar == L'?' ||
+                lastChar == L'\u2026') // ellipsis
+            {
+                nextIsSentStart = true; // Next word starts a new sentence
+            }
+        }
+    }
+
+    // Estimated total audio bytes: 48000 bytes/sec ÷ ~15 chars/sec = 3200 bytes/char.
+    // This is a rough fallback estimate. The server reports the EXACT total
+    // audio byte count via the X-Audio-Length header, which we use if available.
+    // The estimate is only used as a fallback when the header is missing.
+    float estTotalAudioBytes = static_cast<float>(totalTextChars) * 3200.0f / speed;
+    size_t nextWordIdx = 0;
+
+    VLOG(L"Parsed %zu word boundaries, totalChars=%lu, estAudio=%.0f bytes",
+         wordBoundaries.size(), totalTextChars, estTotalAudioBytes);
+
+    // -----------------------------------------------------------------------
     // Step 3: Build the JSON request for the inference server
     // -----------------------------------------------------------------------
     std::string jsonBody = BuildTtsRequestJson(textUtf8, m_voiceId, speed);
@@ -421,12 +495,17 @@ STDMETHODIMP VoiceLinkEngine::Speak(
     // The onChunk callback writes each chunk of PCM audio to SAPI.
     // The checkAbort callback checks if the app wants us to stop.
     //
-    // This is where streaming pays off: audio starts playing within
-    // ~100ms (GPU) or ~300ms (CPU) of calling Speak().
+    // The server pre-generates all audio and reports the exact byte count
+    // in the X-Audio-Length header. We use this for perfectly proportional
+    // word boundary events (no drift between highlighting and audio).
     // -----------------------------------------------------------------------
 
     // Track total bytes written (for logging)
     ULONG totalBytesWritten = 0;
+
+    // The server reports exact audio length via X-Audio-Length header.
+    // If available, this replaces our rough estimate for perfect timing.
+    ULONGLONG serverAudioBytes = 0;
 
     HRESULT hr = m_httpClient.StreamSynthesize(
         jsonBody.c_str(),
@@ -485,26 +564,153 @@ STDMETHODIMP VoiceLinkEngine::Speak(
             }
 
             totalBytesWritten += written;
+
+            // ---------------------------------------------------------------
+            // Use server-reported exact audio length if available.
+            //
+            // The server pre-generates all audio and sends the total byte
+            // count in the X-Audio-Length header. Using the EXACT total
+            // instead of our rough estimate gives perfect proportional
+            // word-boundary event timing — no highlight drift.
+            // ---------------------------------------------------------------
+            if (serverAudioBytes > 0 && estTotalAudioBytes != static_cast<float>(serverAudioBytes))
+            {
+                VLOG(L"Updating estTotalAudioBytes: %.0f → %llu (from server)",
+                     estTotalAudioBytes, serverAudioBytes);
+                estTotalAudioBytes = static_cast<float>(serverAudioBytes);
+            }
+
+            // ---------------------------------------------------------------
+            // Fire SPEI_WORD_BOUNDARY (and SPEI_SENTENCE_BOUNDARY) events
+            // for words whose proportional audio offset we have now passed.
+            //
+            // Each word's audio offset is:
+            //   (charPos / totalTextChars) * estTotalAudioBytes
+            //
+            // With the server-reported total, this is exact. With the
+            // fallback estimate, it's approximate.
+            // ---------------------------------------------------------------
+            while (nextWordIdx < wordBoundaries.size())
+            {
+                float fraction = (totalTextChars > 0)
+                                     ? static_cast<float>(wordBoundaries[nextWordIdx].charPos) / totalTextChars
+                                     : 0.0f;
+                ULONGLONG estOffset = static_cast<ULONGLONG>(fraction * estTotalAudioBytes);
+
+                if (estOffset <= totalBytesWritten)
+                {
+                    // Fire sentence boundary before the first word of a sentence
+                    if (wordBoundaries[nextWordIdx].sentStart)
+                    {
+                        // Calculate sentence length (chars to next sentence or end)
+                        ULONG sentLen = 0;
+                        for (size_t si = nextWordIdx + 1; si < wordBoundaries.size(); si++)
+                        {
+                            if (wordBoundaries[si].sentStart)
+                            {
+                                sentLen = wordBoundaries[si].charPos - wordBoundaries[nextWordIdx].charPos;
+                                break;
+                            }
+                        }
+                        if (sentLen == 0 && totalTextChars > wordBoundaries[nextWordIdx].charPos)
+                            sentLen = totalTextChars - wordBoundaries[nextWordIdx].charPos;
+
+                        SPEVENT sentEvt = {};
+                        sentEvt.eEventId = SPEI_SENTENCE_BOUNDARY;
+                        sentEvt.elParamType = SPET_LPARAM_IS_UNDEFINED;
+                        sentEvt.ullAudioStreamOffset = estOffset;
+                        sentEvt.wParam = static_cast<WPARAM>(sentLen);
+                        sentEvt.lParam = static_cast<LPARAM>(wordBoundaries[nextWordIdx].charPos);
+                        pOutputSite->AddEvents(&sentEvt, 1);
+                    }
+
+                    SPEVENT evt = {};
+                    evt.eEventId = SPEI_WORD_BOUNDARY;
+                    evt.elParamType = SPET_LPARAM_IS_UNDEFINED;
+                    evt.ullAudioStreamOffset = estOffset;
+                    evt.wParam = static_cast<WPARAM>(wordBoundaries[nextWordIdx].charLen);
+                    evt.lParam = static_cast<LPARAM>(wordBoundaries[nextWordIdx].charPos);
+                    pOutputSite->AddEvents(&evt, 1);
+                    nextWordIdx++;
+                }
+                else
+                    break;
+            }
+
             return S_OK;
         },
 
         // checkAbort: called between chunks to see if we should stop
         [&]() -> bool
         {
-            // GetActions() returns a bitmask of pending events.
-            // SPVES_ABORT means "stop speaking NOW" — the user clicked stop,
-            // navigated away, or the app is shutting down.
-            //
-            // We check this between chunks (every ~170ms of audio).
-            // This gives responsive cancellation without checking too often.
+            // GetActions() returns a bitmask of pending actions.
+            // IMPORTANT: GetActions() CLEARS the flags after reading,
+            // so we must handle all flags in a single call.
             DWORD actions = pOutputSite->GetActions();
+
             if (actions & SPVES_ABORT)
             {
                 VLOG(L"Abort requested by SAPI");
-                return true; // Signal abort
+                return true;
             }
+
+            // SPVES_SKIP: Edge Read Aloud sends this when the user clicks
+            // on a different position in the text. We acknowledge the skip
+            // and abort so Edge can start a new Speak() from that position.
+            if (actions & SPVES_SKIP)
+            {
+                SPVSKIPTYPE skipType;
+                long skipCount;
+                if (SUCCEEDED(pOutputSite->GetSkipInfo(&skipType, &skipCount)))
+                {
+                    pOutputSite->CompleteSkip(skipCount);
+                }
+                VLOG(L"Skip requested by SAPI — aborting for repositioning");
+                return true;
+            }
+
             return false;
-        });
+        },
+        &serverAudioBytes);
+
+    // Flush any remaining word-boundary events whose estimated offset
+    // exceeded the actual audio length (our estimate was too high).
+    // Only flush on successful completion — not on abort/skip.
+    if (SUCCEEDED(hr))
+        while (nextWordIdx < wordBoundaries.size())
+        {
+            if (wordBoundaries[nextWordIdx].sentStart)
+            {
+                ULONG sentLen = 0;
+                for (size_t si = nextWordIdx + 1; si < wordBoundaries.size(); si++)
+                {
+                    if (wordBoundaries[si].sentStart)
+                    {
+                        sentLen = wordBoundaries[si].charPos - wordBoundaries[nextWordIdx].charPos;
+                        break;
+                    }
+                }
+                if (sentLen == 0 && totalTextChars > wordBoundaries[nextWordIdx].charPos)
+                    sentLen = totalTextChars - wordBoundaries[nextWordIdx].charPos;
+
+                SPEVENT sentEvt = {};
+                sentEvt.eEventId = SPEI_SENTENCE_BOUNDARY;
+                sentEvt.elParamType = SPET_LPARAM_IS_UNDEFINED;
+                sentEvt.ullAudioStreamOffset = totalBytesWritten;
+                sentEvt.wParam = static_cast<WPARAM>(sentLen);
+                sentEvt.lParam = static_cast<LPARAM>(wordBoundaries[nextWordIdx].charPos);
+                pOutputSite->AddEvents(&sentEvt, 1);
+            }
+
+            SPEVENT evt = {};
+            evt.eEventId = SPEI_WORD_BOUNDARY;
+            evt.elParamType = SPET_LPARAM_IS_UNDEFINED;
+            evt.ullAudioStreamOffset = totalBytesWritten;
+            evt.wParam = static_cast<WPARAM>(wordBoundaries[nextWordIdx].charLen);
+            evt.lParam = static_cast<LPARAM>(wordBoundaries[nextWordIdx].charPos);
+            pOutputSite->AddEvents(&evt, 1);
+            nextWordIdx++;
+        }
 
     if (hr == E_ABORT)
     {

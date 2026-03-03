@@ -109,7 +109,8 @@ public:
         const char *jsonBody,
         DWORD jsonBodyLen,
         const std::function<HRESULT(const BYTE *data, DWORD size)> &onChunk,
-        const std::function<bool()> &checkAbort);
+        const std::function<bool()> &checkAbort,
+        ULONGLONG *pTotalAudioBytes = nullptr);
 
     // -----------------------------------------------------------------------
     // IsInitialized — Check if Init() has been called successfully

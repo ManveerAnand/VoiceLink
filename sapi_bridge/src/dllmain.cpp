@@ -212,15 +212,19 @@ static std::wstring GuidToString(const GUID &guid)
     return buf;
 }
 
-// Create a registry key and set its default value
+// Create a registry key and optionally set its default value.
+// If preserveExisting is true and the key already exists, the default
+// value is NOT overwritten (preserves user renames).
 static HRESULT CreateKeyWithDefault(HKEY hParent, const wchar_t *subkey,
-                                    const wchar_t *defaultValue, HKEY *phkResult = nullptr)
+                                    const wchar_t *defaultValue, HKEY *phkResult = nullptr,
+                                    bool preserveExisting = false)
 {
     HKEY hKey = nullptr;
+    DWORD disposition = 0;
     LONG result = RegCreateKeyExW(
         hParent, subkey, 0, nullptr,
-        REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr,
-        &hKey, nullptr);
+        REG_OPTION_NON_VOLATILE, KEY_WRITE | KEY_READ, nullptr,
+        &hKey, &disposition);
 
     if (result != ERROR_SUCCESS)
     {
@@ -230,10 +234,28 @@ static HRESULT CreateKeyWithDefault(HKEY hParent, const wchar_t *subkey,
 
     if (defaultValue)
     {
-        result = RegSetValueExW(
-            hKey, nullptr, 0, REG_SZ,
-            reinterpret_cast<const BYTE *>(defaultValue),
-            static_cast<DWORD>((wcslen(defaultValue) + 1) * sizeof(wchar_t)));
+        bool shouldWrite = true;
+
+        // If preserving existing names, only write if key is newly created
+        // OR if the current value is empty
+        if (preserveExisting && disposition == REG_OPENED_EXISTING_KEY)
+        {
+            // Check if there's already a non-empty value
+            DWORD dataSize = 0;
+            LONG queryResult = RegQueryValueExW(hKey, nullptr, nullptr, nullptr, nullptr, &dataSize);
+            if (queryResult == ERROR_SUCCESS && dataSize > sizeof(wchar_t))
+            {
+                shouldWrite = false; // Already has a name, preserve it
+            }
+        }
+
+        if (shouldWrite)
+        {
+            result = RegSetValueExW(
+                hKey, nullptr, 0, REG_SZ,
+                reinterpret_cast<const BYTE *>(defaultValue),
+                static_cast<DWORD>((wcslen(defaultValue) + 1) * sizeof(wchar_t)));
+        }
     }
 
     if (phkResult)
@@ -373,9 +395,11 @@ STDAPI DllRegisterServer()
             std::wstring tokenPath = std::wstring(tokensRoot) + L"\\" + voice.tokenName;
 
             // Create the voice token key
+            // preserveExisting=true: don't overwrite user-renamed display names
             HKEY hToken = nullptr;
             HRESULT hr = CreateKeyWithDefault(HKEY_LOCAL_MACHINE, tokenPath.c_str(),
-                                              voice.displayName, &hToken);
+                                              voice.displayName, &hToken,
+                                              true /* preserveExisting */);
             if (FAILED(hr))
             {
                 VERR(L"Failed to create token for %s", voice.tokenName);
@@ -394,7 +418,13 @@ STDAPI DllRegisterServer()
                                       nullptr, &hAttrs);
             if (SUCCEEDED(hr) && hAttrs)
             {
-                SetStringValue(hAttrs, L"Name", voice.displayName);
+                // Only set Name if not already present (preserve renames)
+                DWORD nameSize = 0;
+                LONG qr = RegQueryValueExW(hAttrs, L"Name", nullptr, nullptr, nullptr, &nameSize);
+                if (qr != ERROR_SUCCESS || nameSize <= sizeof(wchar_t))
+                {
+                    SetStringValue(hAttrs, L"Name", voice.displayName);
+                }
                 SetStringValue(hAttrs, L"Gender", voice.gender);
                 SetStringValue(hAttrs, L"Language", voice.language);
                 SetStringValue(hAttrs, L"Age", voice.age);

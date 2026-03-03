@@ -91,12 +91,52 @@ function setupNavigation() {
 // Server Status
 // ============================================================================
 
+/** Update the Start/Stop button label and styling based on server state */
+function updateServerToggle(btn: HTMLButtonElement | null, running: boolean) {
+  if (!btn) return;
+  btn.disabled = false;
+  if (running) {
+    btn.textContent = "Stop Server";
+    btn.classList.remove("btn-success");
+    btn.classList.add("btn-danger");
+  } else {
+    btn.textContent = "Start Server";
+    btn.classList.remove("btn-danger");
+    btn.classList.add("btn-success");
+  }
+}
+
+/** Wire up the Start/Stop Server button on the dashboard */
+function setupServerToggle() {
+  const btn = document.getElementById("btn-server-toggle") as HTMLButtonElement | null;
+  btn?.addEventListener("click", async () => {
+    if (!btn) return;
+    const isRunning = btn.classList.contains("btn-danger");
+    btn.disabled = true;
+    btn.textContent = isRunning ? "Stopping…" : "Starting…";
+    try {
+      if (isRunning) {
+        await invoke("stop_server");
+      } else {
+        await invoke("start_server");
+        // Give the server a moment to boot before re-checking
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    } catch (e) {
+      console.error("Server toggle failed:", e);
+    }
+    await checkServerStatus();
+  });
+}
+
 async function checkServerStatus() {
   const indicator = document.getElementById("server-indicator");
   const statusEl = document.getElementById("server-status");
   const modelEl = document.getElementById("server-model");
   const deviceEl = document.getElementById("server-device");
   const voicesEl = document.getElementById("server-voices");
+
+  const toggleBtn = document.getElementById("btn-server-toggle") as HTMLButtonElement | null;
 
   try {
     const result: ServerStatus = await invoke("get_server_status");
@@ -108,10 +148,12 @@ async function checkServerStatus() {
       if (modelEl) modelEl.textContent = result.health.model ?? "—";
       if (deviceEl) deviceEl.textContent = result.health.gpu_name ?? (result.health.gpu_available ? "GPU" : "CPU");
       if (voicesEl) voicesEl.textContent = formatUptime(result.health.uptime_seconds);
+      updateServerToggle(toggleBtn, true);
     } else if (result.running) {
       indicator?.classList.remove("offline");
       indicator?.classList.add("online");
       if (statusEl) statusEl.textContent = "Running (no health data)";
+      updateServerToggle(toggleBtn, true);
     } else {
       indicator?.classList.remove("online");
       indicator?.classList.add("offline");
@@ -119,11 +161,13 @@ async function checkServerStatus() {
       if (modelEl) modelEl.textContent = "—";
       if (deviceEl) deviceEl.textContent = "—";
       if (voicesEl) voicesEl.textContent = "—";
+      updateServerToggle(toggleBtn, false);
     }
   } catch (e) {
     indicator?.classList.remove("online");
     indicator?.classList.add("offline");
     if (statusEl) statusEl.textContent = "Error";
+    updateServerToggle(toggleBtn, false);
     console.error("Status check failed:", e);
   }
 }
@@ -414,13 +458,78 @@ function showModal(title: string, defaultValue: string, alertOnly = false): Prom
 
 const PYTHON_ZIP_URL = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip";
 const GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py";
-// Kokoro model from HuggingFace (ONNX version, ~82MB)
-const MODEL_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx";
-const VOICES_URL = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin";
+// Voicepack download script — uses huggingface_hub (installed with kokoro)
+// Downloads the model + all 11 English voicepacks from HuggingFace to the
+// local HF cache. This ensures ALL voices work, not just the default.
+const VOICEPACK_DOWNLOAD_SCRIPT = `
+import sys, os
+try:
+    from huggingface_hub import hf_hub_download
+except ImportError:
+    print('ERROR: huggingface_hub not installed', flush=True)
+    sys.exit(1)
+
+repo = 'hexgrad/Kokoro-82M'
+voices = [
+    'af_heart', 'af_bella', 'af_nicole', 'af_sarah', 'af_sky',
+    'am_adam', 'am_michael',
+    'bf_emma', 'bf_isabella',
+    'bm_george', 'bm_lewis',
+]
+
+print('Downloading Kokoro model...', flush=True)
+hf_hub_download(repo, 'kokoro-v1_0.pth')
+hf_hub_download(repo, 'config.json')
+print('Model downloaded.', flush=True)
+
+for i, v in enumerate(voices, 1):
+    print(f'Downloading voicepack {i}/{len(voices)}: {v}...', flush=True)
+    hf_hub_download(repo, f'voices/{v}.pt')
+
+print('All voicepacks downloaded.', flush=True)
+
+# Write marker file so the GUI knows everything is ready
+marker = os.path.join(os.environ.get('VOICELINK_DATA_DIR', '.'), '.voices_ready')
+with open(marker, 'w') as f:
+    f.write(','.join(voices))
+print('DONE', flush=True)
+`;
 
 type StepName = "python" | "deps" | "server" | "model" | "start";
 
 let setupRunning = false;
+let stepStartTime: number | null = null;
+let elapsedTimerId: number | null = null;
+
+function formatElapsed(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  return m > 0 ? `${m}m ${sec}s` : `${sec}s`;
+}
+
+function startElapsedTimer(step: StepName) {
+  stepStartTime = Date.now();
+  if (elapsedTimerId) clearInterval(elapsedTimerId);
+  elapsedTimerId = window.setInterval(() => {
+    if (!stepStartTime) return;
+    const elapsed = formatElapsed(Date.now() - stepStartTime);
+    const txt = document.getElementById(`text-${step}`);
+    if (txt) {
+      // Preserve existing text, append elapsed time
+      const base = txt.textContent?.replace(/\s*\(\d+[ms]\s*\d*s?\)$/, "") || "";
+      txt.textContent = `${base} (${elapsed})`;
+    }
+  }, 1000);
+}
+
+function stopElapsedTimer() {
+  if (elapsedTimerId) {
+    clearInterval(elapsedTimerId);
+    elapsedTimerId = null;
+  }
+  stepStartTime = null;
+}
 
 function setStepIcon(step: StepName, state: "pending" | "running" | "done" | "error") {
   const icon = document.getElementById(`step-icon-${step}`);
@@ -569,6 +678,7 @@ async function runSetup() {
       showStepProgress("deps", true);
       setStepProgress("deps", 0, "Installing packages...");
       setOverallStatus("Installing Python packages...");
+      startElapsedTimer("deps");
 
       // Install main deps
       await invoke("setup_run_command", {
@@ -595,6 +705,7 @@ async function runSetup() {
         stepName: "deps",
       });
 
+      stopElapsedTimer();
       setStepIcon("deps", "done");
       showStepProgress("deps", false);
     } else {
@@ -616,28 +727,23 @@ async function runSetup() {
       setStepIcon("server", "done");
     }
 
-    // Step 4: Download model
+    // Step 4: Download model + voicepacks from HuggingFace
     if (!status.model_downloaded) {
       setStepIcon("model", "running");
       showStepProgress("model", true);
-      setOverallStatus("Downloading voice model (~82 MB)...");
+      setOverallStatus("Downloading voice model & voicepacks (~340 MB)...");
+      startElapsedTimer("model");
 
-      // Download the ONNX model
-      await invoke("setup_download_file", {
-        url: MODEL_URL,
-        dest: `${paths.model_dir}\\kokoro-v1.0.onnx`,
+      // Run a Python script that downloads the model and all 11 voicepacks
+      // via huggingface_hub. This ensures every voice works on first use.
+      await invoke("setup_run_command", {
+        program: paths.python_exe,
+        args: ["-c", VOICEPACK_DOWNLOAD_SCRIPT],
         stepName: "model",
+        env: { VOICELINK_DATA_DIR: paths.data_dir },
       });
 
-      setStepProgress("model", 90, "Downloading voices...");
-
-      // Download voices.bin
-      await invoke("setup_download_file", {
-        url: VOICES_URL,
-        dest: `${paths.model_dir}\\voices-v1.0.bin`,
-        stepName: "model",
-      });
-
+      stopElapsedTimer();
       setStepIcon("model", "done");
       showStepProgress("model", false);
     } else {
@@ -649,23 +755,37 @@ async function runSetup() {
     showStepProgress("start", true);
     setStepProgress("start", 50, "Starting server...");
     setOverallStatus("Starting TTS server...");
+    startElapsedTimer("start");
 
     await invoke("start_server");
 
-    // Verify server is running
-    await new Promise((r) => setTimeout(r, 3000));
-    const finalStatus: SetupStatus = await invoke("get_setup_status");
+    // The server takes time to load the model (~30-60s for Kokoro ONNX).
+    // Poll the health endpoint with retries instead of a single check.
+    let serverReady = false;
+    for (let attempt = 0; attempt < 20; attempt++) {
+      setStepProgress("start", 50 + attempt * 2, `Waiting for server to load model... (${(attempt + 1) * 3}s)`);
+      await new Promise((r) => setTimeout(r, 3000));
+      try {
+        const status: SetupStatus = await invoke("get_setup_status");
+        if (status.server_running) {
+          serverReady = true;
+          break;
+        }
+      } catch (_) { /* keep trying */ }
+    }
 
-    if (finalStatus.server_running) {
+    stopElapsedTimer();
+    showStepProgress("start", false);
+
+    if (serverReady) {
       setStepIcon("start", "done");
-      showStepProgress("start", false);
       setOverallStatus("Setup complete! VoiceLink is ready.", "success");
       if (btn) {
         btn.innerHTML = `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5" /></svg> All Set!`;
       }
     } else {
       setStepIcon("start", "error");
-      setOverallStatus("Server started but may still be loading. Check Dashboard.", "info");
+      setOverallStatus("Server is still loading. It may take a minute for the model to initialize. Check Dashboard.", "info");
     }
   } catch (e) {
     console.error("Setup failed:", e);
@@ -675,6 +795,7 @@ async function runSetup() {
       btn.disabled = false;
     }
   } finally {
+    stopElapsedTimer();
     setupRunning = false;
   }
 }
@@ -736,6 +857,34 @@ function setupRefreshButton() {
 }
 
 // ============================================================================
+// Settings — Auto-start toggle
+// ============================================================================
+
+async function setupSettings() {
+  const toggle = document.getElementById("setting-autostart") as HTMLInputElement | null;
+  if (!toggle) return;
+
+  // Load current state
+  try {
+    const enabled: boolean = await invoke("get_autostart");
+    toggle.checked = enabled;
+  } catch (e) {
+    console.error("Failed to get autostart status:", e);
+  }
+
+  // Handle toggle changes
+  toggle.addEventListener("change", async () => {
+    try {
+      await invoke("set_autostart", { enabled: toggle.checked });
+    } catch (e) {
+      console.error("Failed to set autostart:", e);
+      // Revert toggle on error
+      toggle.checked = !toggle.checked;
+    }
+  });
+}
+
+// ============================================================================
 // Utilities
 // ============================================================================
 
@@ -758,13 +907,32 @@ function formatUptime(seconds: number): string {
 // Init
 // ============================================================================
 
-window.addEventListener("DOMContentLoaded", () => {
+window.addEventListener("DOMContentLoaded", async () => {
   setupNavigation();
   setupQuickTest();
+  setupServerToggle();
   setupRefreshButton();
   setupSetupWizard();
+  setupSettings();
   startStatusPolling();
 
   // Initial voice load for the dashboard quick-test dropdown
   loadVoices();
+
+  // Auto-start server on launch if setup is complete but server isn't running
+  try {
+    const status: SetupStatus = await invoke("get_setup_status");
+    if (
+      status.python_installed &&
+      status.deps_installed &&
+      status.server_installed &&
+      status.model_downloaded &&
+      !status.server_running
+    ) {
+      console.log("Setup complete but server offline — auto-starting...");
+      await invoke("start_server");
+    }
+  } catch (e) {
+    console.error("Auto-start check failed:", e);
+  }
 });

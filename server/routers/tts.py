@@ -152,39 +152,54 @@ async def synthesize(request: TTSRequest):
 
     t0 = time.perf_counter()
 
-    def audio_stream() -> Generator[bytes, None, None]:
-        """Generator that yields PCM chunks from the model."""
-        total_bytes = 0
-        try:
-            for chunk in _model.synthesize(
-                text=request.text,
-                voice=request.voice,
-                speed=request.speed,
-            ):
-                total_bytes += len(chunk)
-                yield chunk
-        except Exception as e:
-            # Log the FULL traceback so we can debug
-            logger.exception(f"Synthesis error: {e}")
-            return
+    # ---- Pre-generate all audio ----
+    # We collect all chunks first so we know the exact total byte count.
+    # This lets the COM DLL fire SPEI_WORD_BOUNDARY events at perfectly
+    # proportional audio offsets, giving Edge Read Aloud accurate text
+    # highlighting (no drift between highlighted word and spoken audio).
+    #
+    # The tradeoff: time-to-first-byte increases by the full synthesis
+    # time (~1-3s for a page of text). This is acceptable for reading
+    # apps where users expect a short pause before audio starts.
+    chunks: list[bytes] = []
+    try:
+        for chunk in _model.synthesize(
+            text=request.text,
+            voice=request.voice,
+            speed=request.speed,
+        ):
+            chunks.append(chunk)
+    except Exception as e:
+        logger.exception(f"Synthesis error: {e}")
+        raise HTTPException(status_code=500, detail=f"Synthesis failed: {e}")
 
-        elapsed = time.perf_counter() - t0
-        audio_seconds = total_bytes / (24000 * 2)  # 24kHz * 2 bytes/sample
-        logger.info(
-            f"TTS complete: {audio_seconds:.1f}s audio in {elapsed:.2f}s "
-            f"({audio_seconds / elapsed:.1f}x realtime), "
-            f"{total_bytes:,} bytes"
-        )
+    total_bytes = sum(len(c) for c in chunks)
+    elapsed = time.perf_counter() - t0
+    audio_seconds = total_bytes / (24000 * 2)  # 24kHz * 2 bytes/sample
+    logger.info(
+        f"TTS complete: {audio_seconds:.1f}s audio in {elapsed:.2f}s "
+        f"({audio_seconds / elapsed:.1f}x realtime), "
+        f"{total_bytes:,} bytes"
+    )
 
-    # Return streaming response with appropriate headers
+    def stream_chunks() -> Generator[bytes, None, None]:
+        """Yield pre-generated PCM chunks."""
+        for chunk in chunks:
+            yield chunk
+
+    # Return streaming response with audio length header for precise
+    # word-boundary event timing in the COM DLL.
     return StreamingResponse(
-        content=audio_stream(),
+        content=stream_chunks(),
         media_type="audio/pcm",
         headers={
             # Tell the COM DLL the audio format
             "X-Audio-Sample-Rate": "24000",
             "X-Audio-Sample-Width": "16",
             "X-Audio-Channels": "1",
+            # Exact total audio byte count — used by the DLL for
+            # proportional SPEI_WORD_BOUNDARY event offsets.
+            "X-Audio-Length": str(total_bytes),
         },
     )
 

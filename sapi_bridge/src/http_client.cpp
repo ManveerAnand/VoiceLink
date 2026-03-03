@@ -112,7 +112,8 @@ HRESULT TtsHttpClient::StreamSynthesize(
     const char *jsonBody,
     DWORD jsonBodyLen,
     const std::function<HRESULT(const BYTE *data, DWORD size)> &onChunk,
-    const std::function<bool()> &checkAbort)
+    const std::function<bool()> &checkAbort,
+    ULONGLONG *pTotalAudioBytes)
 {
     if (!m_hConnect)
     {
@@ -231,6 +232,33 @@ HRESULT TtsHttpClient::StreamSynthesize(
         &statusCode,
         &statusSize,
         WINHTTP_NO_HEADER_INDEX);
+
+    // -----------------------------------------------------------------------
+    // Step 5b: Read X-Audio-Length header (if present)
+    //
+    // The server pre-generates all audio and reports the exact total byte
+    // count in this header. The TTS engine uses it for perfectly
+    // proportional SPEI_WORD_BOUNDARY event offsets, so Edge Read Aloud
+    // text highlighting stays in sync with the audio.
+    // -----------------------------------------------------------------------
+    if (pTotalAudioBytes)
+    {
+        *pTotalAudioBytes = 0;
+        wchar_t headerBuf[64] = {};
+        DWORD headerBufSize = sizeof(headerBuf);
+        BOOL hdrOk = WinHttpQueryHeaders(
+            hRequest,
+            WINHTTP_QUERY_CUSTOM,
+            L"X-Audio-Length",
+            headerBuf,
+            &headerBufSize,
+            WINHTTP_NO_HEADER_INDEX);
+        if (hdrOk && headerBufSize > 0)
+        {
+            *pTotalAudioBytes = static_cast<ULONGLONG>(_wtoi64(headerBuf));
+            VLOG(L"Server reported X-Audio-Length: %llu bytes", *pTotalAudioBytes);
+        }
+    }
 
     if (statusCode != 200)
     {

@@ -309,6 +309,36 @@ body {
   font-size: 12px;
 }
 
+.btn-danger {
+  background: #e74c3c;
+  color: #fff;
+}
+
+.btn-danger:hover {
+  background: #c0392b;
+  box-shadow: 0 2px 12px rgba(231, 76, 60, 0.3);
+}
+
+.btn-danger:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-success {
+  background: #27ae60;
+  color: #fff;
+}
+
+.btn-success:hover {
+  background: #219a52;
+  box-shadow: 0 2px 12px rgba(39, 174, 96, 0.3);
+}
+
+.btn-success:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 /* ---- Voice Grid ---- */
 .voices-grid {
   display: grid;

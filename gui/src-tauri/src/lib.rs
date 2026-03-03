@@ -474,13 +474,10 @@ async fn get_setup_status(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<
 
         let server_ok = cfg.server_dir().join("main.py").exists();
 
-        // Check that files actually have content (not 0-byte ghosts from failed downloads)
-        let file_has_content = |p: PathBuf| -> bool {
-            p.metadata().map(|m| m.len() > 1000).unwrap_or(false)
-        };
-        let model_ok = file_has_content(cfg.model_dir().join("kokoro-v1.0.onnx"))
-            || file_has_content(cfg.model_dir().join("kokoro-v0_19.pth"))
-            || cfg.model_dir().join("model").is_dir();
+        // Check for the .voices_ready marker written by the voicepack download
+        // script. This file only exists after ALL voicepacks + model have been
+        // successfully downloaded from HuggingFace to the local HF cache.
+        let model_ok = cfg.data_dir().join(".voices_ready").exists();
 
         (python_ok, deps_ok, server_ok, model_ok, cfg.data_dir.clone())
     }; // MutexGuard dropped here — safe to do async IO now
@@ -683,6 +680,7 @@ async fn setup_run_command(
     program: String,
     args: Vec<String>,
     step_name: String,
+    env: Option<std::collections::HashMap<String, String>>,
 ) -> Result<String, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -697,12 +695,20 @@ async fn setup_run_command(
 
     // CREATE_NO_WINDOW (0x08000000) prevents a visible console window
     // from appearing when a GUI app spawns a console subprocess.
-    let mut child = tokio::process::Command::new(&program)
-        .args(&args)
+    let mut cmd = tokio::process::Command::new(&program);
+    cmd.args(&args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .creation_flags(0x08000000) // CREATE_NO_WINDOW
-        .spawn()
+        .creation_flags(0x08000000); // CREATE_NO_WINDOW
+
+    // Inject optional environment variables (e.g. VOICELINK_DATA_DIR)
+    if let Some(ref envs) = env {
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+    }
+
+    let mut child = cmd.spawn()
         .map_err(|e| format!("Failed to run {}: {}", program, e))?;
 
     // Read stdout and stderr line-by-line, emitting progress events
@@ -878,8 +884,23 @@ async fn start_server(app: AppHandle) -> Result<(), String> {
     // no console window flashes on screen when the server starts.
     // PYTHONPATH must include the data dir so embedded Python can find
     // the "server" package (embedded Python's ._pth restricts sys.path).
+    //
+    // We use a Python bootstrap snippet instead of `-m server.main` so we can
+    // monkey-patch subprocess.Popen to always pass CREATE_NO_WINDOW. This
+    // prevents spaCy, HuggingFace, and other libraries from flashing CMD
+    // windows when they download models on first run.
+    let bootstrap = r#"
+import subprocess, sys
+_orig = subprocess.Popen.__init__
+def _patched(self, *a, **kw):
+    if sys.platform == 'win32' and 'creationflags' not in kw:
+        kw['creationflags'] = 0x08000000
+    _orig(self, *a, **kw)
+subprocess.Popen.__init__ = _patched
+import runpy; runpy.run_module('server.main', run_name='__main__', alter_sys=True)
+"#;
     let child = std::process::Command::new(python.to_string_lossy().to_string())
-        .args(["-m", "server.main"])
+        .args(["-c", bootstrap.trim()])
         .current_dir(cfg.data_dir())
         .env("PYTHONPATH", cfg.data_dir())
         .stdout(std::process::Stdio::null())
@@ -917,6 +938,74 @@ async fn stop_server(app: AppHandle) -> Result<(), String> {
 }
 
 // ============================================================================
+// Auto-start — Launch VoiceLink GUI on user login
+// ============================================================================
+// Uses HKCU registry Run key to launch VoiceLink.exe --minimized on login.
+// HKCU doesn't require admin elevation (same approach as Discord, Steam, etc.).
+// The app starts hidden in the system tray and auto-starts the TTS server.
+
+const AUTOSTART_REG_KEY: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
+const AUTOSTART_VALUE_NAME: &str = "VoiceLink";
+
+/// Check if auto-start is enabled
+#[tauri::command]
+fn get_autostart(_app: AppHandle) -> Result<bool, String> {
+    use winreg::enums::*;
+    use winreg::RegKey;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    match hkcu.open_subkey(AUTOSTART_REG_KEY) {
+        Ok(key) => {
+            let val: Result<String, _> = key.get_value(AUTOSTART_VALUE_NAME);
+            Ok(val.is_ok())
+        }
+        Err(_) => Ok(false),
+    }
+}
+
+/// Enable or disable auto-start
+#[tauri::command]
+fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
+    use winreg::enums::*;
+    use winreg::RegKey;
+
+    if enabled {
+        // Get the path to the running VoiceLink.exe
+        let exe_path = std::env::current_exe()
+            .map_err(|e| format!("Failed to get exe path: {}", e))?;
+
+        // Register in HKCU Run key: "path\to\VoiceLink.exe" --minimized
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let (key, _) = hkcu
+            .create_subkey(AUTOSTART_REG_KEY)
+            .map_err(|e| format!("Failed to open registry: {}", e))?;
+
+        let cmd = format!(
+            r#""{}" --minimized"#,
+            exe_path.to_string_lossy()
+        );
+        key.set_value(AUTOSTART_VALUE_NAME, &cmd)
+            .map_err(|e| format!("Failed to set registry value: {}", e))?;
+    } else {
+        // Remove from registry
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        if let Ok(key) = hkcu.open_subkey_with_flags(AUTOSTART_REG_KEY, KEY_WRITE) {
+            let _ = key.delete_value(AUTOSTART_VALUE_NAME);
+        }
+
+        // Clean up old VBS script if it exists
+        let config = app.state::<Mutex<AppConfig>>();
+        let data_dir = config.lock().ok().map(|c| c.data_dir.clone());
+        if let Some(dir) = data_dir {
+            let vbs_path = PathBuf::from(dir).join("start_server.vbs");
+            let _ = std::fs::remove_file(vbs_path);
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
 // App Setup — Tray icon, window management
 // ============================================================================
 
@@ -944,6 +1033,8 @@ pub fn run() {
             setup_install_server,
             start_server,
             stop_server,
+            get_autostart,
+            set_autostart,
         ])
         .setup(|app| {
             // Build tray menu
@@ -980,9 +1071,13 @@ pub fn run() {
                 });
             }
 
-            // Show the main window after setup
-            if let Some(win) = app.get_webview_window("main") {
-                let _ = win.show();
+            // If launched with --minimized (auto-start on login), keep window
+            // hidden and just live in the system tray. Otherwise show normally.
+            let minimized = std::env::args().any(|a| a == "--minimized");
+            if !minimized {
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.show();
+                }
             }
 
             Ok(())
