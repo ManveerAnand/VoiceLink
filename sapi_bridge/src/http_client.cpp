@@ -27,6 +27,25 @@
 #pragma comment(lib, "winhttp.lib")
 
 // ============================================================================
+// Retry / Timeout Configuration
+// ============================================================================
+//
+// When the server is not running (e.g. after a reboot before VoiceLink GUI
+// starts), the COM DLL should not hang or crash the calling app. Instead:
+//   1. Set connection/receive timeouts so we don't block forever
+//   2. Retry a few times with short delays (server may be starting up)
+//   3. If all retries fail, return S_OK (silence) instead of E_FAIL
+//
+// This makes VoiceLink gracefully degrade: the app just hears nothing
+// instead of getting an error dialog or crashing.
+// ============================================================================
+static constexpr int    MAX_RETRIES         = 3;      // Total attempts
+static constexpr DWORD  RETRY_DELAY_MS      = 500;    // Wait between retries
+static constexpr DWORD  CONNECT_TIMEOUT_MS  = 2000;   // TCP connect timeout
+static constexpr DWORD  SEND_TIMEOUT_MS     = 5000;   // Time to send request
+static constexpr DWORD  RECEIVE_TIMEOUT_MS  = 30000;  // Time waiting for response headers
+
+// ============================================================================
 // TtsHttpClient Implementation
 // ============================================================================
 
@@ -66,6 +85,14 @@ HRESULT TtsHttpClient::Init(const wchar_t *host, INTERNET_PORT port)
         VERR(L"WinHttpOpen failed: %lu", GetLastError());
         return E_FAIL;
     }
+
+    // Set timeouts so we don't block forever if the server is down.
+    // WinHttpSetTimeouts parameters: resolve, connect, send, receive (all in ms).
+    WinHttpSetTimeouts(m_hSession,
+                       CONNECT_TIMEOUT_MS,  // DNS resolve (N/A for 127.0.0.1 but harmless)
+                       CONNECT_TIMEOUT_MS,  // TCP connect
+                       SEND_TIMEOUT_MS,     // Send
+                       RECEIVE_TIMEOUT_MS); // Receive
 
     // -----------------------------------------------------------------------
     // Step 2: Connect to the server
@@ -120,6 +147,59 @@ HRESULT TtsHttpClient::StreamSynthesize(
         VERR(L"StreamSynthesize called but client not initialized");
         return E_FAIL;
     }
+
+    // -----------------------------------------------------------------------
+    // Retry loop: if the server is down or starting up, retry a few times
+    // before giving up. This handles the common case where the COM DLL is
+    // loaded (e.g. by Thorium) before the VoiceLink GUI has started the
+    // server. Each retry waits briefly to give the server time to come up.
+    // -----------------------------------------------------------------------
+    HRESULT lastHr = E_FAIL;
+
+    for (int attempt = 0; attempt < MAX_RETRIES; ++attempt)
+    {
+        if (attempt > 0)
+        {
+            VLOG(L"Retry attempt %d/%d after %lu ms delay",
+                 attempt + 1, MAX_RETRIES, RETRY_DELAY_MS);
+            Sleep(RETRY_DELAY_MS);
+
+            // Check abort between retries (don't make the user wait)
+            if (checkAbort && checkAbort())
+            {
+                VLOG(L"Synthesis aborted during retry wait");
+                return S_OK; // SAPI convention: return S_OK on abort
+            }
+        }
+
+        lastHr = StreamSynthesizeOnce(jsonBody, jsonBodyLen, onChunk,
+                                       checkAbort, pTotalAudioBytes);
+
+        // Success or user abort: stop retrying
+        if (SUCCEEDED(lastHr) || lastHr == E_ABORT)
+            return (lastHr == E_ABORT) ? S_OK : lastHr;
+
+        VERR(L"StreamSynthesize attempt %d failed: 0x%08lX", attempt + 1, lastHr);
+    }
+
+    // All retries exhausted. Return S_OK (silence) instead of E_FAIL.
+    // This prevents the calling app from showing an error or crashing.
+    // The user just hears nothing, which is much better than a crash.
+    VERR(L"All %d attempts failed. Returning silence to avoid app crash.", MAX_RETRIES);
+    return S_OK;
+}
+
+// ============================================================================
+// StreamSynthesizeOnce — Single attempt at HTTP TTS synthesis
+// ============================================================================
+
+HRESULT TtsHttpClient::StreamSynthesizeOnce(
+    const char *jsonBody,
+    DWORD jsonBodyLen,
+    const std::function<HRESULT(const BYTE *data, DWORD size)> &onChunk,
+    const std::function<bool()> &checkAbort,
+    ULONGLONG *pTotalAudioBytes)
+{
 
     // -----------------------------------------------------------------------
     // Step 1: Create a POST request to /v1/tts

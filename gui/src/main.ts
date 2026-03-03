@@ -857,23 +857,34 @@ function setupRefreshButton() {
 }
 
 // ============================================================================
-// Settings — Auto-start toggle
+// Settings — Auto-start toggle + server port
 // ============================================================================
 
 async function setupSettings() {
   const toggle = document.getElementById("setting-autostart") as HTMLInputElement | null;
-  if (!toggle) return;
+  const portInput = document.getElementById("setting-server-url") as HTMLInputElement | null;
 
-  // Load current state
+  // Load current persisted settings
   try {
-    const enabled: boolean = await invoke("get_autostart");
-    toggle.checked = enabled;
+    const settings: { data_dir: string; server_port: number; auto_start: boolean } =
+      await invoke("get_settings");
+
+    if (toggle) toggle.checked = settings.auto_start;
+    if (portInput) portInput.value = `http://127.0.0.1:${settings.server_port}`;
   } catch (e) {
-    console.error("Failed to get autostart status:", e);
+    console.error("Failed to load settings:", e);
+    // Fallback: check registry directly for autostart
+    try {
+      if (toggle) {
+        const enabled: boolean = await invoke("get_autostart");
+        toggle.checked = enabled;
+      }
+    } catch (_) { /* ignore */ }
   }
 
-  // Handle toggle changes
-  toggle.addEventListener("change", async () => {
+  // Handle auto-start toggle changes
+  toggle?.addEventListener("change", async () => {
+    if (!toggle) return;
     try {
       await invoke("set_autostart", { enabled: toggle.checked });
     } catch (e) {
@@ -881,6 +892,13 @@ async function setupSettings() {
       // Revert toggle on error
       toggle.checked = !toggle.checked;
     }
+  });
+
+  // Listen for watchdog giving up (server crashed too many times)
+  listen("server-watchdog-gave-up", (event) => {
+    console.warn("Server watchdog gave up after", event.payload, "restarts");
+    const statusEl = document.getElementById("server-status");
+    if (statusEl) statusEl.textContent = "Crashed (restart failed)";
   });
 }
 

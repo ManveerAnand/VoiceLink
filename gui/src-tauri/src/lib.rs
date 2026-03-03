@@ -75,6 +75,14 @@ pub struct SapiStatus {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct AppConfig {
     data_dir: String,
+    #[serde(default = "default_server_port")]
+    server_port: u16,
+    #[serde(default)]
+    auto_start: bool,
+}
+
+fn default_server_port() -> u16 {
+    7860
 }
 
 impl Default for AppConfig {
@@ -86,6 +94,8 @@ impl Default for AppConfig {
                 .join("VoiceLink")
                 .to_string_lossy()
                 .to_string(),
+            server_port: 7860,
+            auto_start: false,
         }
     }
 }
@@ -154,6 +164,9 @@ pub struct SetupStatus {
 
 /// Holds the server process handle so we can stop it later
 struct ServerProcess(Option<std::process::Child>);
+
+/// Whether we intentionally started the server (vs found it running externally)
+struct ServerManagedByUs(bool);
 
 // ============================================================================
 // Tauri Commands — Called from the frontend via invoke()
@@ -914,6 +927,11 @@ import runpy; runpy.run_module('server.main', run_name='__main__', alter_sys=Tru
         let state = app.state::<Mutex<ServerProcess>>();
         let mut proc = state.lock().map_err(|e| e.to_string())?;
         proc.0 = Some(child);
+
+        // Mark that we manage the server (enables watchdog auto-restart)
+        let managed = app.state::<Mutex<ServerManagedByUs>>();
+        let mut m = managed.lock().map_err(|e| e.to_string())?;
+        m.0 = true;
     }
 
     // Wait a moment for server to start
@@ -925,6 +943,13 @@ import runpy; runpy.run_module('server.main', run_name='__main__', alter_sys=Tru
 /// Stop the inference server
 #[tauri::command]
 async fn stop_server(app: AppHandle) -> Result<(), String> {
+    // Clear managed flag first so watchdog doesn't restart
+    {
+        let managed = app.state::<Mutex<ServerManagedByUs>>();
+        let mut m = managed.lock().map_err(|e| e.to_string())?;
+        m.0 = false;
+    }
+
     let state = app.state::<Mutex<ServerProcess>>();
     let mut proc = state.lock().map_err(|e| e.to_string())?;
 
@@ -932,6 +957,70 @@ async fn stop_server(app: AppHandle) -> Result<(), String> {
         let _ = child.kill();
         let _ = child.wait();
         proc.0 = None;
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Settings — Persist to config.json
+// ============================================================================
+
+/// Return the current settings to the frontend
+#[tauri::command]
+fn get_settings(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<serde_json::Value, String> {
+    let cfg = config.lock().map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "data_dir": cfg.data_dir,
+        "server_port": cfg.server_port,
+        "auto_start": cfg.auto_start,
+    }))
+}
+
+/// Update settings and persist to disk. Also syncs auto_start with registry.
+#[tauri::command]
+fn save_settings(
+    app: AppHandle,
+    server_port: Option<u16>,
+    auto_start: Option<bool>,
+) -> Result<(), String> {
+    let config = app.state::<Mutex<AppConfig>>();
+    let mut cfg = config.lock().map_err(|e| e.to_string())?;
+
+    if let Some(port) = server_port {
+        cfg.server_port = port;
+    }
+
+    if let Some(auto) = auto_start {
+        cfg.auto_start = auto;
+        // Sync with registry (drop lock first is not needed — set_autostart_inner)
+        set_autostart_inner(auto)?;
+    }
+
+    cfg.save()?;
+    Ok(())
+}
+
+/// Internal helper to set/clear the HKCU Run key without needing an AppHandle
+fn set_autostart_inner(enabled: bool) -> Result<(), String> {
+    use winreg::enums::*;
+    use winreg::RegKey;
+
+    if enabled {
+        let exe_path = std::env::current_exe()
+            .map_err(|e| format!("Failed to get exe path: {}", e))?;
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let (key, _) = hkcu
+            .create_subkey(AUTOSTART_REG_KEY)
+            .map_err(|e| format!("Failed to open registry: {}", e))?;
+        let cmd = format!(r#""{}" --minimized"#, exe_path.to_string_lossy());
+        key.set_value(AUTOSTART_VALUE_NAME, &cmd)
+            .map_err(|e| format!("Failed to set registry value: {}", e))?;
+    } else {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        if let Ok(key) = hkcu.open_subkey_with_flags(AUTOSTART_REG_KEY, KEY_WRITE) {
+            let _ = key.delete_value(AUTOSTART_VALUE_NAME);
+        }
     }
 
     Ok(())
@@ -966,34 +1055,18 @@ fn get_autostart(_app: AppHandle) -> Result<bool, String> {
 /// Enable or disable auto-start
 #[tauri::command]
 fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
-    use winreg::enums::*;
-    use winreg::RegKey;
+    // Update registry via shared helper
+    set_autostart_inner(enabled)?;
 
-    if enabled {
-        // Get the path to the running VoiceLink.exe
-        let exe_path = std::env::current_exe()
-            .map_err(|e| format!("Failed to get exe path: {}", e))?;
+    // Also persist to config.json
+    let config = app.state::<Mutex<AppConfig>>();
+    if let Ok(mut cfg) = config.lock() {
+        cfg.auto_start = enabled;
+        let _ = cfg.save();
+    }
 
-        // Register in HKCU Run key: "path\to\VoiceLink.exe" --minimized
-        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        let (key, _) = hkcu
-            .create_subkey(AUTOSTART_REG_KEY)
-            .map_err(|e| format!("Failed to open registry: {}", e))?;
-
-        let cmd = format!(
-            r#""{}" --minimized"#,
-            exe_path.to_string_lossy()
-        );
-        key.set_value(AUTOSTART_VALUE_NAME, &cmd)
-            .map_err(|e| format!("Failed to set registry value: {}", e))?;
-    } else {
-        // Remove from registry
-        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        if let Ok(key) = hkcu.open_subkey_with_flags(AUTOSTART_REG_KEY, KEY_WRITE) {
-            let _ = key.delete_value(AUTOSTART_VALUE_NAME);
-        }
-
-        // Clean up old VBS script if it exists
+    // Clean up old VBS script if it exists
+    if !enabled {
         let config = app.state::<Mutex<AppConfig>>();
         let data_dir = config.lock().ok().map(|c| c.data_dir.clone());
         if let Some(dir) = data_dir {
@@ -1006,6 +1079,131 @@ fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
 }
 
 // ============================================================================
+// Server Watchdog — Auto-restart on crash
+// ============================================================================
+//
+// Background task that monitors the server health every 15 seconds.
+// If the server was started by us (ServerManagedByUs == true) and it goes
+// offline, the watchdog restarts it automatically. Capped at 5 consecutive
+// restarts to prevent infinite loops. Counter resets on successful health check.
+// ============================================================================
+
+const WATCHDOG_INTERVAL_SECS: u64 = 15;
+const MAX_CONSECUTIVE_RESTARTS: u32 = 5;
+
+async fn server_watchdog(app: AppHandle) {
+    let mut consecutive_restarts: u32 = 0;
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(WATCHDOG_INTERVAL_SECS)).await;
+
+        // Check if we're supposed to be managing the server
+        let is_managed = {
+            let managed = app.state::<Mutex<ServerManagedByUs>>();
+            managed.lock().map(|m| m.0).unwrap_or(false)
+        };
+
+        if !is_managed {
+            consecutive_restarts = 0;
+            continue;
+        }
+
+        // Health check
+        let server_alive = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+        {
+            Ok(client) => client
+                .get("http://127.0.0.1:7860/v1/health")
+                .send()
+                .await
+                .map_or(false, |r| r.status().is_success()),
+            Err(_) => false,
+        };
+
+        if server_alive {
+            // Server is healthy, reset restart counter
+            if consecutive_restarts > 0 {
+                eprintln!("[watchdog] Server recovered after {} restart(s)", consecutive_restarts);
+                consecutive_restarts = 0;
+            }
+            continue;
+        }
+
+        // Server is down and we manage it — try to restart
+        consecutive_restarts += 1;
+
+        if consecutive_restarts > MAX_CONSECUTIVE_RESTARTS {
+            eprintln!(
+                "[watchdog] Server crashed {} times. Giving up auto-restart. \
+                 User must restart manually.",
+                MAX_CONSECUTIVE_RESTARTS
+            );
+            // Disable managed flag to stop retrying
+            if let Ok(mut m) = app.state::<Mutex<ServerManagedByUs>>().lock() {
+                m.0 = false;
+            }
+            // Notify the frontend
+            let _ = app.emit("server-watchdog-gave-up", consecutive_restarts);
+            continue;
+        }
+
+        eprintln!(
+            "[watchdog] Server offline (attempt {}/{}). Restarting...",
+            consecutive_restarts, MAX_CONSECUTIVE_RESTARTS
+        );
+
+        // Get config for restart
+        let cfg = {
+            let config = app.state::<Mutex<AppConfig>>();
+            let locked = match config.lock() {
+                Ok(c) => c.clone(),
+                Err(_) => continue,
+            };
+            locked
+        };
+
+        let python = cfg.python_exe();
+        if !python.exists() {
+            continue;
+        }
+
+        let bootstrap = r#"
+import subprocess, sys
+_orig = subprocess.Popen.__init__
+def _patched(self, *a, **kw):
+    if sys.platform == 'win32' and 'creationflags' not in kw:
+        kw['creationflags'] = 0x08000000
+    _orig(self, *a, **kw)
+subprocess.Popen.__init__ = _patched
+import runpy; runpy.run_module('server.main', run_name='__main__', alter_sys=True)
+"#;
+        match std::process::Command::new(python.to_string_lossy().to_string())
+            .args(["-c", bootstrap.trim()])
+            .current_dir(cfg.data_dir())
+            .env("PYTHONPATH", cfg.data_dir())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(0x00000008 | 0x08000000)
+            .spawn()
+        {
+            Ok(child) => {
+                // Update the stored process handle
+                if let Ok(mut proc) = app.state::<Mutex<ServerProcess>>().lock() {
+                    proc.0 = Some(child);
+                }
+                eprintln!("[watchdog] Server process spawned. Waiting for it to become healthy...");
+                // Give it time to start before next health check
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            Err(e) => {
+                eprintln!("[watchdog] Failed to restart server: {}", e);
+            }
+        }
+    }
+}
+
+// ============================================================================
 // App Setup — Tray icon, window management
 // ============================================================================
 
@@ -1014,6 +1212,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(Mutex::new(ServerProcess(None)))
+        .manage(Mutex::new(ServerManagedByUs(false)))
         .manage(Mutex::new(AppConfig::load()))
         .invoke_handler(tauri::generate_handler![
             get_server_status,
@@ -1035,6 +1234,8 @@ pub fn run() {
             stop_server,
             get_autostart,
             set_autostart,
+            get_settings,
+            save_settings,
         ])
         .setup(|app| {
             // Build tray menu
@@ -1079,6 +1280,13 @@ pub fn run() {
                     let _ = win.show();
                 }
             }
+
+            // Spawn the server watchdog background task.
+            // It monitors server health and auto-restarts on crash.
+            let watchdog_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                server_watchdog(watchdog_handle).await;
+            });
 
             Ok(())
         })

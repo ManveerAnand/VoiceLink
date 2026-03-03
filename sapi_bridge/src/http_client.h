@@ -118,6 +118,14 @@ public:
     bool IsInitialized() const { return m_hConnect != nullptr; }
 
 private:
+    // Single attempt at HTTP synthesis (called by StreamSynthesize retry loop)
+    HRESULT StreamSynthesizeOnce(
+        const char *jsonBody,
+        DWORD jsonBodyLen,
+        const std::function<HRESULT(const BYTE *data, DWORD size)> &onChunk,
+        const std::function<bool()> &checkAbort,
+        ULONGLONG *pTotalAudioBytes);
+
     HINTERNET m_hSession = nullptr; // WinHTTP session (like a browser instance)
     HINTERNET m_hConnect = nullptr; // Connection to localhost:7860
     std::wstring m_host;
