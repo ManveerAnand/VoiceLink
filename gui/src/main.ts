@@ -1672,6 +1672,13 @@ async function loadQwen3Voices() {
 
 let narrateInitialized = false;
 let narratePcmData: Uint8Array | null = null;
+let narrateAudioCtx: AudioContext | null = null;
+let narrateSource: AudioBufferSourceNode | null = null;
+let narrateBuffer: AudioBuffer | null = null;
+let narrateStartTime = 0;
+let narrateOffset = 0;
+let narratePlaying = false;
+let narrateRafId = 0;
 
 function setupNarratePage() {
   const voiceSelect = document.getElementById("narrate-voice") as HTMLSelectElement | null;
@@ -1693,26 +1700,25 @@ function setupNarratePage() {
   if (narrateInitialized) return;
   narrateInitialized = true;
 
-  // Speed slider update
+  // Speed slider
   speedSlider?.addEventListener("input", () => {
     if (speedLabel) speedLabel.textContent = `${parseFloat(speedSlider.value).toFixed(2)}×`;
   });
 
-  // Character count update
+  // Character count
   textArea.addEventListener("input", () => {
     const len = textArea.value.length;
-    if (charCount) charCount.textContent = `${len.toLocaleString()} / 50,000 characters`;
+    if (charCount) charCount.textContent = `${len.toLocaleString()} / 50,000`;
     if (generateBtn) generateBtn.disabled = len === 0;
   });
 
-  // File upload: read text content
+  // File upload
   fileInput?.addEventListener("change", () => {
     const file = fileInput.files?.[0];
     if (!file) return;
     const reader = new FileReader();
     reader.onload = () => {
-      const content = reader.result as string;
-      textArea.value = content.substring(0, 50000);
+      textArea.value = (reader.result as string).substring(0, 50000);
       textArea.dispatchEvent(new Event("input"));
     };
     reader.readAsText(file);
@@ -1739,6 +1745,9 @@ function setupNarratePage() {
     if (statusEl) statusEl.textContent = "Generating narration...";
     if (progressBar) progressBar.style.width = "30%";
 
+    // Stop any playing audio
+    narrateStopPlayback();
+
     try {
       const pcmBytes = await invoke<number[]>("qwen3_narrate", {
         voiceId,
@@ -1752,20 +1761,30 @@ function setupNarratePage() {
 
       if (pcmBytes && pcmBytes.length > 0) {
         narratePcmData = new Uint8Array(pcmBytes);
-        const durationSecs = (narratePcmData.length / 2) / 24000;
-        const durationEl = document.getElementById("narrate-duration");
-        if (durationEl) {
-          const mins = Math.floor(durationSecs / 60);
-          const secs = Math.floor(durationSecs % 60);
-          durationEl.textContent = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
-        }
+        const totalSecs = (narratePcmData.length / 2) / 24000;
 
-        // Create a WAV blob for the <audio> element
-        const wavBlob = pcmToWavBlob(narratePcmData, 24000);
-        const audioEl = document.getElementById("narrate-audio") as HTMLAudioElement | null;
-        if (audioEl) {
-          audioEl.src = URL.createObjectURL(wavBlob);
-        }
+        // Duration badge
+        const durationEl = document.getElementById("narrate-duration");
+        if (durationEl) durationEl.textContent = formatTime(totalSecs);
+
+        // Time displays
+        const timeTotal = document.getElementById("narrate-time-total");
+        if (timeTotal) timeTotal.textContent = formatTime(totalSecs);
+        const timeCur = document.getElementById("narrate-time");
+        if (timeCur) timeCur.textContent = "0:00";
+
+        // Reset seek
+        const seekFill = document.getElementById("narrate-seek-fill");
+        if (seekFill) seekFill.style.width = "0%";
+
+        // Prepare AudioBuffer
+        narrateAudioCtx = new AudioContext({ sampleRate: 24000 });
+        const int16 = new Int16Array(narratePcmData.buffer, narratePcmData.byteOffset, narratePcmData.byteLength / 2);
+        const float32 = new Float32Array(int16.length);
+        for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
+        narrateBuffer = narrateAudioCtx.createBuffer(1, float32.length, 24000);
+        narrateBuffer.copyToChannel(float32, 0);
+        narrateOffset = 0;
 
         if (resultDiv) resultDiv.style.display = "block";
       }
@@ -1774,19 +1793,39 @@ function setupNarratePage() {
       if (statusEl) statusEl.textContent = `Error: ${e}`;
     } finally {
       generateBtn.disabled = false;
-      generateBtn.innerHTML = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3" /></svg> Generate Narration`;
-      setTimeout(() => {
-        if (progressDiv) progressDiv.style.display = "none";
-      }, 3000);
+      generateBtn.innerHTML = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3" /></svg> Generate`;
+      setTimeout(() => { if (progressDiv) progressDiv.style.display = "none"; }, 2000);
     }
   });
 
-  // Play button
-  document.getElementById("btn-narrate-play")?.addEventListener("click", () => {
-    if (narratePcmData) playPcmAudio(narratePcmData);
+  // Play/Pause button
+  document.getElementById("btn-narrate-playpause")?.addEventListener("click", () => {
+    if (narratePlaying) {
+      narrateStopPlayback();
+    } else {
+      narrateStartPlayback(narrateOffset);
+    }
   });
 
-  // Download WAV button
+  // Seek bar click
+  document.getElementById("narrate-seek")?.addEventListener("click", (e) => {
+    if (!narrateBuffer) return;
+    const bar = e.currentTarget as HTMLElement;
+    const rect = bar.getBoundingClientRect();
+    const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const seekTo = pct * narrateBuffer.duration;
+    if (narratePlaying) {
+      narrateStopPlayback();
+      narrateStartPlayback(seekTo);
+    } else {
+      narrateOffset = seekTo;
+      updateNarrateSeekUI(pct);
+      const timeCur = document.getElementById("narrate-time");
+      if (timeCur) timeCur.textContent = formatTime(seekTo);
+    }
+  });
+
+  // Download WAV
   document.getElementById("btn-narrate-download")?.addEventListener("click", () => {
     if (!narratePcmData) return;
     const wavBlob = pcmToWavBlob(narratePcmData, 24000);
@@ -1797,6 +1836,80 @@ function setupNarratePage() {
     a.click();
     URL.revokeObjectURL(url);
   });
+}
+
+function narrateStartPlayback(fromOffset: number) {
+  if (!narrateAudioCtx || !narrateBuffer) return;
+
+  // Resume if suspended
+  if (narrateAudioCtx.state === "suspended") narrateAudioCtx.resume();
+
+  narrateSource = narrateAudioCtx.createBufferSource();
+  narrateSource.buffer = narrateBuffer;
+  narrateSource.connect(narrateAudioCtx.destination);
+  narrateStartTime = narrateAudioCtx.currentTime - fromOffset;
+  narrateSource.start(0, fromOffset);
+  narratePlaying = true;
+
+  // Show pause icon
+  const iconPlay = document.getElementById("narrate-icon-play");
+  const iconPause = document.getElementById("narrate-icon-pause");
+  if (iconPlay) iconPlay.style.display = "none";
+  if (iconPause) iconPause.style.display = "block";
+
+  narrateSource.onended = () => {
+    if (narratePlaying) {
+      narratePlaying = false;
+      narrateOffset = 0;
+      cancelAnimationFrame(narrateRafId);
+      if (iconPlay) iconPlay.style.display = "block";
+      if (iconPause) iconPause.style.display = "none";
+      updateNarrateSeekUI(0);
+      const timeCur = document.getElementById("narrate-time");
+      if (timeCur) timeCur.textContent = "0:00";
+    }
+  };
+
+  // Animate seek bar
+  function tick() {
+    if (!narratePlaying || !narrateAudioCtx || !narrateBuffer) return;
+    const elapsed = narrateAudioCtx.currentTime - narrateStartTime;
+    const pct = Math.min(elapsed / narrateBuffer.duration, 1);
+    updateNarrateSeekUI(pct);
+    const timeCur = document.getElementById("narrate-time");
+    if (timeCur) timeCur.textContent = formatTime(elapsed);
+    narrateRafId = requestAnimationFrame(tick);
+  }
+  narrateRafId = requestAnimationFrame(tick);
+}
+
+function narrateStopPlayback() {
+  if (narrateSource) {
+    narratePlaying = false; // set before stop to prevent onended reset
+    if (narrateAudioCtx) {
+      narrateOffset = narrateAudioCtx.currentTime - narrateStartTime;
+    }
+    try { narrateSource.stop(); } catch (_) { /* ignore */ }
+    narrateSource = null;
+  }
+  cancelAnimationFrame(narrateRafId);
+
+  // Show play icon
+  const iconPlay = document.getElementById("narrate-icon-play");
+  const iconPause = document.getElementById("narrate-icon-pause");
+  if (iconPlay) iconPlay.style.display = "block";
+  if (iconPause) iconPause.style.display = "none";
+}
+
+function updateNarrateSeekUI(pct: number) {
+  const fill = document.getElementById("narrate-seek-fill");
+  if (fill) fill.style.width = `${(pct * 100).toFixed(1)}%`;
+}
+
+function formatTime(secs: number): string {
+  const m = Math.floor(secs / 60);
+  const s = Math.floor(secs % 60);
+  return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
 /** Convert raw 16-bit PCM bytes to a WAV Blob */

@@ -1260,27 +1260,145 @@ body {
 }
 
 /* ---- Narrate Page ---- */
-.narrate-controls {
-  display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
-  gap: 16px;
-}
-
-@media (max-width: 800px) {
-  .narrate-controls {
-    grid-template-columns: 1fr;
-  }
-}
-
-#narrate-text {
+.narrate-select {
   background: var(--bg-input);
   color: var(--text-primary);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  padding: 12px;
+  padding: 8px 12px;
+  font-size: 13px;
+  cursor: pointer;
+  min-width: 180px;
+}
+
+.narrate-select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.narrate-speed-control {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 180px;
+}
+
+.narrate-speed-control input[type="range"] {
+  flex: 1;
+  accent-color: var(--accent);
+}
+
+.narrate-upload-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.narrate-upload-label:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+#narrate-text {
+  width: 100%;
+  background: var(--bg-input);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.6;
+  resize: vertical;
+  margin-top: 12px;
 }
 
 #narrate-text:focus {
   border-color: var(--accent);
   outline: none;
+}
+
+.narrate-text-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 10px;
+}
+
+.narrate-progress-track {
+  background: var(--bg-input);
+  border-radius: 4px;
+  height: 5px;
+  margin-top: 10px;
+  overflow: hidden;
+}
+
+.narrate-progress-fill {
+  background: var(--accent);
+  height: 100%;
+  width: 0%;
+  transition: width 0.3s;
+  border-radius: 4px;
+}
+
+/* Custom audio player */
+.narrate-player {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 4px 0;
+}
+
+.narrate-play-btn {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: background 0.15s, box-shadow 0.15s;
+}
+
+.narrate-play-btn:hover {
+  background: var(--accent-hover);
+  box-shadow: 0 2px 12px var(--accent-glow);
+}
+
+.narrate-time {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  min-width: 36px;
+  flex-shrink: 0;
+}
+
+.narrate-seek {
+  flex: 1;
+  height: 6px;
+  background: var(--bg-input);
+  border-radius: 3px;
+  cursor: pointer;
+  position: relative;
+  overflow: hidden;
+}
+
+.narrate-seek-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+  width: 0%;
+  transition: width 0.1s linear;
+  pointer-events: none;
 }

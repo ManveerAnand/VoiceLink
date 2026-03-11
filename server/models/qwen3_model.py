@@ -46,28 +46,65 @@ from faster_qwen3_tts import FasterQwen3TTS
 from server.models.base import TTSModel, VoiceInfo
 
 
-# --- Sentence Splitting ---
+# --- Sentence / Paragraph Splitting ---
 # Split on sentence-ending punctuation followed by whitespace.
 _SENTENCE_RE = re.compile(r'(?<=[.!?;:])[\s]+')
 
 # Crossfade samples between sentences (~10ms at 24kHz)
 _CROSSFADE_SAMPLES = 256
 
-def _split_sentences(text: str) -> list[str]:
-    """Split text into sentences. Short fragments are merged with the previous."""
-    raw = _SENTENCE_RE.split(text.strip())
-    if not raw:
-        return [text.strip()] if text.strip() else []
-    merged: list[str] = []
-    for s in raw:
-        s = s.strip()
-        if not s:
+# Silence gap between paragraphs (~400ms at 24kHz)
+_PARAGRAPH_SILENCE_SAMPLES = 9600
+
+
+class _Chunk:
+    """A text chunk with metadata about paragraph boundaries."""
+    __slots__ = ("text", "is_para_start")
+    def __init__(self, text: str, is_para_start: bool = False):
+        self.text = text
+        self.is_para_start = is_para_start
+
+
+def _split_sentences(text: str) -> list[_Chunk]:
+    """Split text into sentences, preserving paragraph boundaries.
+
+    Paragraph breaks (\\n\\n or more) insert a longer silence gap.
+    Within a paragraph, sentences are crossfaded together.
+    Short fragments (<20 chars) are merged with the previous sentence.
+    """
+    text = text.strip()
+    if not text:
+        return []
+
+    # First split into paragraphs on blank lines
+    paragraphs = re.split(r'\n\s*\n', text)
+    chunks: list[_Chunk] = []
+
+    for para_idx, para in enumerate(paragraphs):
+        para = para.strip()
+        if not para:
             continue
-        if merged and len(s) < 20:
-            merged[-1] = merged[-1] + " " + s
-        else:
-            merged.append(s)
-    return merged if merged else [text.strip()]
+
+        # Split paragraph into sentences
+        raw = _SENTENCE_RE.split(para)
+        merged: list[str] = []
+        for s in raw:
+            s = s.strip()
+            if not s:
+                continue
+            if merged and len(s) < 20:
+                merged[-1] = merged[-1] + " " + s
+            else:
+                merged.append(s)
+
+        if not merged:
+            merged = [para]
+
+        for sent_idx, sent in enumerate(merged):
+            is_para_start = (sent_idx == 0 and para_idx > 0)
+            chunks.append(_Chunk(sent, is_para_start))
+
+    return chunks if chunks else [_Chunk(text)]
 
 def _estimate_max_tokens(text: str) -> int:
     """Estimate max codec tokens for text to prevent degenerate overgeneration.
@@ -321,22 +358,32 @@ class Qwen3Model(TTSModel):
             fade_out = np.linspace(1.0, 0.0, cf, dtype=np.float32)
             fade_in  = np.linspace(0.0, 1.0, cf, dtype=np.float32)
 
-            for i, sentence in enumerate(sentences):
+            for i, chunk in enumerate(sentences):
+                # At paragraph boundary: flush previous tail + insert silence
+                if chunk.is_para_start and prev_tail is not None:
+                    pcm = self._audio_to_pcm(prev_tail)
+                    if pcm:
+                        yield pcm
+                    # Insert paragraph silence gap
+                    silence = np.zeros(_PARAGRAPH_SILENCE_SAMPLES, dtype=np.float32)
+                    yield self._audio_to_pcm(silence)
+                    prev_tail = None
+
                 t0 = time.perf_counter()
                 wavs, sample_rate = self._cv_model.generate_custom_voice(
-                    text=sentence,
+                    text=chunk.text,
                     speaker=speaker,
                     language=lang,
                 )
                 self._sample_rate = sample_rate
                 elapsed = time.perf_counter() - t0
-                logger.debug(f"  sentence {i+1}/{len(sentences)}: {len(sentence)} chars in {elapsed:.2f}s")
+                logger.debug(f"  sentence {i+1}/{len(sentences)}: {len(chunk.text)} chars in {elapsed:.2f}s")
 
                 audio = np.asarray(wavs[0], dtype=np.float32).flatten()
                 if audio.size == 0:
                     continue
 
-                # Crossfade with previous sentence tail
+                # Crossfade with previous sentence tail (within same paragraph)
                 if prev_tail is not None and audio.size >= cf:
                     audio[:cf] = prev_tail * fade_out + audio[:cf] * fade_in
 
@@ -391,11 +438,20 @@ class Qwen3Model(TTSModel):
             fade_out = np.linspace(1.0, 0.0, cf, dtype=np.float32)
             fade_in  = np.linspace(0.0, 1.0, cf, dtype=np.float32)
 
-            for i, sentence in enumerate(sentences):
-                max_tokens = _estimate_max_tokens(sentence)
+            for i, chunk in enumerate(sentences):
+                # At paragraph boundary: flush previous tail + insert silence
+                if chunk.is_para_start and prev_tail is not None:
+                    pcm = self._audio_to_pcm(prev_tail)
+                    if pcm:
+                        yield pcm
+                    silence = np.zeros(_PARAGRAPH_SILENCE_SAMPLES, dtype=np.float32)
+                    yield self._audio_to_pcm(silence)
+                    prev_tail = None
+
+                max_tokens = _estimate_max_tokens(chunk.text)
                 t0 = time.perf_counter()
                 wavs, sample_rate = self._base_model_inst.generate_voice_clone(
-                    text=sentence,
+                    text=chunk.text,
                     language=lang,
                     ref_audio=ref_audio_path,
                     ref_text=ref_text,
@@ -405,13 +461,13 @@ class Qwen3Model(TTSModel):
                 )
                 self._sample_rate = sample_rate
                 elapsed = time.perf_counter() - t0
-                logger.debug(f"  sentence {i+1}/{len(sentences)}: {len(sentence)} chars in {elapsed:.2f}s")
+                logger.debug(f"  sentence {i+1}/{len(sentences)}: {len(chunk.text)} chars in {elapsed:.2f}s")
 
                 audio = np.asarray(wavs[0], dtype=np.float32).flatten()
                 if audio.size == 0:
                     continue
 
-                # Crossfade with previous sentence tail
+                # Crossfade with previous sentence tail (within same paragraph)
                 if prev_tail is not None and audio.size >= cf:
                     audio[:cf] = prev_tail * fade_out + audio[:cf] * fade_in
 
