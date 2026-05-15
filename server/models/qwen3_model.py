@@ -48,7 +48,8 @@ from server.models.base import TTSModel, VoiceInfo
 
 # --- Sentence / Paragraph Splitting ---
 # Split on sentence-ending punctuation followed by whitespace.
-_SENTENCE_RE = re.compile(r'(?<=[.!?;:])[\s]+')
+# Only split on . ! ? — NOT on ; or : which often appear mid-sentence.
+_SENTENCE_RE = re.compile(r'(?<=[.!?])\s+')
 
 # Crossfade samples between sentences (~10ms at 24kHz)
 _CROSSFADE_SAMPLES = 256
@@ -374,6 +375,11 @@ class Qwen3Model(TTSModel):
                     text=chunk.text,
                     speaker=speaker,
                     language=lang,
+                    temperature=0.7,
+                    top_p=0.9,
+                    top_k=50,
+                    repetition_penalty=1.1,
+                    max_new_tokens=_estimate_max_tokens(chunk.text),
                 )
                 self._sample_rate = sample_rate
                 elapsed = time.perf_counter() - t0
@@ -457,7 +463,10 @@ class Qwen3Model(TTSModel):
                     ref_text=ref_text,
                     xvec_only=False,
                     max_new_tokens=max_tokens,
-                    repetition_penalty=1.1,
+                    temperature=0.6,
+                    top_p=0.85,
+                    top_k=50,
+                    repetition_penalty=1.2,
                 )
                 self._sample_rate = sample_rate
                 elapsed = time.perf_counter() - t0

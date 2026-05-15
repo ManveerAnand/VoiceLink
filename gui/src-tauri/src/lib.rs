@@ -578,6 +578,8 @@ fn run_elevated_powershell(commands: &str) -> Result<(), String> {
 }
 
 /// Toggle a voice on/off in SAPI by adding/removing its registry token.
+/// Writes to BOTH 64-bit and 32-bit (WOW6432Node) registry views so
+/// the voice appears in all apps regardless of architecture.
 /// Tries direct HKLM write first; if not admin, elevates via UAC prompt.
 #[tauri::command]
 fn toggle_voice(voice_id: String, enabled: bool) -> Result<(), String> {
@@ -591,6 +593,9 @@ fn toggle_voice(voice_id: String, enabled: bool) -> Result<(), String> {
         r"SOFTWARE\Microsoft\Speech\Voices\Tokens",
         r"SOFTWARE\Microsoft\Speech_OneCore\Voices\Tokens",
     ];
+
+    // Registry access flags: native 64-bit view + WOW64 32-bit view
+    let reg_views: &[u32] = &[KEY_WOW64_64KEY, KEY_WOW64_32KEY];
 
     // Check if we have direct HKLM write access
     let has_access = hklm
@@ -660,36 +665,44 @@ fn toggle_voice(voice_id: String, enabled: bool) -> Result<(), String> {
         let final_name = existing_name.unwrap_or(display_name);
 
         if has_access {
-            // Direct write path
-            for root in &token_roots {
-                let token_path = format!("{}\\{}", root, token_name);
-                let (token_key, _) = hklm
-                    .create_subkey_with_flags(&token_path, KEY_WRITE)
-                    .map_err(|e| format!("Failed to create token key: {}", e))?;
+            // Direct write path — write to both 64-bit and 32-bit registry views
+            for &view_flag in reg_views {
+                for root in &token_roots {
+                    let token_path = format!("{}\\{}", root, token_name);
+                    let (token_key, _) = hklm
+                        .create_subkey_with_flags(&token_path, KEY_WRITE | view_flag)
+                        .map_err(|e| format!("Failed to create token key: {}", e))?;
 
-                token_key.set_value("", &final_name).map_err(|e| e.to_string())?;
-                token_key.set_value("CLSID", &clsid).map_err(|e| e.to_string())?;
-                token_key.set_value("VoiceLinkVoiceId", &voice_id).map_err(|e| e.to_string())?;
-                token_key.set_value("VoiceLinkServerPort", &"7860").map_err(|e| e.to_string())?;
-                token_key.set_value("VoiceLinkModel", &model_name).map_err(|e| e.to_string())?;
+                    token_key.set_value("", &final_name).map_err(|e| e.to_string())?;
+                    token_key.set_value("CLSID", &clsid).map_err(|e| e.to_string())?;
+                    token_key.set_value("VoiceLinkVoiceId", &voice_id).map_err(|e| e.to_string())?;
+                    token_key.set_value("VoiceLinkServerPort", &"7860").map_err(|e| e.to_string())?;
+                    token_key.set_value("VoiceLinkModel", &model_name).map_err(|e| e.to_string())?;
 
-                let attrs_path = format!("{}\\Attributes", token_path);
-                let (attrs_key, _) = hklm
-                    .create_subkey_with_flags(&attrs_path, KEY_WRITE)
-                    .map_err(|e| format!("Failed to create attrs key: {}", e))?;
+                    let attrs_path = format!("{}\\Attributes", token_path);
+                    let (attrs_key, _) = hklm
+                        .create_subkey_with_flags(&attrs_path, KEY_WRITE | view_flag)
+                        .map_err(|e| format!("Failed to create attrs key: {}", e))?;
 
-                attrs_key.set_value("Name", &final_name).map_err(|e| e.to_string())?;
-                attrs_key.set_value("Gender", &gender).map_err(|e| e.to_string())?;
-                attrs_key.set_value("Language", &lang).map_err(|e| e.to_string())?;
-                attrs_key.set_value("Age", &"Adult").map_err(|e| e.to_string())?;
-                attrs_key.set_value("Vendor", &"VoiceLink").map_err(|e| e.to_string())?;
+                    attrs_key.set_value("Name", &final_name).map_err(|e| e.to_string())?;
+                    attrs_key.set_value("Gender", &gender).map_err(|e| e.to_string())?;
+                    attrs_key.set_value("Language", &lang).map_err(|e| e.to_string())?;
+                    attrs_key.set_value("Age", &"Adult").map_err(|e| e.to_string())?;
+                    attrs_key.set_value("Vendor", &"VoiceLink").map_err(|e| e.to_string())?;
+                }
             }
         } else {
-            // Elevate: build PowerShell reg commands
+            // Elevate: build PowerShell reg commands for both native + WOW6432Node
             let safe_name = final_name.replace('\'', "''");
             let safe_vid = voice_id.replace('\'', "''");
             let mut ps_cmds = Vec::new();
-            for root in &token_roots {
+
+            // Native paths (64-bit) + WOW6432Node paths (32-bit)
+            let all_roots: Vec<String> = token_roots.iter().map(|r| r.to_string()).chain(
+                token_roots.iter().map(|r| r.replace(r"SOFTWARE\Microsoft", r"SOFTWARE\WOW6432Node\Microsoft"))
+            ).collect();
+
+            for root in &all_roots {
                 let reg_path = format!("HKLM:\\{}\\{}", root, token_name);
                 let attrs_path = format!("{}\\Attributes", reg_path);
                 ps_cmds.push(format!("New-Item -Path '{}' -Force | Out-Null", reg_path));
@@ -708,16 +721,21 @@ fn toggle_voice(voice_id: String, enabled: bool) -> Result<(), String> {
             run_elevated_powershell(&ps_cmds.join("; "))?;
         }
     } else {
-        // Remove voice token
+        // Remove voice token from both 64-bit and 32-bit registry views
         if has_access {
-            for root in &token_roots {
-                if let Ok(tokens_key) = hklm.open_subkey_with_flags(root, KEY_WRITE) {
-                    let _ = tokens_key.delete_subkey_all(&token_name);
+            for &view_flag in reg_views {
+                for root in &token_roots {
+                    if let Ok(tokens_key) = hklm.open_subkey_with_flags(root, KEY_WRITE | view_flag) {
+                        let _ = tokens_key.delete_subkey_all(&token_name);
+                    }
                 }
             }
         } else {
             let mut ps_cmds = Vec::new();
-            for root in &token_roots {
+            let all_roots: Vec<String> = token_roots.iter().map(|r| r.to_string()).chain(
+                token_roots.iter().map(|r| r.replace(r"SOFTWARE\Microsoft", r"SOFTWARE\WOW6432Node\Microsoft"))
+            ).collect();
+            for root in &all_roots {
                 let reg_path = format!("HKLM:\\{}\\{}", root, token_name);
                 ps_cmds.push(format!(
                     "if (Test-Path '{}') {{ Remove-Item -Path '{}' -Recurse -Force }}",
@@ -1268,19 +1286,34 @@ async fn setup_run_command(
         }
     }
 
-    // Read stdout and stderr line-by-line, emitting progress events
-    // so the frontend shows real-time status during long pip installs.
+    // Prepare log file for this step so "Open Terminal" can tail it
+    let log_path = {
+        let data_dir = {
+            let config = app.state::<Mutex<AppConfig>>();
+            config.lock().ok().map(|cfg| cfg.data_dir())
+        };
+        if let Some(dd) = data_dir {
+            let log_dir = dd.join("logs");
+            let _ = std::fs::create_dir_all(&log_dir);
+            let p = log_dir.join(format!("setup-{}.log", step_name));
+            let _ = std::fs::write(&p, "");
+            Some(p)
+        } else {
+            None
+        }
+    };
+
     let stdout_handle = child.stdout.take();
     let stderr_handle = child.stderr.take();
 
     let step_clone = step_name.clone();
     let app_clone = app.clone();
+    let log_path_stdout = log_path.clone();
     let stdout_task = tokio::spawn(async move {
         let mut lines = Vec::new();
         if let Some(stdout) = stdout_handle {
             let mut reader = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                // Emit the latest line as status text so user sees activity
                 let _ = app_clone.emit(
                     "setup-progress",
                     serde_json::json!({
@@ -1290,6 +1323,12 @@ async fn setup_run_command(
                         "line": line,
                     }),
                 );
+                if let Some(ref lp) = log_path_stdout {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(lp) {
+                        let _ = writeln!(f, "{}", line);
+                    }
+                }
                 lines.push(line);
             }
         }
@@ -1298,6 +1337,7 @@ async fn setup_run_command(
 
     let step_clone2 = step_name.clone();
     let app_clone2 = app.clone();
+    let log_path_stderr = log_path.clone();
     let stderr_task = tokio::spawn(async move {
         let mut lines = Vec::new();
         if let Some(stderr) = stderr_handle {
@@ -1312,6 +1352,12 @@ async fn setup_run_command(
                         "line": line,
                     }),
                 );
+                if let Some(ref lp) = log_path_stderr {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(lp) {
+                        let _ = writeln!(f, "{}", line);
+                    }
+                }
                 lines.push(line);
             }
         }
@@ -1345,6 +1391,42 @@ async fn setup_run_command(
     } else {
         Err(format!("Command failed:\nstdout: {}\nstderr: {}", stdout, stderr))
     }
+}
+
+/// Open a PowerShell window tailing the setup log file for a given step.
+#[tauri::command]
+fn open_setup_terminal(
+    app: AppHandle,
+    step_name: String,
+) -> Result<(), String> {
+    let config = app.state::<Mutex<AppConfig>>();
+    let cfg = config.lock().map_err(|e| e.to_string())?;
+    let log_dir = cfg.data_dir().join("logs");
+    let log_path = log_dir.join(format!("setup-{}.log", step_name));
+
+    // Create log dir and file if they don't exist yet
+    std::fs::create_dir_all(&log_dir)
+        .map_err(|e| format!("Failed to create logs dir: {}", e))?;
+    if !log_path.exists() {
+        std::fs::write(&log_path, "")
+            .map_err(|e| format!("Failed to create log file: {}", e))?;
+    }
+
+    let log_path_str = log_path.to_string_lossy().to_string();
+    std::process::Command::new("powershell")
+        .args([
+            "-Command",
+            &format!(
+                "Set-Location '{}'; Write-Host 'VoiceLink Setup Log — {}' -ForegroundColor Cyan; Write-Host ''; Get-Content '{}' -Wait -Tail 100",
+                log_dir.to_string_lossy(),
+                step_name,
+                log_path_str,
+            ),
+        ])
+        .spawn()
+        .map_err(|e| format!("Failed to open terminal: {}", e))?;
+
+    Ok(())
 }
 
 /// Cancel/pause the currently running Qwen3 download process.
@@ -1823,6 +1905,7 @@ pub fn run() {
             save_wav_file,
             qwen3_get_status,
             cancel_qwen3_download,
+            open_setup_terminal,
             get_setup_status,
             get_setup_paths,
             set_data_dir,

@@ -26,12 +26,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ---- SAPI Bridge (C++ COM DLL) ----
-      - name: Configure SAPI Bridge (CMake)
+      # ---- SAPI Bridge (C++ COM DLL — both 64-bit and 32-bit) ----
+      - name: Configure SAPI Bridge (64-bit)
         run: cmake -B sapi_bridge/build -S sapi_bridge -G "Visual Studio 17 2022" -A x64
 
-      - name: Build SAPI Bridge
+      - name: Build SAPI Bridge (64-bit)
         run: cmake --build sapi_bridge/build --config Release
+
+      - name: Configure SAPI Bridge (32-bit)
+        run: cmake -B sapi_bridge/build32 -S sapi_bridge -G "Visual Studio 17 2022" -A Win32
+
+      - name: Build SAPI Bridge (32-bit)
+        run: cmake --build sapi_bridge/build32 --config Release
 
       # ---- Tauri GUI (Node.js + Rust) ----
       - name: Setup Node.js

@@ -87,7 +87,26 @@ Windows has **two separate** locations for TTS voices:
    → NOT always visible to classic SAPI 5 apps
 ```
 
-**For VoiceLink**, we register in the **classic SAPI 5 path** — that ensures maximum compatibility with apps like Thorium Reader.
+**For VoiceLink**, we register in **both** SAPI paths (classic + OneCore) to cover all apps.
+
+### 32-bit vs 64-bit Registry Views (WOW6432Node)
+
+On 64-bit Windows, the registry is split into two views:
+
+| View | Registry Path | Who reads it |
+|------|--------------|--------------|
+| **64-bit (native)** | `HKLM\SOFTWARE\Microsoft\Speech\Voices\Tokens\` | 64-bit apps: Edge, Narrator, modern .NET |
+| **32-bit (WOW64)** | `HKLM\SOFTWARE\WOW6432Node\Microsoft\Speech\Voices\Tokens\` | 32-bit apps: Adobe Acrobat, older Balabolka, legacy Office |
+
+Windows transparently redirects 32-bit process registry access through `WOW6432Node`. A 32-bit app calling `RegOpenKeyEx(HKLM, "SOFTWARE\Microsoft\Speech\...")` actually reads from `SOFTWARE\WOW6432Node\Microsoft\Speech\...`.
+
+**VoiceLink ships two DLLs:**
+- `voicelink_sapi.dll` — 64-bit, registered via `System32\regsvr32.exe`
+- `voicelink_sapi_32.dll` — 32-bit, registered via `SysWOW64\regsvr32.exe`
+
+Each `regsvr32` writes to its own registry view automatically. The Tauri GUI's `toggle_voice` command also writes to both views using `KEY_WOW64_64KEY` and `KEY_WOW64_32KEY` flags.
+
+**Counterintuitive naming:** `System32\regsvr32.exe` is 64-bit; `SysWOW64\regsvr32.exe` is 32-bit. This is a legacy Windows naming artifact.
 
 ### Voice Token Structure (What We Discovered)
 
@@ -181,7 +200,7 @@ interface IUnknown {
 
 **In-Process Server (InprocServer32):** A COM component packaged as a DLL that runs inside the caller's process. This is what we're building. It's fast because there's no inter-process communication — SAPI loads our DLL directly.
 
-**Registration:** COM components must be registered in the Windows Registry so `CoCreateInstance()` can find them. Our DLL will export `DllRegisterServer()` which writes the registry entries.
+**Registration:** COM components must be registered in the Windows Registry so `CoCreateInstance()` can find them. Our DLL exports `DllRegisterServer()` which writes the registry entries. On 64-bit Windows, we ship both a 64-bit and a 32-bit DLL and register each with its respective `regsvr32` so that both 64-bit apps (Edge, Narrator) and 32-bit apps (Adobe Acrobat) can load our engine.
 
 ---
 

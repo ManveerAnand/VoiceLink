@@ -16,7 +16,7 @@
         <span class="version">v0.1.0</span>
       </div>
       <ul class="nav-items">
-        <li class="nav-item active" data-page="dashboard">
+        <li class="nav-item active" data-page="dashboard" id="nav-dashboard-item">
           <svg
             viewBox="0 0 24 24"
             width="20"
@@ -32,7 +32,7 @@
           </svg>
           <span>Dashboard</span>
         </li>
-        <li class="nav-item" data-page="voices">
+        <li class="nav-item" data-page="voices" id="nav-voices-item">
           <svg
             viewBox="0 0 24 24"
             width="20"
@@ -102,7 +102,7 @@
           </svg>
           <span>Narrate</span>
         </li>
-        <li class="nav-item" data-page="setup">
+        <li class="nav-item" data-page="setup" id="nav-setup-item">
           <svg
             viewBox="0 0 24 24"
             width="20"
@@ -129,6 +129,17 @@
       <!-- Dashboard Page -->
       <section id="page-dashboard" class="page active">
         <h1>Dashboard</h1>
+
+        <div id="dashboard-setup-banner" class="setup-required-banner hidden">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
+          </svg>
+          <div>
+            <strong>Setup Required</strong>
+            <p>Complete the initial setup to start using VoiceLink.</p>
+            <button id="btn-goto-setup" class="btn btn-primary btn-sm" style="margin-top: 8px">Go to Setup</button>
+          </div>
+        </div>
 
         <div class="status-cards">
           <div class="card server-card">
@@ -214,6 +225,17 @@ Hello! VoiceLink is ready.</textarea
 
       <!-- Voices Page -->
       <section id="page-voices" class="page">
+        <div id="voices-setup-banner" class="setup-required-banner hidden">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+            <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+          </svg>
+          <div>
+            <strong>Setup Required</strong>
+            <p>Voice management will be available after the initial setup is complete.</p>
+            <button class="btn-goto-setup btn btn-primary btn-sm" style="margin-top: 8px">Go to Setup</button>
+          </div>
+        </div>
         <div class="page-header">
           <h1>Voice Manager</h1>
           <button id="btn-refresh-voices" class="btn btn-secondary">
@@ -697,6 +719,13 @@ Paragraph breaks (blank lines) will be preserved as natural pauses in the narrat
                 </div>
                 <span class="progress-text" id="text-python">0%</span>
               </div>
+              <div class="step-log hidden" id="log-python">
+                <div class="step-log-header">
+                  <button class="btn-log-toggle" data-step="python">Show Details</button>
+                  <button class="btn-open-terminal" data-step="python" title="Open in Terminal">Open Terminal</button>
+                </div>
+                <pre class="step-log-output collapsed" id="log-output-python"></pre>
+              </div>
             </div>
           </div>
 
@@ -724,6 +753,13 @@ Paragraph breaks (blank lines) will be preserved as natural pauses in the narrat
                   <div class="progress-fill" id="fill-deps"></div>
                 </div>
                 <span class="progress-text" id="text-deps">Installing...</span>
+              </div>
+              <div class="step-log hidden" id="log-deps">
+                <div class="step-log-header">
+                  <button class="btn-log-toggle" data-step="deps">Show Details</button>
+                  <button class="btn-open-terminal" data-step="deps" title="Open in Terminal">Open Terminal</button>
+                </div>
+                <pre class="step-log-output collapsed" id="log-output-deps"></pre>
               </div>
             </div>
           </div>
@@ -778,6 +814,13 @@ Paragraph breaks (blank lines) will be preserved as natural pauses in the narrat
                   <div class="progress-fill" id="fill-model"></div>
                 </div>
                 <span class="progress-text" id="text-model">0%</span>
+              </div>
+              <div class="step-log hidden" id="log-model">
+                <div class="step-log-header">
+                  <button class="btn-log-toggle" data-step="model">Show Details</button>
+                  <button class="btn-open-terminal" data-step="model" title="Open in Terminal">Open Terminal</button>
+                </div>
+                <pre class="step-log-output collapsed" id="log-output-model"></pre>
               </div>
             </div>
           </div>

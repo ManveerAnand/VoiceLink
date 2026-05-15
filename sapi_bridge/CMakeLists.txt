@@ -7,18 +7,31 @@
 # it forwards the text to our Python inference server and streams the
 # AI-generated audio back through SAPI.
 #
-# BUILD INSTRUCTIONS:
+# BUILD INSTRUCTIONS (64-bit):
 #   1. Open "x64 Native Tools Command Prompt for VS 2022"
 #   2. cd to this directory
 #   3. cmake -B build -G "Visual Studio 17 2022" -A x64
 #   4. cmake --build build --config Release
 #   5. The DLL will be at: build/Release/voicelink_sapi.dll
 #
-# REGISTER THE DLL:
-#   regsvr32 build/Release/voicelink_sapi.dll       (as admin)
+# BUILD INSTRUCTIONS (32-bit — needed for 32-bit apps like Adobe Acrobat):
+#   1. Open "x64 Native Tools Command Prompt for VS 2022" (same prompt)
+#   2. cd to this directory
+#   3. cmake -B build32 -G "Visual Studio 17 2022" -A Win32
+#   4. cmake --build build32 --config Release
+#   5. The DLL will be at: build32/Release/voicelink_sapi.dll
 #
-# UNREGISTER:
-#   regsvr32 /u build/Release/voicelink_sapi.dll    (as admin)
+# REGISTER BOTH DLLs (as admin):
+#   C:\Windows\System32\regsvr32.exe build/Release/voicelink_sapi.dll
+#   C:\Windows\SysWOW64\regsvr32.exe build32/Release/voicelink_sapi.dll
+#
+# UNREGISTER BOTH:
+#   C:\Windows\System32\regsvr32.exe /u build/Release/voicelink_sapi.dll
+#   C:\Windows\SysWOW64\regsvr32.exe /u build32/Release/voicelink_sapi.dll
+#
+# NOTE: System32\regsvr32.exe is the 64-bit version (counterintuitive).
+#       SysWOW64\regsvr32.exe is the 32-bit version.
+#       Each regsvr32 writes to its own registry view automatically.
 # ============================================================================
 
 cmake_minimum_required(VERSION 3.20)

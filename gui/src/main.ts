@@ -84,6 +84,296 @@ let cachedGpuInfo: GpuInfo | null = null;
 let qwen3DownloadPaused = false;
 
 // ============================================================================
+// Setup-incomplete gray-out state
+// ============================================================================
+
+function applySetupIncompleteState(isComplete: boolean) {
+  const dashboard = document.getElementById("page-dashboard");
+  const voices = document.getElementById("page-voices");
+  const dashBanner = document.getElementById("dashboard-setup-banner");
+  const voicesBanner = document.getElementById("voices-setup-banner");
+
+  if (isComplete) {
+    dashboard?.classList.remove("setup-incomplete");
+    voices?.classList.remove("setup-incomplete");
+    dashBanner?.classList.add("hidden");
+    voicesBanner?.classList.add("hidden");
+  } else {
+    dashboard?.classList.add("setup-incomplete");
+    voices?.classList.add("setup-incomplete");
+    dashBanner?.classList.remove("hidden");
+    voicesBanner?.classList.remove("hidden");
+  }
+}
+
+function wireGotoSetupButtons() {
+  const navigate = (page: string) => {
+    document.querySelectorAll<HTMLElement>(".nav-item").forEach((n) => {
+      n.classList.toggle("active", n.dataset.page === page);
+    });
+    document.querySelectorAll<HTMLElement>(".page").forEach((p) => {
+      p.classList.toggle("active", p.id === `page-${page}`);
+    });
+    if (page === "setup") refreshSetupStatus();
+  };
+
+  document.getElementById("btn-goto-setup")?.addEventListener("click", () => navigate("setup"));
+  document.querySelectorAll<HTMLElement>(".btn-goto-setup").forEach((btn) => {
+    btn.addEventListener("click", () => navigate("setup"));
+  });
+}
+
+// ============================================================================
+// Spotlight Onboarding Tour
+// ============================================================================
+
+interface TourStep {
+  targetId: string;
+  title: string;
+  body: string;
+  position: "top" | "bottom" | "left" | "right";
+  waitForNav?: string;
+}
+
+const TOUR_STEPS: TourStep[] = [
+  {
+    targetId: "nav-setup-item",
+    title: "Start Here",
+    body: "Click Setup to download the AI voice engine and get everything ready.",
+    position: "right",
+    waitForNav: "setup",
+  },
+  {
+    targetId: "btn-run-setup",
+    title: "Run Setup",
+    body: "Click this button to download and install everything automatically. It takes a few minutes.",
+    position: "bottom",
+  },
+];
+
+const TOUR_POST_SETUP_STEPS: TourStep[] = [
+  {
+    targetId: "nav-dashboard-item",
+    title: "Dashboard",
+    body: "Your server is running! Monitor the status and test voices from here.",
+    position: "right",
+  },
+  {
+    targetId: "nav-voices-item",
+    title: "Voice Manager",
+    body: "Browse, rename, enable, or disable your AI voices here.",
+    position: "right",
+  },
+];
+
+class SpotlightTour {
+  private steps: TourStep[];
+  private currentIndex = 0;
+  private overlay: HTMLDivElement | null = null;
+  private highlight: HTMLDivElement | null = null;
+  private tooltip: HTMLDivElement | null = null;
+  private active = false;
+  private waitingForNav: string | null = null;
+
+  constructor(steps: TourStep[]) {
+    this.steps = steps;
+  }
+
+  start() {
+    if (this.steps.length === 0 || this.active) return;
+    this.active = true;
+    this.currentIndex = 0;
+    this.createOverlay();
+    this.showStep(0);
+  }
+
+  private createOverlay() {
+    this.overlay = document.createElement("div");
+    this.overlay.className = "spotlight-overlay";
+
+    this.highlight = document.createElement("div");
+    this.highlight.className = "spotlight-highlight";
+
+    this.tooltip = document.createElement("div");
+    this.tooltip.className = "spotlight-tooltip";
+
+    this.overlay.appendChild(this.highlight);
+    this.overlay.appendChild(this.tooltip);
+    document.body.appendChild(this.overlay);
+
+    this.overlay.addEventListener("click", (e) => {
+      if (e.target === this.overlay) {
+        // Allow clicking through to the highlighted target
+      }
+    });
+  }
+
+  private showStep(index: number) {
+    if (!this.overlay || !this.highlight || !this.tooltip) return;
+    if (index >= this.steps.length) {
+      this.end();
+      return;
+    }
+
+    this.currentIndex = index;
+    const step = this.steps[index];
+    const target = document.querySelector(`[data-page="${step.targetId}"]`)
+      || document.getElementById(step.targetId);
+
+    if (!target) {
+      this.next();
+      return;
+    }
+
+    const rect = (target as HTMLElement).getBoundingClientRect();
+    const pad = 8;
+
+    this.highlight.style.left = `${rect.left - pad}px`;
+    this.highlight.style.top = `${rect.top - pad}px`;
+    this.highlight.style.width = `${rect.width + pad * 2}px`;
+    this.highlight.style.height = `${rect.height + pad * 2}px`;
+
+    const totalSteps = this.steps.length;
+    this.tooltip.innerHTML = `
+      <div class="spotlight-step-indicator">Step ${index + 1} of ${totalSteps}</div>
+      <h4>${step.title}</h4>
+      <p>${step.body}</p>
+      <div class="spotlight-actions">
+        <button class="btn-skip-tour">Skip Tour</button>
+        <button class="btn-next-tour">${index === totalSteps - 1 ? "Finish" : "Next"}</button>
+      </div>
+    `;
+
+    this.positionTooltip(rect, step.position);
+
+    this.tooltip.querySelector(".btn-skip-tour")?.addEventListener("click", () => this.end());
+    this.tooltip.querySelector(".btn-next-tour")?.addEventListener("click", () => {
+      if (step.waitForNav) {
+        this.waitingForNav = step.waitForNav;
+        this.end();
+      } else {
+        this.next();
+      }
+    });
+  }
+
+  private positionTooltip(targetRect: DOMRect, position: string) {
+    if (!this.tooltip) return;
+    const gap = 16;
+
+    this.tooltip.style.left = "";
+    this.tooltip.style.top = "";
+    this.tooltip.style.right = "";
+    this.tooltip.style.bottom = "";
+
+    switch (position) {
+      case "right":
+        this.tooltip.style.left = `${targetRect.right + gap}px`;
+        this.tooltip.style.top = `${targetRect.top}px`;
+        break;
+      case "bottom":
+        this.tooltip.style.left = `${targetRect.left}px`;
+        this.tooltip.style.top = `${targetRect.bottom + gap}px`;
+        break;
+      case "left":
+        this.tooltip.style.left = `${targetRect.left - 340}px`;
+        this.tooltip.style.top = `${targetRect.top}px`;
+        break;
+      case "top":
+        this.tooltip.style.left = `${targetRect.left}px`;
+        this.tooltip.style.top = `${targetRect.top - gap - 160}px`;
+        break;
+    }
+  }
+
+  next() {
+    this.showStep(this.currentIndex + 1);
+  }
+
+  end() {
+    localStorage.setItem("tourCompleted", "true");
+    this.active = false;
+    if (this.overlay) {
+      this.overlay.remove();
+      this.overlay = null;
+      this.highlight = null;
+      this.tooltip = null;
+    }
+  }
+
+  getWaitingNav(): string | null {
+    return this.waitingForNav;
+  }
+
+  clearWaitingNav() {
+    this.waitingForNav = null;
+  }
+
+  isActive(): boolean {
+    return this.active;
+  }
+}
+
+let onboardingTour: SpotlightTour | null = null;
+let postSetupTour: SpotlightTour | null = null;
+
+function startOnboardingTourIfNeeded(isSetupDone: boolean) {
+  if (isSetupDone) return;
+  if (localStorage.getItem("tourCompleted")) return;
+
+  onboardingTour = new SpotlightTour(TOUR_STEPS);
+  onboardingTour.start();
+}
+
+function startPostSetupTour() {
+  if (localStorage.getItem("tourCompleted")) return;
+
+  postSetupTour = new SpotlightTour(TOUR_POST_SETUP_STEPS);
+  postSetupTour.start();
+}
+
+// ============================================================================
+// Setup Log Viewer
+// ============================================================================
+
+function wireLogViewers() {
+  document.querySelectorAll<HTMLButtonElement>(".btn-log-toggle").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const step = btn.dataset.step;
+      if (!step) return;
+      const output = document.getElementById(`log-output-${step}`);
+      if (!output) return;
+      const isCollapsed = output.classList.toggle("collapsed");
+      btn.textContent = isCollapsed ? "Show Details" : "Hide Details";
+    });
+  });
+
+  document.querySelectorAll<HTMLButtonElement>(".btn-open-terminal").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const step = btn.dataset.step;
+      if (!step) return;
+      try {
+        await invoke("open_setup_terminal", { stepName: step });
+      } catch (e) {
+        console.error("Failed to open terminal:", e);
+      }
+    });
+  });
+}
+
+function appendLogLine(step: string, line: string) {
+  const logContainer = document.getElementById(`log-${step}`);
+  const logOutput = document.getElementById(`log-output-${step}`);
+  if (!logContainer || !logOutput) return;
+
+  logContainer.classList.remove("hidden");
+  logOutput.textContent += line + "\n";
+
+  // Auto-scroll to bottom
+  logOutput.scrollTop = logOutput.scrollHeight;
+}
+
+// ============================================================================
 // Navigation
 // ============================================================================
 
@@ -105,6 +395,16 @@ function setupNavigation() {
       if (page === "setup") refreshSetupStatus();
       if (page === "voice-studio") setupVoiceStudioTabs();
       if (page === "narrate") setupNarratePage();
+
+      // Tour: auto-advance when user navigates to the awaited page
+      if (onboardingTour && onboardingTour.getWaitingNav() === page) {
+        onboardingTour.clearWaitingNav();
+        // Small delay so the page renders before spotlighting
+        setTimeout(() => {
+          const stepTour = new SpotlightTour([TOUR_STEPS[1]]);
+          stepTour.start();
+        }, 300);
+      }
     });
   });
 }
@@ -378,7 +678,6 @@ async function handleTestVoice(voiceId: string) {
 }
 
 async function playVoicePreview(voiceId: string, text: string) {
-  // Route to the correct backend based on voice ID prefix
   let pcmBytes: number[];
   if (voiceId.startsWith("qwen3_")) {
     pcmBytes = await invoke("qwen3_preview_voice", { voiceId, text });
@@ -386,19 +685,7 @@ async function playVoicePreview(voiceId: string, text: string) {
     pcmBytes = await invoke("preview_voice", { voiceId, text });
   }
 
-  const sampleRate = 24000;
-  const audioCtx = new AudioContext({ sampleRate });
-  const int16 = new Int16Array(new Uint8Array(pcmBytes).buffer);
-  const float32 = new Float32Array(int16.length);
-  for (let i = 0; i < int16.length; i++) {
-    float32[i] = int16[i] / 32768;
-  }
-  const buffer = audioCtx.createBuffer(1, float32.length, sampleRate);
-  buffer.getChannelData(0).set(float32);
-  const source = audioCtx.createBufferSource();
-  source.buffer = buffer;
-  source.connect(audioCtx.destination);
-  source.start();
+  playPcmAudio(new Uint8Array(pcmBytes));
 }
 
 function populateTestVoiceSelect() {
@@ -839,6 +1126,9 @@ async function runSetup() {
       if (btn) {
         btn.innerHTML = `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5" /></svg> All Set!`;
       }
+      applySetupIncompleteState(true);
+      loadVoices();
+      setTimeout(() => startPostSetupTour(), 600);
     } else {
       setStepIcon("start", "error");
       setOverallStatus("Server is still loading. It may take a minute for the model to initialize. Check Dashboard.", "info");
@@ -885,15 +1175,13 @@ function setupSetupWizard() {
       const stepName = step as StepName;
 
       if (downloaded && total && total > 0) {
-        // File download — show MB progress
         const mb = (downloaded / 1024 / 1024).toFixed(1);
         const totalMb = (total / 1024 / 1024).toFixed(1);
         setStepProgress(stepName, progress, `${mb} / ${totalMb} MB`);
       } else if (line) {
-        // Command output — show the last meaningful line (e.g. pip activity)
-        // Truncate long lines and show a pulsing progress bar at 50%
         const shortLine = line.length > 60 ? line.substring(0, 57) + "..." : line;
         setStepProgress(stepName, progress, shortLine);
+        appendLogLine(step, line);
       } else {
         setStepProgress(stepName, progress);
       }
@@ -1496,7 +1784,7 @@ function setupCloneForm() {
         previewText: "Hello, this is a preview of the cloned voice.",
       });
 
-      const safeName = nameInput.value.trim().replace(/[^a-zA-Z0-9_\- ]/g, "").trim();
+      const safeName = nameInput.value.trim().replace(/[^a-zA-Z0-9_\- ]/g, "").replace(/\s+/g, " ").trim();
       const voiceId = `qwen3_custom_${safeName}`;
 
       // Play the preview audio
@@ -1573,7 +1861,7 @@ function setupDesignForm() {
       }
     } catch (e: any) {
       console.error("Design voice failed:", e);
-      alert(`Voice design failed: ${e}`);
+      await showModal("Error", `Voice design failed: ${e}`, true);
     } finally {
       generateBtn.disabled = false;
       generateBtn.textContent = "Generate";
@@ -1588,12 +1876,12 @@ function setupDesignForm() {
 
     try {
       await invoke("toggle_voice", { voiceId: lastDesignVoiceId, enabled: true });
-      alert(`Voice "${nameInput.value.trim()}" saved and registered in SAPI!`);
+      await showModal("Saved", `"${nameInput.value.trim()}" saved and registered in SAPI!`, true);
       loadVoices();
       loadQwen3Voices();
     } catch (e: any) {
       console.error("Save designed voice failed:", e);
-      alert(`Failed to save voice: ${e}`);
+      await showModal("Error", `Failed to save voice: ${e}`, true);
     } finally {
       saveBtn.textContent = "Save to Library";
     }
@@ -1944,8 +2232,7 @@ function formatTime(secs: number): string {
 }
 
 /** Convert raw 16-bit PCM bytes to a WAV Blob */
-function pcmToWavBlob(pcmData: Uint8Array, sampleRate: number): Blob {
-  const numSamples = pcmData.length / 2;
+export function pcmToWavBlob(pcmData: Uint8Array, sampleRate: number): Blob {
   const buffer = new ArrayBuffer(44 + pcmData.length);
   const view = new DataView(buffer);
 
@@ -1979,11 +2266,27 @@ function writeString(view: DataView, offset: number, str: string) {
 }
 
 // ============================================================================
-// PCM Playback
+// PCM Playback (singleton — stops previous audio before starting new)
 // ============================================================================
+
+let _activeAudioCtx: AudioContext | null = null;
+let _activeAudioSrc: AudioBufferSourceNode | null = null;
+
+function stopCurrentPlayback() {
+  if (_activeAudioSrc) {
+    try { _activeAudioSrc.stop(); } catch (_) { /* already stopped */ }
+    _activeAudioSrc = null;
+  }
+  if (_activeAudioCtx) {
+    _activeAudioCtx.close();
+    _activeAudioCtx = null;
+  }
+}
 
 function playPcmAudio(pcmData: Uint8Array) {
   try {
+    stopCurrentPlayback();
+
     const audioCtx = new AudioContext({ sampleRate: 24000 });
     const int16 = new Int16Array(pcmData.buffer, pcmData.byteOffset, pcmData.byteLength / 2);
     const float32 = new Float32Array(int16.length);
@@ -1995,8 +2298,19 @@ function playPcmAudio(pcmData: Uint8Array) {
     const source = audioCtx.createBufferSource();
     source.buffer = buffer;
     source.connect(audioCtx.destination);
+
+    _activeAudioCtx = audioCtx;
+    _activeAudioSrc = source;
+
+    source.onended = () => {
+      audioCtx.close();
+      if (_activeAudioCtx === audioCtx) {
+        _activeAudioCtx = null;
+        _activeAudioSrc = null;
+      }
+    };
+
     source.start();
-    source.onended = () => audioCtx.close();
   } catch (e) {
     console.error("PCM playback failed:", e);
   }
@@ -2032,25 +2346,28 @@ window.addEventListener("DOMContentLoaded", async () => {
   setupRefreshButton();
   setupSetupWizard();
   setupSettings();
+  wireGotoSetupButtons();
+  wireLogViewers();
   startStatusPolling();
 
-  // Initial voice load for the dashboard quick-test dropdown
-  loadVoices();
-
-  // Auto-start server on launch if setup is complete but server isn't running
+  // Check setup state and apply gray-out / onboarding tour
   try {
     const status: SetupStatus = await invoke("get_setup_status");
-    if (
-      status.python_installed &&
-      status.deps_installed &&
-      status.server_installed &&
-      status.model_downloaded &&
-      !status.server_running
-    ) {
-      console.log("Setup complete but server offline — auto-starting...");
-      await invoke("start_server");
+    const allDone = status.python_installed && status.deps_installed &&
+      status.server_installed && status.model_downloaded;
+
+    applySetupIncompleteState(allDone);
+
+    if (allDone) {
+      loadVoices();
+      if (!status.server_running) {
+        await invoke("start_server");
+      }
+    } else {
+      startOnboardingTourIfNeeded(false);
     }
   } catch (e) {
-    console.error("Auto-start check failed:", e);
+    console.error("Init check failed:", e);
+    applySetupIncompleteState(false);
   }
 });

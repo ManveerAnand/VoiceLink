@@ -4,8 +4,16 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+build32/
 *.egg
 .venv/
+
+# Build artifacts
+*.exe
+python/
+python-embed.zip
+logs/
+.voices_ready
 
 # Audio samples (generated, not source)
 research/audio_samples/

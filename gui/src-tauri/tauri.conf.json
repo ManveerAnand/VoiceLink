@@ -43,6 +43,7 @@
     ],
     "resources": {
       "../../sapi_bridge/build/Release/voicelink_sapi.dll": "voicelink_sapi.dll",
+      "../../sapi_bridge/build32/Release/voicelink_sapi.dll": "voicelink_sapi_32.dll",
       "../../server": "server/"
     },
     "windows": {

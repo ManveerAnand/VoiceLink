@@ -327,9 +327,9 @@ async def qwen3_clone_voice(
         import librosa
         import soundfile as sf
 
-        audio_data, sr = librosa.load(str(audio_path), sr=None, mono=True)
-        sf.write(str(wav_path), audio_data, sr, subtype="PCM_16")
-        logger.info(f"Audio converted: {audio_filename} -> reference.wav ({len(audio_data)/sr:.1f}s @ {sr}Hz)")
+        audio_data, sr = librosa.load(str(audio_path), sr=24000, mono=True)
+        sf.write(str(wav_path), audio_data, 24000, subtype="PCM_16")
+        logger.info(f"Audio converted: {audio_filename} -> reference.wav ({len(audio_data)/24000:.1f}s @ 24000Hz)")
     except Exception as e:
         if profile_dir.exists():
             shutil.rmtree(profile_dir, ignore_errors=True)
