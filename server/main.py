@@ -55,6 +55,7 @@ from server.config import settings
 from server.models import load_model
 from server.routers.tts import router as tts_router, set_model, set_start_time
 from server.routers.qwen3 import router as qwen3_router
+from server.routers.lookahead import router as lookahead_router
 
 
 def setup_logging():
@@ -151,6 +152,7 @@ app = FastAPI(
 
 # Mount routers
 app.include_router(tts_router)
+app.include_router(lookahead_router)
 
 # Qwen3 router is always mounted — the router itself handles lazy loading.
 # If Qwen3 is disabled, requests will still fail gracefully because the model
