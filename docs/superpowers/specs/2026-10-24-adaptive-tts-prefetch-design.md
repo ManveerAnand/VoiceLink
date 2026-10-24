@@ -1,491 +1,1009 @@
-# Adaptive TTS Look-Ahead and Prefetch Design
+# Adaptive TTS Look-Ahead and Structural Prosody
 
-**Status:** Proposed for implementation
+Date: 2026-10-24
+Status: Proposed
+Repositories: R2 Navigator JS, Thorium Reader, VoiceLink
 
-**Date:** 2026-10-24
+## 1. Summary
 
-**Primary project:** VoiceLink
+Thorium currently reads one sentence at a time through the Web Speech API. The
+next sentence is submitted only after the current utterance ends. With a local
+neural TTS engine such as Kokoro, this creates a synthesis delay between
+sentences. VoiceLink cannot remove that delay because the Windows SAPI engine
+sees only the current utterance and has no knowledge of future text.
 
-**Integration project:** `edrlab/r2-navigator-js` (consumed by Thorium Reader)
+This design adds an optional, provider-neutral look-ahead channel alongside the
+existing speech path. R2 Navigator publishes a bounded snapshot containing the
+current sentence, several future sentences, and their document structure.
+Thorium forwards the snapshot to VoiceLink. VoiceLink pre-generates future audio
+and applies structure-aware pauses. The existing Web Speech/SAPI request remains
+the source of truth for what is actually spoken.
 
-## Intent and rationale
+The new path is an optimization. If any component does not support it, if
+correlation is ambiguous, or if prefetched audio is unavailable, playback uses
+the current behavior without losing, reordering, or duplicating text.
 
-VoiceLink currently introduces a pause at every Thorium read-aloud boundary. Thorium submits one sentence to the Web Speech API, waits for that utterance to end, and only then submits the next sentence. VoiceLink cannot synthesize the next sentence during current playback because SAPI exposes only the text in the current `ISpTTSEngine::Speak` call.
+## 2. Goals
 
-The current VoiceLink server adds a second latency source: `/v1/tts` collects every Kokoro PCM chunk before returning HTTP headers or audio. On the reference CPU installation, measured time to first byte was 1.11 seconds for 12 characters, 1.85 seconds for 39 characters, and 7.24 seconds for 232 characters. Time to first byte was effectively equal to total request time.
+- Remove avoidable neural-synthesis gaps between sentences by generating future
+  sentence audio while the current sentence is playing.
+- Preserve the existing one-utterance-at-a-time Web Speech and SAPI contract.
+- Preserve compatibility with existing R2 Navigator hosts, Thorium builds,
+  VoiceLink bridges, and TTS providers.
+- Carry semantic document structure so VoiceLink can distinguish sentence,
+  paragraph, list, heading, section, and similar boundaries.
+- Keep R2 Navigator independent of VoiceLink and of any localhost protocol.
+- Bound CPU, memory, text exposure, and speculative work.
+- Make every optimization failure fall back safely to on-demand synthesis.
 
-The intended result is continuous read-aloud: the current segment starts as soon as it is ready, while a bounded background producer prepares future segments. Text highlighting, cancellation, navigation, and compatibility with existing SAPI clients must remain correct.
+## 3. Non-goals
 
-## Goals
+- Sending multiple sentences in a single `SpeechSynthesisUtterance`.
+- Replacing or changing the existing `/v1/tts` request contract.
+- Rendering an entire chapter or book in advance.
+- Passing arbitrary SSML from EPUB content to the speech engine.
+- Guaranteeing uninterrupted playback when synthesis is not faster than
+  consumption over a sustained interval.
+- Announcing structure such as “heading level two” in the first version.
+- Phoneme-level or word-level forced alignment.
+- Making R2 Navigator aware of VoiceLink, Kokoro, or Windows SAPI.
 
-- Remove synthesis-sized gaps between consecutive Thorium sentences when the model can generate faster than playback consumes audio.
-- Let the text owner, Readium, provide a bounded look-ahead window rather than asking VoiceLink to guess future text.
-- Separate synthesis from playback through a bounded producer/consumer pipeline.
-- Preserve accurate SAPI word and sentence events using the exact PCM length of each generated segment.
-- Adapt the buffered audio runway to observed model throughput instead of relying only on a fixed sentence count.
-- Cancel stale work promptly after stop, seek, page navigation, voice change, rate change, or a new read-aloud session.
-- Retain the existing `/v1/tts` contract for old VoiceLink bridges and non-look-ahead clients.
-- Structure the work so the VoiceLink and Readium changes can be reviewed independently and submitted upstream.
+## 4. Current Behavior and Root Cause
 
-## Non-goals
+R2 Navigator already constructs a document-order TTS queue. Each queue item
+contains a block element, its text nodes, combined text, sentence splits,
+language, and direction. When playback reaches a sentence, R2 creates one
+`SpeechSynthesisUtterance` and submits it through `speechSynthesis.speak()`.
+The next sentence is submitted from the current utterance's completion path.
 
-- Pre-rendering a whole book or chapter.
-- Predicting text that the reader has not supplied.
-- Running multiple concurrent Kokoro inference calls against the same model instance.
-- Providing phoneme-level alignment. Word timing remains an estimate within an exact segment duration.
-- Replacing SAPI or the Web Speech API with a VoiceLink-only media player.
-- Solving sustained playback for a model whose effective real-time factor is at or above 1.0. Buffering can absorb variation, but it cannot make an unsustainable producer keep up indefinitely.
-- Making Qwen3 use this pipeline in the first implementation. The protocol should not prevent later adoption, but Kokoro/Thorium is the initial target.
+Chromium queues Web Speech utterances internally and sends only the active
+utterance to the native TTS service. Windows SAPI similarly calls the selected
+engine with the current text fragment. Consequently, queuing more Web Speech
+utterances would not make future text available to VoiceLink early enough to
+pre-generate it.
 
-## Anti-goals
+The local VoiceLink server also needs the completed Kokoro PCM before it can
+calculate the current response length. Local measurements show that first-byte
+latency grows with input size. The gap is therefore primarily a producer timing
+problem, not an audio-player pause setting.
 
-The change is considered a failure if it:
+## 5. Design Principles
 
-- silently skips or repeats text at batch boundaries;
-- lets highlighting advance independently of the audio presentation position;
-- generates an unbounded second audiobook in RAM or on disk;
-- keeps synthesizing an old location after the user navigates elsewhere;
-- requires all SAPI clients to adopt the new protocol simultaneously;
-- reduces stop/skip responsiveness compared with the current bridge;
-- fixes latency by removing boundary events or materially degrading Thorium navigation.
+1. **The current utterance is authoritative.** Look-ahead data never causes
+   speech by itself.
+2. **The existing path remains untouched.** Current text still travels through
+   Web Speech, Chromium, SAPI, the VoiceLink bridge, and `/v1/tts`.
+3. **Look-ahead is a replaceable snapshot, not a command queue.** Repeating the
+   same snapshot is harmless; a newer generation invalidates older work.
+4. **Structure is semantic, not timed.** R2 reports document meaning. VoiceLink
+   decides how that meaning maps to pauses or future prosody controls.
+5. **Correlation must be conservative.** VoiceLink uses prefetched data only
+   when it can identify exactly one matching stream and sequence.
+6. **All speculative work is bounded.** The window, cache, request size, worker
+   time, and retained PCM have explicit limits.
 
-## Constraints and findings
+## 6. End-to-End Architecture
 
-### Ownership of future text
-
-Readium constructs a document-wide TTS queue and flattens sentence fragments into global queue indexes. Its current player creates one `SpeechSynthesisUtterance` for the current global item and calls the next item only from `utterance.onend`.
-
-Chromium also serializes Web Speech utterances: additional calls to `speechSynthesis.speak()` are stored in Chromium's queue while a native utterance is active. Chromium does not forward all queued utterances to the Windows voice in advance.
-
-SAPI calls `ISpTTSEngine::Speak` with only the `SPVTEXTFRAG` list belonging to the current input stream. Consequently, no VoiceLink-only implementation can pre-render Thorium's next sentence unless Readium first includes that sentence in the active native utterance or uses a separate provider API.
-
-### Existing VoiceLink timing contract
-
-The server currently pre-generates all PCM to produce `X-Audio-Length`. The bridge uses that total length to distribute word-boundary events proportionally across the entire input. This improves total-duration knowledge at the cost of delaying every byte.
-
-The exact total length of the whole look-ahead batch is unnecessary. Exact length per segment is sufficient and produces a better estimate: each word is placed proportionally within its own sentence or clause rather than across an entire multi-sentence passage.
-
-### Reference designs
-
-- `readio` uses separate render and playback threads, a bounded queue, a hard sentence cap, generation epochs for cancellation, a content-addressed cache, and an audio-runway target adjusted by an EWMA of real-time factor.
-- `paperreader` generates and caches sentence clips ahead of playback and derives word timings from actual clip duration.
-- `PageCast` uses a bounded duration target, limited concurrent preparation, caching, and cancellation of obsolete work.
-- `readaloud` pre-generates future chunks and keeps canonical cached audio independent of playback tempo.
-
-These systems share one invariant: the document owner supplies future text to a bounded producer before the player needs it.
-
-## Approaches considered
-
-### 1. Restore streaming in VoiceLink only
-
-Return a `StreamingResponse` directly from the Kokoro generator and omit the whole-response `X-Audio-Length`.
-
-**Advantages**
-
-- Smallest VoiceLink change.
-- Improves time to first audio for clients that submit several sentences or a paragraph.
-
-**Trade-offs**
-
-- Thorium normally submits one sentence, so there is no next sentence to generate.
-- A Kokoro chunk is approximately a sentence; a one-sentence request still waits for that sentence's inference.
-- Whole-utterance timing falls back to a rough estimate.
-
-**Decision:** retain as a compatibility improvement where practical, but reject as the complete solution.
-
-### 2. Combine a fixed number of Readium queue items
-
-Readium could concatenate the next three to five sentences into one Web Speech utterance. VoiceLink would receive the larger input and stream Kokoro's chunks.
-
-**Advantages**
-
-- Avoids a custom document-provider API.
-- Relatively small first prototype.
-
-**Trade-offs**
-
-- Sentence length and synthesis speed vary widely, so a count is a poor buffer measure.
-- Boundary-to-DOM mapping, skip, previous/next, and cancellation must still be redesigned.
-- Raw PCM streaming does not carry exact per-segment text and audio metadata.
-
-**Decision:** useful as a spike, but reject as the final algorithm.
-
-### 3. Batched Readium utterance plus an adaptive VoiceLink synthesis session
-
-Readium supplies a bounded batch with a mapping back to its original queue items. The SAPI bridge creates a short-lived server session. The server returns one exact segment at a time and prepares later segments in the background. The bridge consumes segments in order and queues exact per-segment SAPI events.
-
-**Advantages**
-
-- Gives the synthesizer the future text it actually needs.
-- Keeps the standard Web Speech and SAPI playback path.
-- Provides explicit cancellation, exact segment metadata, backpressure, bounded memory, and compatibility.
-- Allows model throughput to determine the runway.
-
-**Trade-offs**
-
-- Requires coordinated changes in VoiceLink and Readium.
-- Requires stateful, short-lived local sessions.
-- Readium must map boundary indexes for a combined utterance back to original DOM ranges.
-
-**Decision:** selected. This is the only approach that addresses both ownership of future text and a robust bounded generation pipeline.
-
-## System architecture
+The authoritative playback path remains:
 
 ```text
-Readium document TTS queue
-        |
-        | builds a same-language look-ahead batch and span map
-        v
-SpeechSynthesisUtterance(batch text)
-        |
-        | Chromium forwards the single active utterance
-        v
-VoiceLink SAPI bridge
-        |
-        | POST session, then request ordered segments
-        v
-VoiceLink session coordinator
-        |
-        +--> urgent current-segment job
-        +--> lower-priority prefetch jobs
-        v
-single Kokoro model worker --> bounded ready queue/cache
-        |
-        | exact segment metadata + PCM
-        v
-SAPI bridge queues boundary events, then writes paced PCM
-        |
-        v
-Thorium receives boundary events and maps charIndex to DOM spans
+R2 current sentence
+  -> speechSynthesis.speak(current sentence)
+  -> Chromium
+  -> Windows SAPI
+  -> VoiceLink bridge
+  -> POST /v1/tts
+  -> audio returned to SAPI
 ```
 
-The document queue, synthesis queue, and playback queue are distinct:
-
-- Readium owns textual order and navigation.
-- The VoiceLink server owns inference scheduling and cached PCM.
-- SAPI owns presentation and reports playback-position events to Readium.
-
-## Readium look-ahead batching
-
-### Batch construction
-
-Starting at global queue index `N`, Readium collects subsequent `ITtsQueueItemReference` values until the first applicable limit:
-
-- language or direction changes;
-- document boundary;
-- configured hard sentence cap;
-- configured hard character cap;
-- estimated audio-runway cap.
-
-The initial hard limits are implementation safeguards, not tuning claims. Recommended starting points are six sentence items, 1,200 characters, and approximately 30 seconds of estimated speech. Benchmarks and tests may lower them.
-
-Readium creates:
+The optional look-ahead path is:
 
 ```text
-TtsLookAheadBatch
-  startGlobalIndex
-  endGlobalIndexExclusive
-  combinedText
-  spans[]
-    globalIndex
-    combinedStartUtf16
-    combinedLengthUtf16
-    queueItemReference
+R2 bounded structured snapshot
+  -> provider-neutral R2 event/callback
+  -> Thorium renderer adapter
+  -> Thorium main process
+  -> VoiceLink loopback look-ahead endpoint
+  -> correlation + scheduler + bounded cache
 ```
 
-Separators inserted between items are included in the span accounting. UTF-16 units are used because Web Speech `charIndex` and SAPI text offsets are based on the Windows/JavaScript string representation.
+The two paths meet only inside VoiceLink when an authoritative `/v1/tts`
+request can be correlated safely with a previously received snapshot.
 
-Separators are explicit non-item spans rather than being assigned to either neighboring item. Batch construction inserts one ASCII space only when the existing boundary does not already contain whitespace. A boundary event inside a separator span is ignored and the current highlight remains in place until an event reaches the following item. The bridge's word parser must not normally emit an event for whitespace, but representing separators explicitly keeps binary-search and local-offset behavior defined for malformed or platform-specific events.
+### 6.1 Component responsibilities
 
-### Highlighting and navigation
+**R2 Navigator JS**
 
-On a word boundary, Readium binary-searches `spans` for the reported `charIndex`, switches the active queue reference when necessary, converts the index to the item's local offset, and uses the existing highlight path.
+- Selects a bounded window from its existing TTS queue.
+- Attaches language, direction, block structure, and boundary semantics.
+- Emits a provider-neutral event or callback.
+- Advances the snapshot as playback advances.
+- Changes generation when the reading timeline is invalidated.
+- Does nothing differently when no host listener is installed.
 
-Normal `onend` advances to `endGlobalIndexExclusive`, not `N + 1`.
+**Thorium Reader**
 
-Explicit next/previous, click-to-read, seek, stop, pause-restart, language change, or voice change cancels the active Web Speech utterance and constructs a fresh batch at the requested global index. A manual next command advances one logical queue item, not one whole batch.
+- Listens for the optional R2 look-ahead event.
+- Probes whether the local VoiceLink instance supports the protocol.
+- Forwards validated snapshots through Electron's main process.
+- Stops forwarding when VoiceLink is unavailable or unsupported.
+- Does not alter ordinary TTS playback.
 
-### Activation and upstream compatibility
+**VoiceLink**
 
-The `r2-navigator-js` API gains a configurable look-ahead policy. The default remains one item until the multi-item boundary mapping is validated across supported platforms. The host can select `adaptive` or a numeric hard cap.
+- Advertises optional look-ahead capability.
+- Accepts and validates bounded snapshots on loopback.
+- Correlates the current SAPI-originated request conservatively.
+- Schedules future Kokoro synthesis with lower priority than current speech.
+- Stores reusable canonical speech PCM in a bounded cache.
+- Adds a structure-aware pause when returning authoritative audio.
+- Falls back to ordinary on-demand synthesis on every uncertainty.
 
-Thorium adoption is a small integration step after the navigator change: update the dependency and enable the policy for voices/configurations where boundary events are available. If upstream maintainers do not want a new UI control, the navigator option can initially be enabled by Thorium configuration while retaining the current default for other consumers.
+## 7. R2 Navigator Look-Ahead Contract
 
-This means there are two substantive implementations and potentially a third, small adoption PR in Thorium itself. The navigator change remains the correct upstream home for queue batching.
+### 7.1 Event shape
 
-## VoiceLink session protocol
+R2 adds an optional event, tentatively named `R2_EVENT_TTS_LOOKAHEAD`, with a
+host-facing listener such as `ttsLookAheadListen`. Naming should follow the
+existing R2 event conventions during implementation.
 
-The existing `POST /v1/tts` remains supported. A versioned session API is added for bridges that advertise look-ahead capability.
+An illustrative payload is:
 
-### Create session and obtain the first segment
+```ts
+interface TtsLookAheadSnapshot {
+  protocol: 1;
+  streamId: string;
+  generation: number;
+  revision: number;
+  currentSequence: number;
+  selectedVoice?: {
+    name?: string;
+    voiceURI?: string;
+    lang?: string;
+  };
+  rate: number;
+  units: TtsLookAheadUnit[];
+}
 
-```text
-POST /v1/tts/sessions
-Content-Type: application/json
-
-{
-  "text": "combined look-ahead text",
-  "voice": "af_heart",
-  "speed": 1.0,
-  "format": "pcm_24k_16bit",
-  "protocol": 1
+interface TtsLookAheadUnit {
+  sequence: number;
+  text: string;
+  lang?: string;
+  direction?: "ltr" | "rtl" | "auto";
+  block: {
+    id: string;
+    kind: TtsBlockKind;
+    htmlTag?: string;
+    headingLevel?: number;
+    epubTypes?: string[];
+    ariaRole?: string;
+  };
+  position: {
+    indexInBlock: number;
+    firstInBlock: boolean;
+    lastInBlock: boolean;
+  };
+  boundaryBefore: TtsBoundaryKind;
+  boundaryAfter: TtsBoundaryKind;
 }
 ```
 
-The response body is the first segment's PCM. Response headers include:
+Initial block kinds are:
 
 ```text
-X-VoiceLink-Protocol: 1
-X-VoiceLink-Session: <opaque id>
-X-Segment-Index: 0
-X-Segment-Text-Start-UTF16: <offset>
-X-Segment-Text-Length-UTF16: <length>
-X-Segment-Audio-Length: <PCM bytes>
-X-Segment-Flags: sentence-start[,sentence-end][,final]
+heading, paragraph, list-item, blockquote, caption, table-cell,
+code, math, image-description, page-break, other
 ```
 
-Returning PCM in the creation response avoids a second round trip before initial playback. The response is sent as soon as segment zero is complete; it does not wait for future segments.
-
-### Obtain subsequent segments
+Initial semantic boundary kinds are:
 
 ```text
-GET /v1/tts/sessions/{session_id}/segments/next
+none, sentence, paragraph, list-item, heading-to-body, section, document
 ```
 
-The request waits until the next ordered segment is ready, fails, is cancelled, or reaches a bounded timeout. It returns PCM with the same segment headers. End-of-session is an explicit `204 No Content` or a `final` segment followed by idempotent `204`; the implementation plan must select and test one consistent rule.
+The exact TypeScript names may change to match existing R2 conventions, but the
+semantics are part of the protocol contract.
 
-Local HTTP round-trip cost is negligible compared with inference and gives the server an acknowledgement boundary: requesting segment `K + 1` means the bridge has finished submitting segment `K` to SAPI.
+Thorium converts the R2-local `selectedVoice` and `rate` fields into the
+normative wire `source` object below, removes `streamId` from the body because it
+is carried in the URL, and may add the VoiceLink-specific `synthesisHint` under
+the strict rule below. R2 itself never defines or emits `synthesisHint`.
 
-### Cancel session
+### 7.2 Normative protocol-1 wire schema
+
+The TypeScript event names are repository-local, but the Thorium-to-VoiceLink
+JSON schema is frozen for protocol 1. JSON object property names below are
+normative. Unknown properties are ignored; missing required properties or an
+unknown enum value make the request invalid.
+
+```json
+{
+  "protocol": 1,
+  "generation": 3,
+  "revision": 18,
+  "currentSequence": 42,
+  "source": {
+    "rate": 1.0,
+    "voiceName": "Heart (Kokoro)",
+    "voiceURI": "optional Web Speech identifier",
+    "lang": "en-GB"
+  },
+  "synthesisHint": {
+    "route": "kokoro",
+    "voice": "af_heart",
+    "speed": 1.0,
+    "format": "pcm_24k_16bit"
+  },
+  "units": [
+    {
+      "sequence": 42,
+      "text": "Example sentence.",
+      "lang": "en-GB",
+      "direction": "ltr",
+      "block": {
+        "id": "b7",
+        "kind": "paragraph",
+        "htmlTag": "p",
+        "epubTypes": [],
+        "ariaRole": "paragraph"
+      },
+      "position": {
+        "indexInBlock": 0,
+        "firstInBlock": true,
+        "lastInBlock": true
+      },
+      "boundaryBefore": "paragraph",
+      "boundaryAfter": "paragraph"
+    }
+  ]
+}
+```
+
+Required top-level fields are `protocol`, `generation`, `revision`,
+`currentSequence`, `source.rate`, and `units`. `generation`, `revision`, and all
+sequences are non-negative safe JSON integers. `source.rate` is the Web Speech
+rate supplied to R2 and is informational. Other `source` properties are
+optional. `synthesisHint` is optional and Thorium may include it only when its
+VoiceLink voice-token metadata and rate conversion guarantee that all four
+values are byte-for-byte identical to the next bridge `/v1/tts` body. Otherwise
+it must be omitted; an uncertain hint is worse than no hint.
+
+Every unit requires `sequence`, non-empty `text`, `block.id`, `block.kind`, all
+three `position` fields, `boundaryBefore`, and `boundaryAfter`. Optional fields
+are omitted, not sent as `null`. Units are ordered by consecutive sequence,
+start at `currentSequence`, and contain no duplicates. `streamId` appears only
+as the canonical lowercase UUID in the URL path; it is not duplicated in the
+body.
+
+Character limits count Unicode scalar values after JSON decoding. Transport
+limits count UTF-8 request-body bytes. Implementations must not count UTF-16
+code units. Protocol 1 permits at most 12 units, 12,000 scalar values across
+unit texts, 4,000 scalar values in one unit, and a 64 KiB HTTP body. A server may
+advertise smaller positive limits, in which case Thorium tail-truncates to them.
+If the current unit by itself exceeds any advertised or protocol limit, Thorium
+sends no snapshot for that sequence and ordinary playback continues. It must not
+split, truncate, or rewrite the authoritative current unit for this feature.
+
+`GET /v1/capabilities` returns this normative shape for this feature:
+
+```json
+{
+  "lookahead": {
+    "protocols": [1],
+    "maxUnits": 12,
+    "maxCharacters": 12000,
+    "maxUnitCharacters": 4000,
+    "maxBodyBytes": 65536
+  },
+  "structuredPauses": true,
+  "bridgeProtocolRequiredForPauses": 2
+}
+```
+
+For `PUT`, VoiceLink returns `202` with
+`{"status":"accepted","generation":3,"revision":18}`, or `200` with the
+same generation/revision and `status:"duplicate"` for an identical replay.
+It returns `400 invalid`, `409 stale`, `409 revision-conflict`, `413 over-limit`,
+`426 unsupported-protocol`, or `429 budget-exhausted`. Error bodies have the
+normative form `{"error":{"code":"stale","message":"..."}}`; clients branch
+on `code`, not the human-readable message. `DELETE` is idempotent and returns
+`204`, including when the stream no longer exists.
+
+All non-2xx `PUT` responses are atomic rejections: they do not replace,
+invalidate, or partially schedule the previously accepted window. In
+particular, `429 budget-exhausted` means no state from that request was stored.
+Thorium drops that revision, applies exponential backoff starting at one second
+and capped at 30 seconds, and may send only the then-current newer revision after
+the backoff. It never retries the rejected body verbatim. Existing accepted
+state expires normally and cannot advance correlation past its published
+sequence window.
+
+### 7.3 Snapshot semantics
+
+- `streamId` is a random opaque identifier for one active read-aloud session.
+- `generation` increases whenever previously published future units may no
+  longer be valid.
+- `revision` increases for every replacement within one generation.
+- `sequence` is monotonic within a generation.
+- `currentSequence` identifies the sentence currently being submitted or
+  spoken through the authoritative path.
+- `units` begins with the current unit and contains a bounded number of future
+  units in document order.
+- Replacing a snapshot with the same `(streamId, generation, revision)` and
+  identical content is idempotent.
+- A higher generation atomically invalidates queued work, in-flight stream
+  associations, and generation-scoped results for earlier generations. It does
+  not evict an independently keyed canonical PCM entry whose exact synthesis
+  key remains valid.
+- Within one generation, VoiceLink accepts only a higher revision whose
+  `currentSequence` is not lower than the accepted value. A lower revision or
+  regressing sequence is stale. Reusing a revision with different content is a
+  conflict. Receivers reject lower generations and malformed or oversized
+  windows.
+
+A complete window is used instead of `appendNextSentence` because it is robust
+to duplicate delivery, dropped events, seeks, restarts, and changes in the
+adaptive window size. It also lets the receiver reconcile state without relying
+on a perfectly delivered command history.
+
+### 7.4 Extracting structure
+
+R2 already has the relevant DOM context when it creates `ITtsQueueItem`. The
+event adapter derives structure from the queue item's parent element and the
+sentence's position within that item:
+
+- `h1` through `h6` become `heading` with `headingLevel`.
+- `p` becomes `paragraph`.
+- `li`, `blockquote`, `caption`/`figcaption`, `th`/`td`, `pre`, and known math or
+  image-description semantics map to their corresponding kinds.
+- `epub:type` values and computed ARIA role are retained as semantic hints.
+- Unknown elements map to `other`; they never block speech.
+
+Block IDs are session-local opaque identifiers. They need not expose EPUB file
+paths, element IDs, titles, or book identifiers.
+
+Boundary values are derived from adjacent units. For example, two sentences in
+one paragraph have a `sentence` boundary; the first body sentence after a
+heading has `heading-to-body`; adjacent list items have `list-item`; and the
+first unit of a new section has `section` when R2 can determine that reliably.
+When structure is uncertain, R2 reports the less specific safe value rather
+than guessing.
+
+Protocol 1 carries one boundary value, so simultaneous meanings use this strict
+precedence from strongest to weakest:
 
 ```text
-DELETE /v1/tts/sessions/{session_id}
+document > heading-to-body > section > list-item > paragraph > sentence > none
 ```
 
-Cancellation is idempotent. Sessions also expire by TTL so a crashed SAPI host cannot leak memory or work indefinitely.
+For adjacent units A and B, `A.boundaryAfter` must equal
+`B.boundaryBefore`. The first unit in a stream has `boundaryBefore: document`;
+the final known unit of the document has `boundaryAfter: document`. The tail of
+a truncated snapshot is not assumed to be the end of the document: its final
+`boundaryAfter` is derived from the next queue unit even when that unit is not
+transmitted. If the next unit is unavailable or structural classification is
+uncertain, use `sentence` for same-block text, `paragraph` for a known block
+change, and `none` only when no audible separation is intended.
 
-The lease is refreshed whenever a segment request begins or completes. A configurable idle TTL, initially 30 minutes, bounds abandoned paused sessions. If a generic SAPI client remains paused beyond the lease and later resumes, the bridge finishes any already accepted current-segment write, recreates a session for the first not-yet-submitted segment, and does not replay the current segment. Thorium's existing pause path cancels the active Web Speech utterance, so its resume naturally creates a new batch instead of depending on a long-lived server session.
+### 7.5 Lifecycle
 
-### Errors
+R2 publishes or replaces the snapshot when playback starts and when the current
+sequence advances. During one active stream it increments `generation` on:
 
-- Failure before the first response uses the existing HTTP error contract.
-- Failure during a session is returned by the next-segment request with a stable error code and message.
-- The bridge aborts the active SAPI `Speak` call on a terminal session error.
-- Readium stops read-aloud, surfaces the error, and retains the first unplayed logical queue item as the retry position. It neither skips that item nor automatically replays an ambiguously consumed segment.
-- If session creation is unsupported, the bridge falls back to `/v1/tts` without changing registered voice compatibility.
+- seek or navigation to a different queue position;
+- voice, language, or speech-rate change;
+- document or spine-item change;
+- queue reconstruction that may change sequence identity.
 
-## Segmentation and exact event timing
+Pause retains the current generation but must not cause the look-ahead window to
+grow. Stop or document close synchronously emits a provider-neutral
+`R2_EVENT_TTS_LOOKAHEAD_CANCEL` (final public naming follows R2 conventions)
+whose payload is `{ protocol: 1, streamId }`. Thorium consumes that signal and
+sends the idempotent DELETE. A later start always creates a new random
+`streamId`, with generation and revision reset to zero; a canceled ID is never
+reused. Unexpected renderer destruction may prevent delivery, so server TTL
+remains the final cleanup mechanism.
 
-The server segments the original request without losing original character ranges. It prefers sentence-final punctuation, then clause punctuation, then whitespace before a model/token safety limit. It never splits a UTF-16 surrogate pair.
+R2 dispatches each look-ahead event synchronously before it calls
+`speechSynthesis.speak()` for that current sequence. This establishes ordering
+inside the renderer, but HTTP forwarding remains asynchronous and may reach
+VoiceLink after the authoritative request. VoiceLink therefore supports the
+late-correlation rule in Section 10; playback never waits for look-ahead
+delivery.
 
-Each segment records:
+R2 emits a host-configured fixed maximum window, initially 12 units and 12,000
+Unicode scalar values including the current unit. Thorium truncates only from
+the tail to the smaller limits advertised by VoiceLink and never removes or
+rewrites the current unit. VoiceLink then adaptively schedules an in-order
+subset of the received future units. There is no feedback loop from VoiceLink's
+runway estimator into R2 in protocol 1.
 
-- Python source slice;
-- source start and length converted to UTF-16 code units;
-- whether it starts or ends a logical sentence;
-- exact generated PCM byte length;
-- synthesis wall time and audio duration.
+## 8. Thorium Adapter
 
-Long sentences are allowed to become several inference segments. Only the first segment carries `sentence-start`; the bridge continues word events through later segments without inventing new sentence boundaries.
+Thorium is the integration boundary because it knows both the provider-neutral
+R2 event and the configured local TTS integration.
 
-Before writing a segment's PCM, the bridge queues its SAPI events. Word offsets are distributed proportionally within that exact segment's PCM length and added to the cumulative audio byte offset. This obeys SAPI's requirement that events be queued before their associated audio and improves on whole-utterance proportional timing.
+On the first relevant event, and periodically after failures, Thorium calls:
 
-## Producer, scheduler, and backpressure
+```http
+GET /v1/capabilities
+```
 
-### Single model actor
+If the response advertises look-ahead protocol version 1, Thorium forwards
+snapshots using its Electron main process. Keeping the HTTP call out of the
+webview avoids CORS and content-security-policy coupling and gives Thorium one
+place to enforce loopback-only destinations, timeouts, size limits, and version
+negotiation.
 
-Kokoro inference is owned by one long-lived worker/actor. Requests are serialized through it; multiple HTTP handlers never invoke the same model concurrently.
+Forwarding is best-effort and non-blocking. A slow or failed call must never
+delay `speechSynthesis.speak()`. Capability or transport failure disables the
+optimization for a backoff period and leaves current speech unchanged.
 
-Jobs have two priorities:
+Thorium sends stream deletion on normal teardown when practical, but correctness
+does not depend on it because VoiceLink also expires streams by TTL.
 
-1. `immediate`: the segment blocking audible playback;
-2. `prefetch`: future segments in an active session.
+## 9. VoiceLink Protocol
 
-Fairness prevents one long batch from starving a newly started or newly sought session. At segment boundaries the scheduler checks for newer immediate work before taking another prefetch job.
+### 9.1 Capability discovery
 
-### Session state
+```http
+GET /v1/capabilities
+```
+
+The protocol-1 response and counting rules are normative in Section 7.2.
+Absence, an error, or a response without protocol 1 means the feature is not
+available.
+
+### 9.2 Replace snapshot
+
+```http
+PUT /v1/tts/lookahead/{streamId}
+Content-Type: application/json
+```
+
+The body is the normative Section 7.2 snapshot without `streamId`; the canonical
+UUID exists only in the path. The operation replaces the server's desired
+window for that stream and generation; it does not append commands.
+
+Normative response codes and bodies are defined in Section 7.2. Thorium does not
+retry stale, conflicting, invalid, or over-limit snapshots.
+
+### 9.3 Cancel stream
+
+```http
+DELETE /v1/tts/lookahead/{streamId}
+```
+
+Cancellation removes pending speculative jobs and stream-specific associations.
+Canonical cache entries may remain until ordinary cache eviction because they
+contain only derived audio keyed independently of the stream.
+
+### 9.4 Existing synthesis endpoint
+
+`POST /v1/tts` remains backward-compatible in request and audio-response
+semantics. A new VoiceLink bridge may add diagnostic correlation headers:
 
 ```text
-CREATING -> ACTIVE -> DRAINED -> CLOSED
-                 \-> CANCELLED
-                 \-> FAILED
+X-VoiceLink-Bridge-Protocol: 2
+X-VoiceLink-Engine-Instance: <random UUID created by the bridge>
+X-VoiceLink-Engine-Process: <process identifier, if useful>
 ```
 
-Every session has a monotonically increasing generation/era token. Stop or replacement invalidates the old era before attempting model cancellation. Results produced for a stale era are discarded and never enter the ready queue.
+The bridge creates a fresh UUID for each `VoiceLinkEngine` COM object, not one
+per DLL or process, and retains it for that object's lifetime. One object is not
+assumed to equal one reader: the server still applies the concurrency and
+ambiguity rules in Section 10. `X-VoiceLink-Bridge-Protocol: 2` promises that the
+bridge understands prefix-silence timing headers. Older bridges omit these
+headers and the server must continue to synthesize normally. None of the headers
+attempts to transport the R2 stream ID through Web Speech or SAPI.
 
-Sessions are independent per client `Speak` call. Creating a session never globally supersedes sessions belonging to another SAPI object, process, or application. Replacement invalidates only the session owned by that bridge call. The model worker and priority scheduler are global to the server and arbitrate fairly across these independent sessions.
+## 10. Conservative Correlation
 
-### Adaptive runway
+The side-channel and authoritative SAPI request cannot carry a shared identifier
+through the complete current stack. VoiceLink therefore treats correlation as a
+best-effort optimization with strict ambiguity rules.
 
-For every cache miss, record:
+Bridge protocol 2 also sends
+`X-VoiceLink-Request-Id: <UUID>` once per SAPI `Speak` call and reuses it only for
+transport retries of that same call. This makes retry handling idempotent.
+
+VoiceLink keeps two short-lived indexes: unclaimed snapshots and authoritative
+request observations. An observation contains request ID, engine-instance ID,
+arrival time, the exact request-body synthesis configuration, and text digests;
+it expires after five seconds. This permits either arrival order:
+
+- If the snapshot is already present, an authoritative request may claim it.
+- If asynchronous forwarding makes the snapshot late, its arrival may claim one
+  recent still-eligible request observation and then begin prefetching future
+  units. It cannot accelerate that already-started current request, but it can
+  prepare the next one.
+
+For an initial claim, snapshot S and request observation R are eligible exactly
+when all of these conditions hold:
+
+- both are accepted, unexpired, and their arrival timestamps differ by no more
+  than five seconds;
+- S is unclaimed, R is unclaimed, and R has bridge protocol 2 instance and
+  request IDs;
+- S's current-unit `correlationTextDigest` equals R's digest;
+- if S contains `synthesisHint`, every hint field exactly equals R's request
+  route/body configuration; if the hint is absent, this check is neutral;
+- neither the engine instance nor stream is already bound to a different
+  active counterpart.
+
+The protocol-1 `source` fields are never equality constraints because they are
+provider-neutral and may use a different naming or rate scale. They are retained
+for diagnostics and future negotiation only.
+
+Claiming requires a mutually unique edge in the active eligibility graph: S has
+exactly one eligible request observation, and R has exactly one eligible
+snapshot. Unrelated pairs with different digests do not affect uniqueness. If
+either endpoint has two eligible counterparts, none of those edges is claimed,
+regardless of which item arrived first. This symmetric rule prevents arrival
+order from choosing between simultaneous readers with identical text.
+
+R2's `source` voice/rate/language values are correlation hints, not synthesis
+configuration. When present, `synthesisHint` participates in matching only
+because Thorium has asserted exact equivalence. The first authoritative request
+that claims a stream freezes the actual configuration from its `/v1/tts` body:
+route/model, voice, speed, format, backend version, and any other
+synthesis-affecting option. All speculative units for that claim use this frozen
+configuration. A later authoritative configuration mismatch suspends the claim,
+serves normally, and requires a unique new-generation claim before prefetch is
+used again. Thus no Web Speech-to-SAPI rate conversion is guessed by VoiceLink.
+
+Candidate discovery may use a separately named `correlationTextDigest` based on
+a narrowly defined normalization (Unicode NFC, CRLF-to-LF, and collapse of
+Unicode whitespace runs to one ASCII space, with no case or punctuation
+folding). This digest only locates candidates. It never authorizes audio reuse.
+Every reusable PCM entry and in-flight synthesis job uses a
+`synthesisInputDigest` over the exact UTF-8 text received by `/v1/tts` or stored
+in the snapshot plus the frozen synthesis configuration. If the exact key does
+not match, the authoritative text is synthesized on demand even when
+correlation succeeds.
+
+The binding state machine is normative:
+
+1. `unclaimed`: a snapshot has no engine association. Claim it only if exactly
+   one globally eligible snapshot/observation pair matches. Zero or multiple
+   pairs remain unclaimed.
+2. `bound`: associate `(engineInstance, streamId, generation)` with the last
+   accepted sequence, next expected sequence, and frozen synthesis config.
+3. `advance`: a new request advances only when it is the sole non-retry request
+   on that engine instance, matches the exact expected sequence's
+   `synthesisInputDigest`, and no competing unclaimed snapshot makes the same
+   request globally ambiguous.
+4. `retry`: the same request ID attaches to the same job/result and never
+   advances sequence twice.
+5. `suspended`: an unexpected text/configuration, competing candidate,
+   concurrent different request ID, generation discontinuity, or sequence gap
+   immediately disables prefetched reuse. The authoritative request follows the
+   legacy path. A later unique claim may rebind.
+6. `released`: DELETE, stop/TTL expiry, engine TTL expiry, or document teardown
+   removes the association and cancels stream-specific speculative jobs.
+
+One engine instance may have at most one bound stream and one non-retry
+authoritative request in flight. The server does not assume that a COM object is
+dedicated to one reader; overlap causes suspension and fallback. A higher
+generation on the same stream may replace the binding only when its current
+unit uniquely matches the next authoritative request.
+
+Requests from an old bridge without protocol-2 instance and request IDs never
+create an ordered stream binding and never receive structural prefix silence.
+They may use an already existing canonical cache entry only when their exact
+synthesis key matches; otherwise they follow the legacy path. Correctness takes
+priority over hit rate.
+
+Full text is not written to logs. Diagnostic records use digests, lengths,
+sequence numbers, and reason codes such as `unique-match`, `ambiguous`,
+`mismatch`, or `expired`.
+
+## 11. Synthesis Scheduler and Cache
+
+### 11.1 Worker model and authoritative isolation
+
+Speculative inference must never occupy the only capacity able to serve a new
+authoritative `/v1/tts` miss. A queue priority alone is insufficient because it
+cannot preempt a long inference already running.
+
+Protocol-1 enablement therefore requires two execution lanes:
+
+1. An authoritative lane reserved for `/v1/tts` misses.
+2. A lower-OS-priority speculative lane with its own cancellable worker process
+   and model instance.
+
+The two lanes share only job metadata and the bounded PCM cache, not a mutable
+model object. If the machine cannot load the second model instance within its
+configured memory/CPU budget, VoiceLink advertises no look-ahead capability and
+uses the legacy authoritative lane only. Speculative CPU concurrency is capped
+and benchmarked so enabling it does not materially regress authoritative
+first-byte latency; the release gate is no more than 5% p95 regression versus
+look-ahead disabled under the same workload.
+
+An authoritative miss may reuse an identical completed cache entry. It may also
+adopt an identical in-flight speculative job only when the backend can promote
+or complete that job within the authoritative latency budget; otherwise it
+synthesizes independently in the reserved lane and the first valid completion
+wins cache insertion. Newer generations cancel the speculative process job when
+safe and remove stale queued jobs. Results that finish after invalidation are
+discarded from the stream association, though a valid exact-key canonical
+result may still enter the bounded content cache.
+
+### 11.2 Canonical cache key
+
+Canonical synthesized speech PCM is keyed by all inputs that affect speech,
+including at least:
 
 ```text
-sample_rtf = synthesis_wall_seconds / generated_audio_seconds
+route + engine/model version + voice + effective speed + format
++ language/backend options + exact UTF-8 synthesis text
 ```
 
-Maintain a clipped EWMA per effective model/voice/speed identity:
+Structural silence is not included in canonical speech PCM. Keeping speech and
+boundary pauses separate avoids duplicate cache entries for identical text at
+different document boundaries.
+
+### 11.3 Adaptive runway
+
+VoiceLink tracks an exponentially weighted moving average of real-time factor:
 
 ```text
-rtf = 0.75 * previous_rtf + 0.25 * sample_rtf
-utilization = rtf
-target_runway = base_runway / clamp(1 - utilization, min_headroom, 1)
+RTF = synthesis wall time / generated speech duration
 ```
 
-`target_runway` is clamped by configuration and hard resource limits. A reasonable initial policy to validate is:
-
-- base runway: 8 seconds;
-- target range: 8 to 30 seconds;
-- hard ready-segment cap: 6;
-- hard PCM byte cap derived from 30 seconds at 24 kHz, 16-bit mono;
-- minimum headroom: 0.2.
-
-These are benchmark inputs, not immutable product values. Tests assert boundedness and adaptation, not a magic exact constant.
-
-If `utilization >= 1`, the system fills to the hard cap but reports that continuous playback is not sustainable at the selected model/rate. It does not allocate without bound.
-
-The producer may start another segment only while the session is current and projected ready audio is below the target and all hard caps permit it. The next segment's duration is estimated from recent characters-per-audio-second until exact PCM exists.
-
-### Backpressure
-
-The next-segment request is the primary consumption acknowledgement. The server retains only the bounded ready queue. The bridge writes PCM in small chunks and checks `SPVES_ABORT`, `SPVES_SKIP`, rate, and volume actions between writes. It must not fetch unlimited future segments into the DLL.
-
-## Cache design
-
-Generated canonical PCM is keyed by a versioned digest of:
+The desired runway is enough predicted audio to cover expected synthesis time
+plus a safety margin. A conceptual rule is:
 
 ```text
-model implementation/version
-voice
-synthesis speed
-normalized exact segment text
-audio format
-segmentation protocol version
+target_runway_seconds = clamp(
+  minimum_runway,
+  recent_RTF * next_expected_generation_cost + safety_margin,
+  maximum_runway
+)
 ```
 
-Unlike players that apply tempo after synthesis, VoiceLink passes speed into Kokoro, so speed is part of the cache identity.
+The actual selection walks future units in order until the target is met, while
+also enforcing hard caps. The exact estimator should be tuned from measured
+telemetry rather than fixed in the protocol.
 
-The first implementation may use an in-memory LRU to minimize scope. A disk cache is optional later. Both entry count and total bytes are bounded. Partial, failed, or stale output is never cached.
+Hard bounds include:
 
-Cache hits do not update model RTF because they contain no inference measurement.
+- maximum units per snapshot and per active stream;
+- maximum characters per unit and snapshot;
+- maximum predicted PCM seconds and bytes;
+- maximum queued speculative work;
+- per-stream and global cache budgets;
+- stream and cache TTLs.
 
-## Cancellation and control behavior
+When `RTF >= 1` for a sustained period, prefetch cannot guarantee continuous
+playback. The scheduler still minimizes gaps but does not grow without bound.
 
-- **Stop or purge:** invalidate the session era, issue `DELETE`, stop requesting segments, and return promptly from `Speak`.
-- **Skip/click navigation:** acknowledge SAPI skip as today, cancel the session, and let Readium start a new batch at the chosen queue item.
-- **Reader-originated voice change:** Readium cancels the active utterance and restarts from the active logical queue item using the new voice. The old bridge call only cancels its own session; it does not attempt to synthesize a suffix for a different voice.
-- **Reader-originated rate change:** Readium follows the same cancel/restart rule so text ownership and the restart position remain with the reader.
-- **SAPI runtime rate action without a replacement `Speak`:** finish the already-started PCM segment at its old rate, cancel prefetched suffix segments, and create a replacement session for the first not-yet-submitted text range at the new rate. Never restart a partially submitted segment. Volume changes remain local PCM scaling and do not invalidate synthesized audio.
-- **Pause:** preserve the current session and bounded queue within its idle lease. Do not expand the runway while paused. Expiry recovery starts at the first not-yet-submitted segment as defined by the session lease rule.
-- **Client crash:** TTL cleanup cancels pending work and releases PCM.
-- **Server restart:** the bridge treats the lost session as a terminal request failure and may use its existing retry/fallback policy for a newly created session; it never replays an ambiguous partially consumed segment.
+## 12. Structure-Aware Pauses
 
-## Compatibility and rollout
+### 12.1 Semantic policy
 
-1. Add tests and the session API behind protocol version 1 while leaving `/v1/tts` unchanged.
-2. Add bridge support with automatic capability detection and fallback.
-3. Validate VoiceLink batching with a small Readium spike.
-4. Implement full Readium span mapping, navigation, and cancellation.
-5. Submit the VoiceLink PR independently with generic multi-segment clients and integration tests.
-6. Submit the navigator PR; then update Thorium's dependency/configuration in a small adoption PR if required by its release process.
+R2 supplies semantic boundaries. VoiceLink maps them through a configurable
+`ProsodyPolicy`. Defaults should be conservative and tuned by listening tests,
+not embedded in the cross-project protocol.
 
-Old server plus new bridge and new server plus old bridge must continue to speak through `/v1/tts`.
+An initial ordering is:
 
-## Observability
+```text
+sentence < paragraph/list-item < heading-to-body < section/document
+```
 
-Structured debug logs should expose enough data to diagnose gaps without logging full book text:
+Different block kinds may refine the mapping. Code, verse-like preformatted
+text, tables, and captions should avoid aggressive interpretation until tested.
+Unknown structure uses ordinary sentence behavior.
 
-- session ID and era;
-- segment index and UTF-16 range;
-- cache hit/miss;
-- synthesis milliseconds, audio milliseconds, sample RTF, EWMA RTF;
-- ready runway seconds and queue count;
-- time from request to first PCM;
-- time the bridge waits for each next segment;
-- cancellation reason and stale-result discards;
-- underrun count and duration.
+Version 1 primarily realizes structure as silence. The policy abstraction may
+later select model-specific style or prosody controls. Audible announcements of
+structure are a separate future accessibility option and are off by default.
 
-Text is represented only by length and a short digest in normal logs.
+### 12.2 Pause placement
 
-## Verification strategy
+Boundary silence is prefixed to the following unit's response and represents
+that unit's `boundaryBefore`. Prefix placement is preferable to appending silence
+to the prior response because, when the next request arrives, VoiceLink knows
+whether it incurred synthesis wait time and can avoid compounding that wait with
+the full desired pause.
 
-### VoiceLink server tests
+VoiceLink adds prefix silence only to a safely correlated request carrying
+`X-VoiceLink-Bridge-Protocol: 2`. Old bridges receive no structural prefix
+because they cannot offset SAPI boundary/progress events. Prefetch and canonical
+exact-key cache hits remain independently usable without adding silence.
 
-- deterministic segmentation with ASCII, punctuation, paragraphs, emoji, combining characters, and surrogate pairs;
-- session state transitions and idempotent cancellation;
-- first response does not wait for the second synthetic segment;
-- second segment is generated while a fake consumer plays the first;
-- immediate work preempts queued prefetch work at a segment boundary;
-- adaptive runway grows for slower RTF and faster consumption but never crosses hard caps;
-- pause does not expand prefetch;
-- stale-era results are discarded;
-- cache keys include every synthesis-affecting input;
-- errors after segment zero are observable and do not corrupt subsequent sessions;
-- legacy endpoint behavior remains covered.
+Let:
 
-### Bridge tests
+```text
+desired_gap = ProsodyPolicy(boundaryBefore)
+request_wait = elapsed time spent waiting for audio after the next request
+prefix_silence = max(0, desired_gap - request_wait)
+```
 
-- protocol negotiation and legacy fallback;
-- exact parsing of segment headers;
-- cumulative audio offsets across segments;
-- events queued before corresponding PCM;
-- partial HTTP reads and malformed lengths;
-- abort/skip while waiting, receiving, and writing;
-- x64 and Win32 builds;
-- bounded local buffering.
+On a cache hit, `request_wait` is near zero and the full structural gap is
+included. On a miss, synthesis latency already creates part or all of the
+perceived gap, so only the remainder is added. The measurement begins when the
+authoritative request reaches VoiceLink; it is therefore an approximation of
+wall-clock inter-utterance delay, not sample-accurate presentation timing.
 
-### Readium tests
+If actual request-to-playback buffering proves materially variable, the policy
+must remain conservative or the bridge can later report timing telemetry. That
+enhancement is not required for the initial protocol.
 
-- batch construction limits and language/document boundaries;
-- UTF-16 span mapping, including emoji;
-- boundary events crossing from one original queue item to the next;
-- normal completion advances by the batch size;
-- next/previous move one logical item;
-- click-to-read and seek cancel/restart at the correct index;
-- no skipped or duplicated text after cancellation races;
-- single-item mode remains behaviorally unchanged.
+For bridge protocol 2, the response includes additive timing headers measured in
+PCM bytes:
 
-### End-to-end acceptance
+```text
+X-Audio-Prefix-Bytes: <integer bytes of leading silence>
+X-Speech-Audio-Length: <integer PCM bytes excluding prefix silence>
+X-Audio-Length: <integer total PCM bytes returned>
+```
 
-- Thorium reads a multi-paragraph EPUB continuously with Kokoro on the reference CPU system.
-- After the first sentence starts, median inter-sentence dead air is below 150 ms when observed RTF is comfortably below 1; the test records underruns rather than hiding them.
-- Highlighting selects the correct sentence and word throughout a batch.
-- Stop and click-to-seek take effect within the existing responsiveness budget.
-- Memory and cache remain within configured caps during a long chapter.
-- A deliberately slow fake model demonstrates bounded, reported underruns without unbounded queue growth.
+New bridge code offsets boundary and progress events by the prefix duration and
+uses speech length for word-timing calculations. Duration is derived from the
+existing sample-rate, sample-width, and channel headers. Old bridges receive no
+prefix, ignore the new headers if present, and continue to receive legacy PCM.
 
-## Expected code areas
+A safely correlated cache miss still receives
+`max(0, desired_gap - request_wait)` silence under bridge protocol 2. In this
+document, “legacy fallback” means byte/timing-equivalent old output when the
+request is uncorrelated, ambiguous, from an old bridge, or otherwise unsafe.
+A failed or evicted speculative job alone does not remove structure when the
+stream correlation and protocol-2 timing support remain valid; it changes a hit
+into on-demand synthesis plus the residual safe pause.
 
-### VoiceLink
+## 13. Failure Handling
 
-- `server/routers/tts.py`: versioned session endpoints and response metadata.
-- `server/models/base.py`: a segment-oriented synthesis contract or adapter.
-- `server/models/kokoro_model.py`: range-preserving segmentation and per-segment metrics.
-- new server session/scheduler/cache modules with focused responsibilities.
-- `sapi_bridge/src/http_client.*`: session lifecycle and per-segment requests.
-- `sapi_bridge/src/tts_engine.cpp`: segment event mapping, paced writes, cancellation, and fallback.
-- new Python tests and C++ protocol/unit tests where the build permits.
+The following cases always preserve the old behavior:
 
-### Readium/Thorium
+- R2 host installs no look-ahead listener.
+- Thorium does not contain the adapter.
+- VoiceLink is absent, unreachable, slow, or reports no compatible capability.
+- The VoiceLink bridge is old and supplies no engine-instance header.
+- A snapshot is late, stale, malformed, or over limits.
+- Correlation has zero or multiple candidates.
+- The expected sequence or text does not match the authoritative request.
+- A prefetched job fails, is canceled, or is evicted.
+- Structure is absent or unknown.
 
-- `r2-navigator-js/src/electron/renderer/webview/readaloud.ts`: batch lifecycle and boundary routing.
-- `r2-navigator-js/src/electron/renderer/common/dom-text-utils.ts`: look-ahead batch/span helpers.
-- public read-aloud configuration types and tests.
-- Thorium dependency/configuration adoption if the navigator option is not enabled by default.
+Look-ahead transport and synthesis errors are observable through bounded,
+privacy-preserving diagnostics but never fail current speech solely because an
+optimization failed.
 
-## Builder discretion
+## 14. Security and Privacy
 
-The implementation plan may choose module names, concrete synchronization primitives, test libraries already compatible with each repository, and whether protocol headers use the exact names shown here. It must preserve the protocol semantics, UTF-16 ranges, boundedness, compatibility, and state transitions defined above.
+- All VoiceLink endpoints bind to loopback only by default.
+- Thorium forwards only to an explicitly configured loopback VoiceLink origin.
+- Stream and block identifiers are random, opaque, and session-local.
+- Snapshots contain no book path, title, author, account, or persistent document
+  identifier.
+- Logs omit full text and record only digests, lengths, timing, and reason codes.
+- Requests have strict byte, character, unit, and nesting limits.
+- Active streams, jobs, and PCM have per-client and global budgets plus TTLs.
+- Capability and look-ahead calls use short timeouts and do not block playback.
+- If VoiceLink later permits non-loopback binding, authentication and transport
+  security must be designed separately before this endpoint is exposed.
 
-The implementation plan should begin with a narrow VoiceLink protocol and scheduler slice using fake synthesis, then connect Kokoro, then update the bridge, and only then implement Readium batching. This keeps each failure attributable and allows the server/bridge behavior to be tested without Thorium.
+## 15. Compatibility and Versioning
 
-## Source references
+The look-ahead payload has an explicit protocol version. Capability negotiation
+prevents Thorium from sending unsupported shapes. Additive fields may be ignored
+within a protocol version; incompatible semantic changes require a new version.
 
-- Readium queue playback: <https://github.com/edrlab/r2-navigator-js/blob/develop/src/electron/renderer/webview/readaloud.ts>
-- Readium queue flattening: <https://github.com/edrlab/r2-navigator-js/blob/develop/src/electron/renderer/common/dom-text-utils.ts>
-- Chromium TTS queue: <https://github.com/chromium/chromium/blob/main/content/browser/speech/tts_controller_impl.cc>
-- Microsoft SAPI `SPVTEXTFRAG`: <https://learn.microsoft.com/en-us/previous-versions/windows/desktop/ms720504(v=vs.85)>
-- Microsoft SAPI engine guide: <https://learn.microsoft.com/en-us/previous-versions/windows/desktop/ms717037(v=vs.85)>
-- readio producer/consumer implementation: <https://github.com/hrhrng/readio/blob/main/apps/tui/src/voice/mod.rs>
-- paperreader: <https://github.com/dzimmerer/paperreader>
-- PageCast: <https://github.com/flabanabba8/PageCast>
-- readaloud: <https://github.com/YareyareSenpai/readaloud>
+Compatibility matrix:
+
+| R2 | Thorium adapter | VoiceLink support | Result |
+|---|---|---|---|
+| old | any | any | Existing playback |
+| new | absent | any | Existing playback |
+| new | present | absent/old | Existing playback after capability failure |
+| new | present | new, old bridge | Exact-key cache only; no binding or structured prefix |
+| new | present | new, new bridge | Prefetch and structured pauses when uniquely correlated |
+
+No existing R2 listener, Web Speech utterance, SAPI method, or `/v1/tts`
+request body changes meaning.
+
+## 16. Repository and Pull Request Boundaries
+
+This feature should be proposed as three independently reviewable changes.
+
+### 16.1 R2 Navigator JS PR
+
+- Add provider-neutral look-ahead event types and listener plumbing.
+- Convert existing queue items into bounded structured snapshots.
+- Add generation and lifecycle handling.
+- Preserve no-listener behavior as a no-op.
+- Document the host contract without mentioning VoiceLink as a dependency.
+
+### 16.2 Thorium Reader PR
+
+- Listen for the optional R2 event.
+- Add capability discovery and backoff.
+- Forward snapshots and cancellation through the main process.
+- Restrict forwarding to configured loopback destinations.
+- Ensure failures never delay or alter ordinary TTS.
+
+### 16.3 VoiceLink PR
+
+- Add capabilities, snapshot replacement, and cancellation endpoints.
+- Add conservative stream correlation and optional bridge-instance headers.
+- Introduce priority scheduling, in-flight reuse, adaptive runway, and bounded
+  canonical PCM caching.
+- Add semantic pause policy and prefix-silence response metadata.
+- Add limits, TTLs, diagnostics, and privacy safeguards.
+
+The R2 PR can land without the other two because it is dormant without a
+listener. Thorium should feature-detect VoiceLink. VoiceLink can land its API
+before Thorium begins sending snapshots.
+
+## 17. Testing Strategy
+
+### 17.1 R2 Navigator tests
+
+- Maps headings, paragraphs, list items, blockquotes, captions, table cells,
+  preformatted content, EPUB semantics, ARIA roles, language, and direction.
+- Produces correct sentence order and `indexInBlock` flags.
+- Derives boundaries correctly across sentences, blocks, and headings.
+- Emits bounded current-plus-future snapshots.
+- Emits synchronously before the matching `speak()` call and increments revision
+  monotonically within a generation.
+- Increments generation for seek, voice/rate change, and queue rebuild.
+- Emits cancellation on stop/close and uses a new stream ID on restart.
+- Produces identical before/after values for every adjacent-unit boundary and
+  applies the normative boundary precedence.
+- Performs no extra work or behavior change without a listener.
+
+### 17.2 Thorium tests
+
+- Enables forwarding only after compatible capability discovery.
+- Adds an exact `synthesisHint` only when token/rate mapping is guaranteed;
+  otherwise omits it.
+- Tail-truncates to negotiated limits without removing the current unit.
+- Omits the snapshot when the current unit alone exceeds a limit.
+- Uses the Electron main process and only allowed loopback origins.
+- Coalesces or drops obsolete snapshots without blocking playback.
+- Applies timeout and retry backoff when VoiceLink is unavailable.
+- Sends cancellation on teardown when possible.
+- Leaves ordinary TTS unchanged on all adapter failures.
+
+### 17.3 VoiceLink unit and integration tests
+
+- Accepts valid bounded snapshots and rejects malformed, stale, or oversized
+  input.
+- An identical revision is idempotent; lower/out-of-order revisions and
+  same-revision conflicts receive the normative responses.
+- A 429 leaves prior state unchanged, and a later newer revision is accepted
+  after client backoff.
+- Higher generations cancel stale queued work and cannot return stale audio.
+- Both snapshot-first and request-first arrival can claim uniquely within the
+  observation TTL; zero and multiple matches do not claim.
+- Mutual uniqueness is arrival-order independent for simultaneous identical
+  readers.
+- Correlation normalization never permits reuse unless the exact synthesis key
+  also matches.
+- The first authoritative request freezes synthesis configuration; later config
+  mismatches suspend the binding.
+- Bound engine instances advance only on exact expected sequence and text.
+- Duplicate request IDs do not double-advance; concurrent different request IDs
+  suspend the binding.
+- A reserved authoritative lane remains available while speculative work runs,
+  and p95 first-byte latency stays within the 5% release gate.
+- An authoritative request reuses an identical in-flight or cached job.
+- Cache keys include every synthesis-affecting input and exclude structure.
+- Cache, queue, stream, and TTL limits are enforced.
+- Adaptive runway responds to measured RTF but respects hard caps.
+- Pause policy maps semantic boundaries and synthesizes correct prefix silence.
+- Miss wait time reduces prefix silence without producing a negative duration.
+- Audio-length headers distinguish prefix, speech, and total duration.
+- Logs contain no raw book text.
+- Old clients and bridge requests continue through the existing path.
+
+### 17.4 End-to-end tests
+
+- Read a long chapter with no skipped, duplicated, or reordered sentence.
+- Confirm future synthesis overlaps current playback and later requests hit the
+  cache under normal load.
+- Seek backward and forward while speculative work is active.
+- Change voice and rate during playback.
+- Pause and resume without unbounded prefetch growth.
+- Use identical sentences in two simultaneous readers and confirm ambiguity
+  disables optimization rather than cross-wiring streams.
+- Kill or restart VoiceLink and confirm Thorium continues with existing speech
+  behavior.
+- Compare sentence, paragraph, list-item, heading-to-body, and section pauses in
+  listening tests.
+- Exercise books with large chapters and resource-heavy layouts to confirm hard
+  resource limits.
+
+## 18. Observability and Acceptance Criteria
+
+Useful local metrics are:
+
+- look-ahead snapshots accepted, rejected, stale, and expired;
+- correlation outcomes by reason;
+- cache and in-flight reuse hit rates;
+- current-request first-byte latency;
+- synthesis RTF and available runway;
+- speculative jobs completed, canceled, and discarded;
+- prefix silence selected by boundary kind;
+- current and peak cache/queue sizes.
+
+The first release is successful when:
+
+1. Existing playback is behaviorally unchanged when look-ahead is disabled or
+   unavailable.
+2. With compatible components, the next sentence is normally synthesized before
+   the authoritative request arrives on supported hardware where average
+   synthesis RTF is below one.
+3. No test can produce skipped, duplicated, reordered, or cross-stream speech.
+4. Ambiguous correlation always falls back rather than guessing.
+5. Paragraph and heading boundaries are audibly distinguishable without adding
+   excessive delay after a cache miss.
+6. Memory, queued work, and retained text/audio remain within configured bounds.
+7. No persistent document identity or raw text is written to diagnostic logs.
+
+## 19. Rollout
+
+1. Land the dormant provider-neutral R2 event and tests.
+2. Land VoiceLink capability and look-ahead endpoints behind a disabled-by-
+   default experimental setting.
+3. Add bridge instance headers, scheduler/cache, and correlation tests.
+4. Add the Thorium adapter behind a feature flag and validate fallback paths.
+5. Measure first-byte latency, RTF, hit rate, memory, and listening quality on a
+   representative book set.
+6. Tune default window bounds and `ProsodyPolicy` from evidence.
+7. Enable by default only after compatibility and ambiguity tests pass across
+   supported Windows and Thorium versions.
+
+## 20. Alternatives Considered
+
+### Queue several Web Speech utterances
+
+Rejected as the primary solution. Chromium retains future utterances and does
+not expose their text to the active SAPI engine early enough for VoiceLink
+prefetch.
+
+### Send a multi-sentence utterance
+
+Rejected. It changes navigation, cancellation, highlighting, and boundary event
+semantics, and makes large synthesis latency worse before playback begins.
+
+### Add only `appendNextSentence`
+
+Rejected. An imperative append stream is fragile under duplicate/dropped
+messages, seeks, restarts, and changing window size. A versioned replacement
+snapshot is idempotent and self-healing.
+
+### Put VoiceLink HTTP calls directly in R2
+
+Rejected. R2 is a reusable provider-neutral navigator and should not depend on a
+specific local service or encounter renderer CORS/CSP concerns.
+
+### Pass structure as fixed pause milliseconds from R2
+
+Rejected. Document semantics are stable across engines; timing preferences and
+model behavior are not. VoiceLink owns the policy that converts semantics to
+audio treatment.
+
+### Require a stream ID inside SAPI text
+
+Rejected. Injecting control markers risks speaking them, altering synthesis,
+breaking normalization, or coupling generic Web Speech content to one provider.
+Conservative side-channel correlation preserves the existing contract.
+
+## 21. Open Implementation Decisions
+
+These decisions are intentionally deferred to implementation planning and
+measurement because they do not change the architecture:
+
+- final public names for R2 events and TypeScript types;
+- default PCM/cache budgets and TTLs other than the normative five-second
+  initial-correlation window;
+- concrete EWMA constants and runway safety margin;
+- default pause durations per semantic boundary;
+- feature-flag names and telemetry presentation.
+
+All such choices must preserve the invariant that an optimization miss or
+ambiguity produces the same authoritative speech behavior as the existing
+system.
