@@ -73,7 +73,10 @@ class SnapshotStore:
         previous: SnapshotRecord, snapshot: LookAheadSnapshot, digest: str
     ) -> ReplaceResult:
         old = previous.snapshot
-        if snapshot.generation < old.generation:
+        if (
+            snapshot.generation < old.generation
+            or snapshot.current_sequence < old.current_sequence
+        ):
             return ReplaceResult.STALE
         if snapshot.generation == old.generation:
             if snapshot.revision < old.revision:
@@ -84,8 +87,6 @@ class SnapshotStore:
                     if digest == previous.body_digest
                     else ReplaceResult.REVISION_CONFLICT
                 )
-            if snapshot.current_sequence < old.current_sequence:
-                return ReplaceResult.STALE
         return ReplaceResult.ACCEPTED
 
     def _exceeds_budget(self, stream_id: UUID, snapshot: LookAheadSnapshot) -> bool:

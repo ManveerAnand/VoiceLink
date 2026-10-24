@@ -1,8 +1,15 @@
 from copy import deepcopy
+import json
 from uuid import uuid4
 
 import pytest
-from httpx import AsyncClient
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
+
+from server.config import LookAheadSettings
+from server.lookahead.protocol import MAX_BODY_BYTES
+from server.lookahead.store import SnapshotStore
+from server.routers.lookahead import create_router
 
 
 def snapshot(*, generation: int = 3, revision: int = 18, current_sequence: int = 42) -> dict:
@@ -74,12 +81,16 @@ async def test_put_returns_duplicate_for_an_identical_replay(client: AsyncClient
 @pytest.mark.asyncio
 async def test_put_rejects_a_lower_revision_without_replacing_state(client: AsyncClient) -> None:
     stream_id = uuid4()
-    await client.put(f"/v1/tts/lookahead/{stream_id}", json=snapshot(revision=2))
+    accepted = snapshot(revision=2)
+    await client.put(f"/v1/tts/lookahead/{stream_id}", json=accepted)
 
     response = await client.put(f"/v1/tts/lookahead/{stream_id}", json=snapshot(revision=1))
+    replay = await client.put(f"/v1/tts/lookahead/{stream_id}", json=accepted)
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "stale"
+    assert replay.status_code == 200
+    assert replay.json()["status"] == "duplicate"
 
 
 @pytest.mark.asyncio
@@ -110,6 +121,23 @@ async def test_put_rejects_a_regressing_current_sequence(client: AsyncClient) ->
 
 
 @pytest.mark.asyncio
+async def test_put_rejects_a_higher_generation_with_a_regressing_current_sequence(
+    client: AsyncClient,
+) -> None:
+    stream_id = uuid4()
+    await client.put(
+        f"/v1/tts/lookahead/{stream_id}", json=snapshot(generation=3, revision=2, current_sequence=2)
+    )
+
+    response = await client.put(
+        f"/v1/tts/lookahead/{stream_id}", json=snapshot(generation=4, revision=0, current_sequence=1)
+    )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "stale"
+
+
+@pytest.mark.asyncio
 async def test_put_rejects_an_oversized_unit_before_replacing_state(client: AsyncClient) -> None:
     body = snapshot()
     body["units"][0]["text"] = "x" * 4_001
@@ -118,6 +146,88 @@ async def test_put_rejects_an_oversized_unit_before_replacing_state(client: Asyn
 
     assert response.status_code == 413
     assert response.json()["error"]["code"] == "over-limit"
+
+
+@pytest.mark.asyncio
+async def test_put_accepts_protocol_unit_and_total_character_boundaries(client: AsyncClient) -> None:
+    unit_boundary = snapshot()
+    unit_boundary["units"] = [deepcopy(unit_boundary["units"][0]) for _ in range(12)]
+    for sequence, unit in enumerate(unit_boundary["units"], start=42):
+        unit["sequence"] = sequence
+
+    total_boundary = snapshot()
+    total_boundary["units"] = [deepcopy(total_boundary["units"][0]) for _ in range(3)]
+    for sequence, unit in enumerate(total_boundary["units"], start=42):
+        unit["sequence"] = sequence
+        unit["text"] = "x" * 4_000
+
+    units_response = await client.put(f"/v1/tts/lookahead/{uuid4()}", json=unit_boundary)
+    total_response = await client.put(f"/v1/tts/lookahead/{uuid4()}", json=total_boundary)
+
+    assert units_response.status_code == 202
+    assert total_response.status_code == 202
+
+
+@pytest.mark.asyncio
+async def test_put_rejects_unit_count_and_total_character_limit_excesses(client: AsyncClient) -> None:
+    too_many_units = snapshot()
+    too_many_units["units"] = [deepcopy(too_many_units["units"][0]) for _ in range(13)]
+    for sequence, unit in enumerate(too_many_units["units"], start=42):
+        unit["sequence"] = sequence
+
+    too_many_characters = snapshot()
+    too_many_characters["units"] = [deepcopy(too_many_characters["units"][0]) for _ in range(4)]
+    for sequence, unit in enumerate(too_many_characters["units"], start=42):
+        unit["sequence"] = sequence
+        unit["text"] = "x" * (4_000 if sequence < 45 else 1)
+
+    units_response = await client.put(f"/v1/tts/lookahead/{uuid4()}", json=too_many_units)
+    total_response = await client.put(f"/v1/tts/lookahead/{uuid4()}", json=too_many_characters)
+
+    assert units_response.status_code == 413
+    assert units_response.json()["error"]["code"] == "over-limit"
+    assert total_response.status_code == 413
+    assert total_response.json()["error"]["code"] == "over-limit"
+
+
+@pytest.mark.asyncio
+async def test_put_enforces_the_body_byte_boundary_before_json_parsing(client: AsyncClient) -> None:
+    body = json.dumps(snapshot()).encode()
+    at_limit = body + (b" " * (MAX_BODY_BYTES - len(body)))
+    over_limit = at_limit + b" "
+
+    accepted = await client.put(
+        f"/v1/tts/lookahead/{uuid4()}", content=at_limit, headers={"content-type": "application/json"}
+    )
+    rejected = await client.put(
+        f"/v1/tts/lookahead/{uuid4()}", content=over_limit, headers={"content-type": "application/json"}
+    )
+
+    assert accepted.status_code == 202
+    assert rejected.status_code == 413
+    assert rejected.json()["error"]["code"] == "over-limit"
+
+
+@pytest.mark.asyncio
+async def test_put_treats_byte_different_equivalent_json_as_a_revision_conflict(
+    client: AsyncClient,
+) -> None:
+    stream_id = uuid4()
+    body = snapshot()
+    first = json.dumps(body, separators=(",", ":")).encode()
+    replay_with_different_bytes = json.dumps(body, indent=2).encode()
+
+    accepted = await client.put(
+        f"/v1/tts/lookahead/{stream_id}", content=first, headers={"content-type": "application/json"}
+    )
+    conflict = await client.put(
+        f"/v1/tts/lookahead/{stream_id}", content=replay_with_different_bytes,
+        headers={"content-type": "application/json"},
+    )
+
+    assert accepted.status_code == 202
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "revision-conflict"
 
 
 @pytest.mark.asyncio
@@ -169,3 +279,41 @@ async def test_put_rejects_null_optionals_and_non_consecutive_sequences(client: 
     assert null_response.json()["error"]["code"] == "invalid"
     assert sequence_response.status_code == 400
     assert sequence_response.json()["error"]["code"] == "invalid"
+
+
+@pytest.mark.asyncio
+async def test_put_rejects_unknown_enum_values(client: AsyncClient) -> None:
+    body = snapshot()
+    body["units"][0]["direction"] = "sideways"
+
+    response = await client.put(f"/v1/tts/lookahead/{uuid4()}", json=body)
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("enabled", "ready"),
+    [(False, True), (True, False)],
+)
+async def test_capabilities_omit_lookahead_until_enabled_and_worker_ready(
+    enabled: bool, ready: bool
+) -> None:
+    app = FastAPI()
+    app.include_router(
+        create_router(
+            settings=LookAheadSettings(enabled=enabled),
+            store=SnapshotStore(),
+            worker_ready=lambda: ready,
+        )
+    )
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as capability_client:
+        response = await capability_client.get("/v1/capabilities")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "structuredPauses": True,
+        "bridgeProtocolRequiredForPauses": 2,
+    }
