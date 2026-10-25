@@ -6,10 +6,12 @@ import logging
 import re
 import unicodedata
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from hashlib import sha256
 from threading import RLock
+from time import monotonic
 from uuid import UUID
 
 from server.lookahead.cache import SynthesisConfig, synthesis_input_digest
@@ -113,11 +115,13 @@ class CorrelationRegistry:
         binding_ttl_seconds: float = 30.0,
         retry_ttl_seconds: float = 30.0,
         max_retry_records: int = 256,
+        clock: Callable[[], float] = monotonic,
     ) -> None:
         self._correlation_ttl = correlation_ttl_seconds
         self._binding_ttl = binding_ttl_seconds
         self._retry_ttl = retry_ttl_seconds
         self._max_retry_records = max_retry_records
+        self._clock = clock
         self._snapshots: dict[UUID, SnapshotRecord] = {}
         self._requests: dict[UUID, AuthoritativeObservation] = {}
         self._retry_records: OrderedDict[UUID, _RetryRecord] = OrderedDict()
@@ -293,7 +297,7 @@ class CorrelationRegistry:
             )
             return [self._decision(outcome, outcome.value)]
 
-    def complete_request(self, request_id: UUID, *, now: float) -> None:
+    def complete_request(self, request_id: UUID, *, now: float | None = None) -> None:
         with self._lock:
             engine = self._in_flight_engine_by_request.pop(request_id, None)
             if engine is None:
@@ -307,7 +311,8 @@ class CorrelationRegistry:
             retry_record = self._retry_records.get(request_id)
             if retry_record is not None:
                 retry_record.completed = True
-                retry_record.last_seen_at = max(retry_record.last_seen_at, now)
+                completed_at = self._clock() if now is None else now
+                retry_record.last_seen_at = max(retry_record.last_seen_at, completed_at)
             self._trim_retry_records()
 
     def suspend_engine(

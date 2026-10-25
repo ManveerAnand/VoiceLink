@@ -689,8 +689,8 @@ def test_engine_release_drops_active_retry_records_under_cap_pressure() -> None:
     assert not registry._in_flight_engine_by_request  # type: ignore[attr-defined]
 
 
-def test_long_request_retry_ttl_starts_at_explicit_completion_time() -> None:
-    registry = CorrelationRegistry(retry_ttl_seconds=5.0)
+def test_long_request_retry_ttl_starts_at_internal_completion_clock() -> None:
+    registry = CorrelationRegistry(retry_ttl_seconds=5.0, clock=lambda: 100.0)
     stream_id = uuid4()
     engine = uuid4()
     registry.observe_snapshot(
@@ -701,7 +701,7 @@ def test_long_request_retry_ttl_starts_at_explicit_completion_time() -> None:
     assert_bound(registry.observe_request(first), stream_id)
     assert first.request_id is not None
 
-    registry.complete_request(first.request_id, now=100.0)
+    registry.complete_request(first.request_id)
     retry = registry.observe_request(
         observation(
             "Repeated.",
