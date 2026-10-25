@@ -47,6 +47,14 @@ def test_prefix_silence_uses_only_the_residual_after_request_wait() -> None:
     assert len(silence) == 180 * 2 * 2
     assert silence == b"\x00" * len(silence)
 
+    residual = prefix_silence_pcm(
+        BoundaryKind.PARAGRAPH,
+        request_wait_ms=30,
+        audio_format=audio_format,
+    )
+    assert len(residual) == 150 * 2 * 2
+    assert residual == b"\x00" * len(residual)
+
     # Wait longer than the desired gap: no negative duration and no bytes.
     assert (
         prefix_silence_pcm(
@@ -80,6 +88,20 @@ def test_prefix_silence_rounds_frames_and_remains_frame_aligned() -> None:
     assert len(rounded) == 2 * audio_format.channels * 2
     assert len(rounded) % (audio_format.channels * 2) == 0
     assert rounded == b"\x00" * len(rounded)
+
+
+def test_prefix_silence_uses_sample_rate_when_rounding_frame_count() -> None:
+    audio_format = AudioFormat(sample_rate=16_000, channels=1)
+
+    # 80 ms at 16 kHz is 1,280 frames, not 80 frames.
+    silence = prefix_silence_pcm(
+        BoundaryKind.SENTENCE,
+        request_wait_ms=0,
+        audio_format=audio_format,
+    )
+
+    assert len(silence) == round(80 * 16_000 / 1_000) * 1 * 2
+    assert silence == b"\x00" * len(silence)
 
 
 def test_stream_start_has_no_leading_document_silence_and_speech_bytes_stay_canonical() -> (
