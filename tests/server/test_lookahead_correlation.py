@@ -151,6 +151,25 @@ def test_five_second_eligibility_boundary_is_exact(
     assert decision.outcome is expected
 
 
+def test_claimed_authoritative_text_is_removed_after_candidate_ttl() -> None:
+    registry = CorrelationRegistry(correlation_ttl_seconds=5.0)
+    stream_id = uuid4()
+    request = observation("Private\u2003phrase", arrived_at=10.0)
+    registry.observe_snapshot(
+        stream_id, snapshot_record("Private phrase", accepted_at=10.0)
+    )
+    assert_bound(registry.observe_request(request), stream_id)
+
+    registry.expire(15.000001)
+
+    assert request.request_id not in registry._requests  # type: ignore[attr-defined]
+    assert all(
+        not hasattr(binding, "claim_observation")
+        for binding in registry._bindings_by_engine.values()  # type: ignore[attr-defined]
+    )
+    assert "Private\u2003phrase" not in repr(vars(registry))
+
+
 def test_absent_hint_is_neutral_and_exact_hint_matches_actual_config() -> None:
     hint = {
         "route": "kokoro",
@@ -406,6 +425,30 @@ def test_concurrent_different_request_ids_on_one_engine_suspend() -> None:
     assert registry.bound_stream_ids() == ()
 
 
+def test_candidate_expiry_does_not_clear_authoritative_in_flight_occupancy() -> None:
+    registry = CorrelationRegistry(correlation_ttl_seconds=5.0)
+    engine = uuid4()
+    first = observation("No snapshot.", arrived_at=10.0, engine_instance=engine)
+    assert registry.observe_request(first).outcome is CorrelationOutcome.UNCLAIMED
+
+    registry.expire(15.000001)
+    second = registry.observe_request(
+        observation("Still running.", arrived_at=16.0, engine_instance=engine)
+    )
+
+    assert second.outcome is CorrelationOutcome.SUSPENDED
+    assert second.reason == "concurrent-request"
+    assert first.request_id is not None
+    registry.complete_request(first.request_id)
+
+    third = registry.observe_request(
+        observation("Second still running.", arrived_at=17.0, engine_instance=engine)
+    )
+
+    assert third.outcome is CorrelationOutcome.SUSPENDED
+    assert third.reason == "concurrent-request"
+
+
 def test_higher_generation_can_uniquely_rebind_after_suspension() -> None:
     registry = CorrelationRegistry()
     stream_id = uuid4()
@@ -429,6 +472,52 @@ def test_higher_generation_can_uniquely_rebind_after_suspension() -> None:
         for decision in generation_decisions
     )
     assert_bound(rebound, stream_id, sequence=40)
+    assert rebound.claim is not None and rebound.claim.generation == 2
+
+
+def test_config_mismatch_requires_a_higher_generation_to_rebind() -> None:
+    registry = CorrelationRegistry()
+    stream_id = uuid4()
+    engine = uuid4()
+    registry.observe_snapshot(stream_id, snapshot_record("First.", "Second."))
+    first = observation("First.", engine_instance=engine)
+    assert_bound(registry.observe_request(first), stream_id)
+    assert first.request_id is not None
+    registry.complete_request(first.request_id)
+
+    mismatch = observation(
+        "Second.",
+        arrived_at=101.0,
+        engine_instance=engine,
+        synthesis_config=config(speed=1.25),
+    )
+    assert registry.observe_request(mismatch).reason == "config-mismatch"
+    assert mismatch.request_id is not None
+    registry.complete_request(mismatch.request_id)
+
+    same_generation = registry.observe_snapshot(
+        stream_id,
+        snapshot_record(
+            "Second.", generation=1, current_sequence=11, accepted_at=101.1
+        ),
+    )
+    assert not any(
+        decision.outcome is CorrelationOutcome.BOUND for decision in same_generation
+    )
+    assert registry.bound_stream_ids() == ()
+
+    registry.expire(106.1)
+    registry.observe_snapshot(
+        stream_id,
+        snapshot_record(
+            "Second.", generation=2, current_sequence=11, accepted_at=106.1
+        ),
+    )
+    rebound = registry.observe_request(
+        observation("Second.", arrived_at=106.1, engine_instance=engine)
+    )
+
+    assert_bound(rebound, stream_id, sequence=11)
     assert rebound.claim is not None and rebound.claim.generation == 2
 
 
@@ -479,6 +568,35 @@ def test_delete_and_ttl_release_bindings() -> None:
         if decision.claim
     )
     assert registry.bound_stream_ids() == ()
+
+
+@pytest.mark.parametrize("release_kind", ["delete", "ttl"])
+def test_released_binding_retry_never_returns_a_claim(release_kind: str) -> None:
+    registry = CorrelationRegistry(binding_ttl_seconds=30.0)
+    stream_id = uuid4()
+    engine = uuid4()
+    registry.observe_snapshot(stream_id, snapshot_record("Release.", accepted_at=100.0))
+    request = observation("Release.", arrived_at=100.0, engine_instance=engine)
+    assert_bound(registry.observe_request(request), stream_id)
+    assert request.request_id is not None
+
+    retry_at = 101.0
+    if release_kind == "delete":
+        registry.release_stream(stream_id)
+    else:
+        registry.expire(130.000001)
+        retry_at = 131.0
+    retry = registry.observe_request(
+        observation(
+            "Release.",
+            arrived_at=retry_at,
+            request_id=request.request_id,
+            engine_instance=engine,
+        )
+    )
+
+    assert retry.outcome is CorrelationOutcome.RETRY
+    assert retry.claim is None
 
 
 @pytest.mark.parametrize(

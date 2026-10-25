@@ -76,7 +76,21 @@ class _Binding:
     config: SynthesisConfig
     record: SnapshotRecord
     claim_request_id: UUID
-    claim_observation: AuthoritativeObservation
+    claim_arrived_at: float
+    claim_correlation_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class _RequestFingerprint:
+    engine_instance: UUID
+    bridge_protocol: int
+    synthesis_digest: str
+
+
+@dataclass(slots=True)
+class _GenerationSuspension:
+    generation: int
+    last_seen_at: float
 
 
 class CorrelationRegistry:
@@ -92,13 +106,15 @@ class CorrelationRegistry:
         self._binding_ttl = binding_ttl_seconds
         self._snapshots: dict[UUID, SnapshotRecord] = {}
         self._requests: dict[UUID, AuthoritativeObservation] = {}
+        self._request_fingerprints: dict[UUID, _RequestFingerprint] = {}
         self._request_decisions: dict[UUID, CorrelationDecision] = {}
         self._claimed_requests: set[UUID] = set()
         self._blocked_requests: set[UUID] = set()
         self._blocked_streams: set[UUID] = set()
+        self._suspended_generations: dict[UUID, _GenerationSuspension] = {}
         self._bindings_by_engine: dict[UUID, _Binding] = {}
         self._engine_by_stream: dict[UUID, UUID] = {}
-        self._in_flight_by_engine: dict[UUID, UUID] = {}
+        self._in_flight_by_engine: dict[UUID, set[UUID]] = {}
         self._lock = RLock()
 
     def observe_request(
@@ -122,7 +138,7 @@ class CorrelationRegistry:
             prior = self._request_decisions.get(request_id)
             if prior is not None:
                 if not self._same_authoritative_call(
-                    self._requests.get(request_id), observation
+                    self._request_fingerprints.get(request_id), observation
                 ):
                     return self._suspend_for_request(observation, "request-id-conflict")
                 retry = self._decision(
@@ -134,14 +150,17 @@ class CorrelationRegistry:
                 self._request_decisions[request_id] = retry
                 return retry
 
-            in_flight = self._in_flight_by_engine.get(engine)
-            if in_flight is not None and in_flight != request_id:
+            self._request_fingerprints[request_id] = self._fingerprint(observation)
+
+            in_flight = self._in_flight_by_engine.setdefault(engine, set())
+            if in_flight:
+                in_flight.add(request_id)
                 self._requests[request_id] = observation
                 decision = self._suspend_for_request(observation, "concurrent-request")
                 self._request_decisions[request_id] = decision
                 return decision
 
-            self._in_flight_by_engine[engine] = request_id
+            in_flight.add(request_id)
             self._requests[request_id] = observation
 
             competing_bindings = [
@@ -190,6 +209,21 @@ class CorrelationRegistry:
         with self._lock:
             self._prune_candidates(record.accepted_at)
             decisions: list[CorrelationDecision] = []
+            suspension = self._suspended_generations.get(stream_id)
+            if suspension is not None:
+                if record.snapshot.generation > suspension.generation:
+                    self._suspended_generations.pop(stream_id, None)
+                else:
+                    suspension.last_seen_at = max(
+                        suspension.last_seen_at, record.accepted_at
+                    )
+                    self._snapshots[stream_id] = record
+                    return [
+                        self._decision(
+                            CorrelationOutcome.SUSPENDED,
+                            "generation-suspended",
+                        )
+                    ]
             engine = self._engine_by_stream.get(stream_id)
             if engine is not None:
                 binding = self._bindings_by_engine[engine]
@@ -216,9 +250,7 @@ class CorrelationRegistry:
             for bound_engine, binding in tuple(self._bindings_by_engine.items()):
                 if binding.stream_id == stream_id:
                     continue
-                if self._eligible_pair(
-                    stream_id, record, binding.claim_observation, ignore_bound=True
-                ):
+                if self._snapshot_competes_with_binding(stream_id, record, binding):
                     self._blocked_streams.update((stream_id, binding.stream_id))
                     decisions.append(self._suspend_engine(bound_engine, "ambiguous"))
                     decisions.append(
@@ -238,11 +270,15 @@ class CorrelationRegistry:
 
     def complete_request(self, request_id: UUID) -> None:
         with self._lock:
-            observation = self._requests.get(request_id)
-            if observation is None or observation.engine_instance is None:
+            fingerprint = self._request_fingerprints.get(request_id)
+            if fingerprint is None:
                 return
-            if self._in_flight_by_engine.get(observation.engine_instance) == request_id:
-                self._in_flight_by_engine.pop(observation.engine_instance, None)
+            in_flight = self._in_flight_by_engine.get(fingerprint.engine_instance)
+            if in_flight is None:
+                return
+            in_flight.discard(request_id)
+            if not in_flight:
+                self._in_flight_by_engine.pop(fingerprint.engine_instance, None)
 
     def suspend_engine(
         self, engine_instance: UUID, reason: str = "suspended"
@@ -256,6 +292,7 @@ class CorrelationRegistry:
         with self._lock:
             self._snapshots.pop(stream_id, None)
             self._blocked_streams.discard(stream_id)
+            self._suspended_generations.pop(stream_id, None)
             engine = self._engine_by_stream.get(stream_id)
             if engine is None:
                 return None
@@ -300,6 +337,11 @@ class CorrelationRegistry:
                 )
                 self._log(decision)
                 expired.append(decision)
+            for stream_id, suspension in tuple(self._suspended_generations.items()):
+                if now - suspension.last_seen_at <= self._binding_ttl:
+                    continue
+                self._suspended_generations.pop(stream_id, None)
+                self._snapshots.pop(stream_id, None)
             return expired
 
     def bound_stream_ids(self) -> tuple[UUID, ...]:
@@ -361,6 +403,7 @@ class CorrelationRegistry:
             for stream_id, record in self._snapshots.items()
             if stream_id not in self._engine_by_stream
             and stream_id not in self._blocked_streams
+            and not self._generation_is_suspended(stream_id, record)
         }
         requests = {
             request_id: observation
@@ -408,7 +451,8 @@ class CorrelationRegistry:
                 config=observation.config,
                 record=record,
                 claim_request_id=request_id,
-                claim_observation=observation,
+                claim_arrived_at=observation.arrived_at,
+                claim_correlation_digest=correlation_text_digest(observation.text),
             )
             self._bindings_by_engine[engine] = binding
             self._engine_by_stream[stream_id] = engine
@@ -456,6 +500,8 @@ class CorrelationRegistry:
     ) -> bool:
         if not self._is_protocol_two(observation):
             return False
+        if self._generation_is_suspended(stream_id, record):
+            return False
         if abs(record.accepted_at - observation.arrived_at) > self._correlation_ttl:
             return False
         if not ignore_bound:
@@ -490,8 +536,31 @@ class CorrelationRegistry:
                 observation,
                 ignore_bound=True,
             )
-            and abs(binding.claim_observation.arrived_at - observation.arrived_at)
+            and abs(binding.claim_arrived_at - observation.arrived_at)
             <= self._correlation_ttl
+        )
+
+    def _snapshot_competes_with_binding(
+        self,
+        stream_id: UUID,
+        record: SnapshotRecord,
+        binding: _Binding,
+    ) -> bool:
+        if self._generation_is_suspended(stream_id, record):
+            return False
+        if abs(record.accepted_at - binding.claim_arrived_at) > self._correlation_ttl:
+            return False
+        current = self._unit_at(record.snapshot, record.snapshot.current_sequence)
+        if current is None:
+            return False
+        if correlation_text_digest(current.text) != binding.claim_correlation_digest:
+            return False
+        hint = record.snapshot.synthesis_hint
+        return hint is None or (
+            hint.route == binding.config.route
+            and hint.voice == binding.config.voice
+            and hint.speed == binding.config.speed
+            and hint.format == binding.config.format
         )
 
     def _request_degree(
@@ -524,22 +593,36 @@ class CorrelationRegistry:
     ) -> CorrelationDecision:
         engine = observation.engine_instance
         request_id = observation.request_id
-        claim = None
         if engine is not None and engine in self._bindings_by_engine:
-            suspended = self._suspend_engine(engine, reason)
-            claim = suspended.claim
+            self._suspend_engine(
+                engine,
+                reason,
+                suspended_at=observation.arrived_at,
+            )
         decision = self._decision(
             CorrelationOutcome.SUSPENDED,
             reason,
             request_id=request_id,
-            claim=claim,
         )
         self._log(decision)
         return decision
 
-    def _suspend_engine(self, engine: UUID, reason: str) -> CorrelationDecision:
+    def _suspend_engine(
+        self,
+        engine: UUID,
+        reason: str,
+        *,
+        suspended_at: float | None = None,
+    ) -> CorrelationDecision:
         binding = self._remove_binding(engine)
         assert binding is not None
+        if reason == "config-mismatch":
+            self._suspended_generations[binding.stream_id] = _GenerationSuspension(
+                generation=binding.generation,
+                last_seen_at=(
+                    binding.record.accepted_at if suspended_at is None else suspended_at
+                ),
+            )
         claim = self._claim(binding, binding.next_expected_sequence - 1)
         decision = self._decision(
             CorrelationOutcome.SUSPENDED,
@@ -547,7 +630,11 @@ class CorrelationRegistry:
             request_id=binding.claim_request_id,
             claim=claim,
         )
-        self._request_decisions[binding.claim_request_id] = decision
+        self._request_decisions[binding.claim_request_id] = self._decision(
+            CorrelationOutcome.SUSPENDED,
+            reason,
+            request_id=binding.claim_request_id,
+        )
         self._log(decision)
         return decision
 
@@ -555,25 +642,19 @@ class CorrelationRegistry:
         binding = self._bindings_by_engine.pop(engine, None)
         if binding is not None:
             self._engine_by_stream.pop(binding.stream_id, None)
+            self._invalidate_retry_claims(binding.stream_id)
         return binding
 
     def _prune_candidates(self, now: float) -> None:
         expired_requests = {
             request_id
             for request_id, observation in self._requests.items()
-            if request_id not in self._claimed_requests
-            and now - observation.arrived_at > self._correlation_ttl
+            if now - observation.arrived_at > self._correlation_ttl
         }
         for request_id in expired_requests:
-            observation = self._requests.pop(request_id)
-            self._request_decisions.pop(request_id, None)
+            self._requests.pop(request_id)
+            self._claimed_requests.discard(request_id)
             self._blocked_requests.discard(request_id)
-            if (
-                observation.engine_instance is not None
-                and self._in_flight_by_engine.get(observation.engine_instance)
-                == request_id
-            ):
-                self._in_flight_by_engine.pop(observation.engine_instance, None)
         for stream_id, record in tuple(self._snapshots.items()):
             if stream_id in self._engine_by_stream:
                 continue
@@ -591,16 +672,48 @@ class CorrelationRegistry:
 
     @staticmethod
     def _same_authoritative_call(
-        previous: AuthoritativeObservation | None,
+        previous: _RequestFingerprint | None,
         retry: AuthoritativeObservation,
     ) -> bool:
         return previous is not None and (
-            previous.request_id == retry.request_id
-            and previous.engine_instance == retry.engine_instance
+            previous.engine_instance == retry.engine_instance
             and previous.bridge_protocol == retry.bridge_protocol
-            and previous.text == retry.text
-            and previous.config == retry.config
+            and previous.synthesis_digest
+            == synthesis_input_digest(retry.text, retry.config)
         )
+
+    @staticmethod
+    def _fingerprint(observation: AuthoritativeObservation) -> _RequestFingerprint:
+        assert observation.engine_instance is not None
+        return _RequestFingerprint(
+            engine_instance=observation.engine_instance,
+            bridge_protocol=observation.bridge_protocol,
+            synthesis_digest=synthesis_input_digest(
+                observation.text,
+                observation.config,
+            ),
+        )
+
+    def _generation_is_suspended(
+        self,
+        stream_id: UUID,
+        record: SnapshotRecord,
+    ) -> bool:
+        suspension = self._suspended_generations.get(stream_id)
+        return (
+            suspension is not None
+            and record.snapshot.generation <= suspension.generation
+        )
+
+    def _invalidate_retry_claims(self, stream_id: UUID) -> None:
+        for request_id, decision in tuple(self._request_decisions.items()):
+            if decision.claim is None or decision.claim.stream_id != stream_id:
+                continue
+            self._request_decisions[request_id] = self._decision(
+                decision.outcome,
+                decision.reason,
+                request_id=request_id,
+            )
 
     @staticmethod
     def _unit_at(snapshot: LookAheadSnapshot, sequence: int) -> LookAheadUnit | None:
