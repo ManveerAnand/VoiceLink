@@ -32,8 +32,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from loguru import logger
 
+from server.lookahead.service import AudioEnvelope, LookAheadService
+
 
 # ---- Request / Response Models ----
+
 
 class TTSRequest(BaseModel):
     """
@@ -86,12 +89,12 @@ class VoiceResponse(BaseModel):
 class HealthResponse(BaseModel):
     """Response body for GET /v1/health."""
 
-    status: str               # "ok" or "error"
-    model: str | None         # Currently loaded model name
-    model_loaded: bool        # Is the model ready?
-    gpu_available: bool       # Is CUDA available?
-    gpu_name: str | None      # GPU device name
-    uptime_seconds: float     # Seconds since server started
+    status: str  # "ok" or "error"
+    model: str | None  # Currently loaded model name
+    model_loaded: bool  # Is the model ready?
+    gpu_available: bool  # Is CUDA available?
+    gpu_name: str | None  # GPU device name
+    uptime_seconds: float  # Seconds since server started
 
 
 # ---- Router ----
@@ -101,12 +104,19 @@ router = APIRouter(prefix="/v1", tags=["TTS"])
 # These get set by main.py on startup
 _model = None
 _start_time: float = 0.0
+_lookahead_service: LookAheadService | None = None
 
 
 def set_model(model):
     """Called by main.py to inject the loaded model."""
     global _model
     _model = model
+
+
+def set_lookahead_service(service: LookAheadService | None) -> None:
+    """Inject the optional composition service without changing the TTS contract."""
+    global _lookahead_service
+    _lookahead_service = service
 
 
 def set_start_time(t: float):
@@ -117,13 +127,14 @@ def set_start_time(t: float):
 
 # ---- Endpoints ----
 
+
 @router.post(
     "/tts",
     summary="Synthesize text to speech",
     description="Returns streaming PCM audio (24kHz, 16-bit, mono).",
     response_class=StreamingResponse,
 )
-async def synthesize(request: TTSRequest):
+async def synthesize(http_request: Request, request: TTSRequest):
     """
     Convert text to speech audio.
 
@@ -151,7 +162,21 @@ async def synthesize(request: TTSRequest):
         f"text_len={len(request.text)}"
     )
 
-    t0 = time.perf_counter()
+    service = _lookahead_service
+    context = None
+    service_clock = None
+    if service is not None:
+        try:
+            service_clock = service.now
+            t0 = service_clock()
+            context = service.begin_authoritative(http_request.headers, request, t0)
+        except Exception:
+            logger.error("Look-ahead begin failed; using legacy synthesis")
+            context = None
+            service_clock = None
+            t0 = time.perf_counter()
+    else:
+        t0 = time.perf_counter()
 
     def _run_synthesis() -> list[bytes]:
         """Run blocking synthesis in a thread so the event loop stays responsive."""
@@ -164,25 +189,60 @@ async def synthesize(request: TTSRequest):
             result.append(chunk)
         return result
 
+    synthesis_error: Exception | None = None
+    cached_speech = getattr(context, "cached_speech", None)
     try:
-        chunks = await asyncio.to_thread(_run_synthesis)
-    except Exception as e:
-        logger.exception(f"Synthesis error: {e}")
-        raise HTTPException(status_code=500, detail=f"Synthesis failed: {e}")
+        chunks = (
+            [cached_speech]
+            if cached_speech is not None
+            else await asyncio.to_thread(_run_synthesis)
+        )
+    except Exception as error:
+        chunks = []
+        synthesis_error = error
 
-    total_bytes = sum(len(c) for c in chunks)
-    elapsed = time.perf_counter() - t0
-    audio_seconds = total_bytes / (24000 * 2)  # 24kHz * 2 bytes/sample
+    try:
+        finished_at = (
+            service_clock() if service_clock is not None else time.perf_counter()
+        )
+    except Exception:
+        logger.error("Look-ahead clock failed; using legacy timing")
+        finished_at = time.perf_counter()
+    elapsed = max(0.0, finished_at - t0)
+    speech_pcm = b"".join(chunks)
+    envelope = AudioEnvelope(b"", speech_pcm)
+    if context is not None and service is not None:
+        try:
+            envelope = service.finish_authoritative(
+                context,
+                None if synthesis_error is not None else speech_pcm,
+                elapsed,
+                finished_at,
+            )
+        except Exception:
+            logger.error("Look-ahead finish failed; using legacy synthesis")
+            envelope = AudioEnvelope(b"", speech_pcm)
+
+    if synthesis_error is not None:
+        logger.error("Synthesis failed")
+        raise HTTPException(
+            status_code=500, detail=f"Synthesis failed: {synthesis_error}"
+        )
+
+    total_bytes = len(envelope.body)
+    audio_seconds = len(envelope.speech_pcm) / (24000 * 2)  # 24kHz * 2 bytes/sample
+    realtime = audio_seconds / elapsed if elapsed > 0 else float("inf")
     logger.info(
         f"TTS complete: {audio_seconds:.1f}s audio in {elapsed:.2f}s "
-        f"({audio_seconds / elapsed:.1f}x realtime), "
+        f"({realtime:.1f}x realtime), "
         f"{total_bytes:,} bytes"
     )
 
     def stream_chunks() -> Generator[bytes, None, None]:
         """Yield pre-generated PCM chunks."""
-        for chunk in chunks:
-            yield chunk
+        if envelope.prefix_pcm:
+            yield envelope.prefix_pcm
+        yield envelope.speech_pcm
 
     # Return streaming response with audio length header for precise
     # word-boundary event timing in the COM DLL.
@@ -197,6 +257,7 @@ async def synthesize(request: TTSRequest):
             # Exact total audio byte count — used by the DLL for
             # proportional SPEI_WORD_BOUNDARY event offsets.
             "X-Audio-Length": str(total_bytes),
+            **envelope.headers,
         },
     )
 

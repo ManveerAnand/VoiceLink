@@ -21,13 +21,16 @@ from server.lookahead.protocol import (
     LookAheadSnapshot,
 )
 from server.lookahead.store import ReplaceResult, SnapshotStore
+from server.lookahead.service import LookAheadService
 
 
 logger = logging.getLogger(__name__)
 
 
 def _error(status_code: int, code: str, message: str) -> JSONResponse:
-    return JSONResponse(status_code=status_code, content={"error": {"code": code, "message": message}})
+    return JSONResponse(
+        status_code=status_code, content={"error": {"code": code, "message": message}}
+    )
 
 
 def _parse_stream_id(value: str) -> UUID | None:
@@ -44,6 +47,7 @@ def create_router(
     store: SnapshotStore,
     worker_ready: Callable[[], bool] = lambda: False,
     on_cancel_stream: Callable[[UUID], None] | None = None,
+    service: LookAheadService | None = None,
 ) -> APIRouter:
     """Create an injectable router so protocol tests never load a TTS model."""
     store.configure_budgets(
@@ -79,7 +83,9 @@ def create_router(
 
         raw_body = await request.body()
         if len(raw_body) > MAX_BODY_BYTES:
-            return _error(413, "over-limit", "request body exceeds the protocol byte limit")
+            return _error(
+                413, "over-limit", "request body exceeds the protocol byte limit"
+            )
         try:
             payload = json.loads(raw_body)
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -87,8 +93,14 @@ def create_router(
         if not isinstance(payload, dict):
             return _error(400, "invalid", "request body must be a JSON object")
         protocol = payload.get("protocol")
-        if isinstance(protocol, int) and not isinstance(protocol, bool) and protocol != PROTOCOL:
-            return _error(426, "unsupported-protocol", f"protocol {protocol} is not supported")
+        if (
+            isinstance(protocol, int)
+            and not isinstance(protocol, bool)
+            and protocol != PROTOCOL
+        ):
+            return _error(
+                426, "unsupported-protocol", f"protocol {protocol} is not supported"
+            )
         try:
             snapshot = LookAheadSnapshot.model_validate(payload)
         except ValidationError:
@@ -99,22 +111,49 @@ def create_router(
 
         # The digest is intentionally of the original bytes, not a normalized model.
         snapshot._body_digest = sha256(raw_body).hexdigest()
-        result = store.replace(parsed_stream_id, snapshot, len(raw_body), time.monotonic())
+        accepted_at = time.monotonic()
+        if service is not None:
+            try:
+                accepted_at = service.now()
+            except Exception:
+                logger.error(
+                    "look-ahead clock failed; snapshot will remain an optional optimization"
+                )
+        result = store.replace(parsed_stream_id, snapshot, len(raw_body), accepted_at)
         if result is ReplaceResult.ACCEPTED:
+            if service is not None:
+                record = store.get(parsed_stream_id)
+                if record is not None:
+                    try:
+                        service.observe_snapshot(parsed_stream_id, record)
+                    except Exception:
+                        logger.error(
+                            "look-ahead snapshot integration failed; authoritative TTS is unchanged"
+                        )
             return JSONResponse(
                 status_code=202,
-                content={"status": "accepted", "generation": snapshot.generation, "revision": snapshot.revision},
+                content={
+                    "status": "accepted",
+                    "generation": snapshot.generation,
+                    "revision": snapshot.revision,
+                },
             )
         if result is ReplaceResult.DUPLICATE:
             return JSONResponse(
                 status_code=200,
-                content={"status": "duplicate", "generation": snapshot.generation, "revision": snapshot.revision},
+                content={
+                    "status": "duplicate",
+                    "generation": snapshot.generation,
+                    "revision": snapshot.revision,
+                },
             )
         if result is ReplaceResult.BUDGET_EXHAUSTED:
             return _error(429, "budget-exhausted", "look-ahead budget is exhausted")
         if result is ReplaceResult.STALE:
             return _error(409, "stale", "snapshot is older than the accepted snapshot")
-        return _error(409, "revision-conflict", "revision was already used with different content")
+        return _error(
+            409, "revision-conflict", "revision was already used with different content"
+        )
 
     @router.delete("/tts/lookahead/{stream_id}", status_code=204)
     async def cancel_snapshot(stream_id: str) -> Response:
@@ -122,6 +161,13 @@ def create_router(
         if parsed_stream_id is None:
             return _error(400, "invalid", "streamId must be a canonical lowercase UUID")
         store.cancel(parsed_stream_id)
+        if service is not None:
+            try:
+                service.cancel_stream(parsed_stream_id)
+            except Exception:
+                logger.error(
+                    "look-ahead service stream cancellation failed; DELETE remains idempotent"
+                )
         if on_cancel_stream is not None:
             try:
                 on_cancel_stream(parsed_stream_id)

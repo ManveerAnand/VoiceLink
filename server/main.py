@@ -54,11 +54,18 @@ from loguru import logger
 
 from server.config import settings
 from server.models import load_model
-from server.routers.tts import router as tts_router, set_model, set_start_time
+from server.routers.tts import (
+    router as tts_router,
+    set_lookahead_service,
+    set_model,
+    set_start_time,
+)
 from server.routers.qwen3 import router as qwen3_router
 from server.routers.lookahead import create_router
 from server.lookahead.cache import PcmCache
+from server.lookahead.correlation import CorrelationRegistry
 from server.lookahead.scheduler import LookAheadScheduler
+from server.lookahead.service import LookAheadService
 from server.lookahead.store import SnapshotStore
 from server.lookahead.worker import SpeculativeWorker
 
@@ -84,6 +91,18 @@ lookahead_scheduler = LookAheadScheduler(
     settings=settings.lookahead,
 )
 _lookahead_scheduler_holder["scheduler"] = lookahead_scheduler
+lookahead_registry = CorrelationRegistry(
+    correlation_ttl_seconds=settings.lookahead.correlation_ttl_seconds,
+    binding_ttl_seconds=settings.lookahead.stream_ttl_seconds,
+)
+lookahead_service = LookAheadService(
+    settings=settings.lookahead,
+    store=lookahead_store,
+    scheduler=lookahead_scheduler,
+    registry=lookahead_registry,
+    model_version="Kokoro",
+)
+set_lookahead_service(lookahead_service)
 
 
 def setup_logging():
@@ -209,7 +228,7 @@ app.include_router(
         settings=settings.lookahead,
         store=lookahead_store,
         worker_ready=lambda: lookahead_scheduler.ready,
-        on_cancel_stream=lookahead_scheduler.cancel_stream,
+        service=lookahead_service,
     )
 )
 
