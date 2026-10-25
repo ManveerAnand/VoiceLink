@@ -189,8 +189,10 @@ def test_runway_estimator_adapts_to_observed_real_time_factor() -> None:
 
 def test_new_generation_cancels_pending_work_and_late_result_uses_exact_key() -> None:
     worker = FakeWorker()
-    store = SnapshotStore(on_cancel_job=worker.cancel)
+    holder: dict[str, LookAheadScheduler] = {}
+    store = SnapshotStore(on_cancel_job=lambda association_id: holder["scheduler"].cancel(association_id))
     subject = scheduler(worker, store)
+    holder["scheduler"] = subject
     stream = uuid4()
     old = claim(stream, generation=1, count=2)
     snapshot = LookAheadSnapshot.model_validate({
@@ -208,6 +210,65 @@ def test_new_generation_cancels_pending_work_and_late_result_uses_exact_key() ->
     assert worker.cancelled == [job.id]
     assert subject.cache.get(job.cache_key, now=10) == b"pcm"
     assert store.result_key(stream, generation=1, sequence=job.sequence) is None
+
+
+def test_cached_only_runway_is_cleared_for_a_new_generation_and_stream_cancel() -> None:
+    worker = FakeWorker()
+    store = SnapshotStore()
+    subject = scheduler(worker, store)
+    stream = uuid4()
+    first = claim(stream, generation=1, count=4)
+    first_snapshot = LookAheadSnapshot.model_validate({
+        "protocol": 1, "generation": 1, "revision": 1, "currentSequence": 10,
+        "source": {"rate": 1, "voiceName": "Heart", "lang": "en-GB"},
+        "units": [unit.model_dump(by_alias=True, exclude_none=True) for unit in first.units],
+    })
+    store.replace(stream, first_snapshot, 1, now=0)
+    for unit in first.units[1:]:
+        subject.cache.put(synthesis_input_digest(unit.text, first.config), b"pcm", now=0)
+
+    subject.schedule_claim(first)
+    assert subject.scheduled_runway_seconds >= 3
+    second_snapshot = first_snapshot.model_copy(update={"generation": 2, "revision": 2})
+    store.replace(stream, second_snapshot, 2, now=1)
+    second = claim(stream, generation=2, count=4)
+    subject.schedule_claim(second)
+
+    assert store.result_key(stream, generation=2, sequence=11) is not None
+    subject.cancel_stream(stream)
+    assert subject.scheduled_runway_seconds == 0
+
+
+def test_invalidating_one_shared_waiter_keeps_the_other_shared_job_alive() -> None:
+    worker = FakeWorker()
+    holder: dict[str, LookAheadScheduler] = {}
+    store = SnapshotStore(on_cancel_job=lambda association_id: holder["scheduler"].cancel(association_id))
+    subject = scheduler(worker, store)
+    holder["scheduler"] = subject
+    first, second = uuid4(), uuid4()
+    first_claim, second_claim = claim(first, count=2), claim(second, count=2)
+    for stream, bound in ((first, first_claim), (second, second_claim)):
+        snapshot = LookAheadSnapshot.model_validate({
+            "protocol": 1, "generation": 1, "revision": 1, "currentSequence": 10,
+            "source": {"rate": 1, "voiceName": "Heart", "lang": "en-GB"},
+            "units": [unit.model_dump(by_alias=True, exclude_none=True) for unit in bound.units],
+        })
+        store.replace(stream, snapshot, 1, now=0)
+        subject.schedule_claim(bound)
+    job = worker.submitted[0]
+    first_replacement = LookAheadSnapshot.model_validate({
+        "protocol": 1, "generation": 2, "revision": 2, "currentSequence": 10,
+        "source": {"rate": 1, "voiceName": "Heart", "lang": "en-GB"},
+        "units": [unit.model_dump(by_alias=True, exclude_none=True) for unit in first_claim.units],
+    })
+
+    store.replace(first, first_replacement, 2, now=1)
+    subject.handle_result(SpeculativeResult(job.id, job.cache_key, b"pcm", 0.1, 1.0))
+
+    assert worker.cancelled == []
+    assert store.result_key(first, generation=1, sequence=11) is None
+    assert store.result_key(second, generation=1, sequence=11) == job.cache_key
+    assert subject.cache.get(job.cache_key, now=10) == b"pcm"
 
 
 def test_scheduler_has_no_capability_or_jobs_when_worker_is_not_ready() -> None:
