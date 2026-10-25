@@ -313,7 +313,7 @@ def test_bound_stream_advances_exactly_once_and_retry_does_not_double_advance() 
     first = observation("First.", engine_instance=engine)
     assert_bound(registry.observe_request(first), stream_id)
     assert first.request_id is not None
-    registry.complete_request(first.request_id)
+    registry.complete_request(first.request_id, now=100.0)
     second = observation("Second.", engine_instance=engine)
 
     advanced = registry.observe_request(second)
@@ -342,7 +342,7 @@ def test_competing_unclaimed_snapshot_suspends_instead_of_advancing() -> None:
     first = observation("First.", engine_instance=engine)
     assert_bound(registry.observe_request(first), bound_stream)
     assert first.request_id is not None
-    registry.complete_request(first.request_id)
+    registry.complete_request(first.request_id, now=100.0)
     registry.observe_snapshot(competing_stream, snapshot_record("Repeated."))
 
     decision = registry.observe_request(
@@ -362,7 +362,7 @@ def test_consecutive_identical_units_advance_by_expected_sequence() -> None:
     first = observation("Repeated.", engine_instance=engine)
     assert_bound(registry.observe_request(first), stream_id)
     assert first.request_id is not None
-    registry.complete_request(first.request_id)
+    registry.complete_request(first.request_id, now=100.0)
 
     decision = registry.observe_request(
         observation("Repeated.", engine_instance=engine)
@@ -390,7 +390,7 @@ def test_unexpected_text_config_or_sequence_suspends_binding(
     first = observation("First.", engine_instance=engine)
     assert_bound(registry.observe_request(first), stream_id)
     assert first.request_id is not None
-    registry.complete_request(first.request_id)
+    registry.complete_request(first.request_id, now=100.0)
     if record_current != 10:
         decisions = registry.observe_snapshot(
             stream_id,
@@ -440,7 +440,7 @@ def test_candidate_expiry_does_not_clear_authoritative_in_flight_occupancy() -> 
     assert second.outcome is CorrelationOutcome.SUSPENDED
     assert second.reason == "concurrent-request"
     assert first.request_id is not None
-    registry.complete_request(first.request_id)
+    registry.complete_request(first.request_id, now=16.0)
 
     third = registry.observe_request(
         observation("Second still running.", arrived_at=17.0, engine_instance=engine)
@@ -458,7 +458,7 @@ def test_higher_generation_can_uniquely_rebind_after_suspension() -> None:
     old = observation("Old.", engine_instance=engine)
     assert_bound(registry.observe_request(old), stream_id)
     assert old.request_id is not None
-    registry.complete_request(old.request_id)
+    registry.complete_request(old.request_id, now=100.0)
 
     generation_decisions = registry.observe_snapshot(
         stream_id,
@@ -484,7 +484,7 @@ def test_config_mismatch_requires_a_higher_generation_to_rebind() -> None:
     first = observation("First.", engine_instance=engine)
     assert_bound(registry.observe_request(first), stream_id)
     assert first.request_id is not None
-    registry.complete_request(first.request_id)
+    registry.complete_request(first.request_id, now=100.0)
 
     mismatch = observation(
         "Second.",
@@ -494,7 +494,7 @@ def test_config_mismatch_requires_a_higher_generation_to_rebind() -> None:
     )
     assert registry.observe_request(mismatch).reason == "config-mismatch"
     assert mismatch.request_id is not None
-    registry.complete_request(mismatch.request_id)
+    registry.complete_request(mismatch.request_id, now=101.0)
 
     same_generation = registry.observe_snapshot(
         stream_id,
@@ -615,7 +615,7 @@ def test_completed_retry_metadata_is_bounded_by_cap_and_ttl() -> None:
         )
         registry.observe_request(latest)
         assert latest.request_id is not None
-        registry.complete_request(latest.request_id)
+        registry.complete_request(latest.request_id, now=10.0)
 
     assert len(registry._retry_records) <= 8  # type: ignore[attr-defined]
     assert latest is not None and latest.request_id is not None
@@ -646,7 +646,7 @@ def test_release_uses_stream_retry_index_without_scanning_unrelated_history() ->
         )
         registry.observe_request(unrelated)
         assert unrelated.request_id is not None
-        registry.complete_request(unrelated.request_id)
+        registry.complete_request(unrelated.request_id, now=100.0)
 
     stream_id = uuid4()
     registry.observe_snapshot(stream_id, snapshot_record("Bound."))
@@ -668,6 +668,51 @@ def test_release_uses_stream_retry_index_without_scanning_unrelated_history() ->
     registry.release_stream(stream_id)
 
     assert stream_id not in registry._retry_ids_by_stream  # type: ignore[attr-defined]
+
+
+def test_engine_release_drops_active_retry_records_under_cap_pressure() -> None:
+    registry = CorrelationRegistry(retry_ttl_seconds=5.0, max_retry_records=8)
+    for index in range(100):
+        engine = uuid4()
+        request = observation(
+            f"Released engine {index}.",
+            arrived_at=10.0,
+            engine_instance=engine,
+        )
+        registry.observe_request(request)
+        registry.release_engine(engine)
+
+    registry.expire(15.000001)
+
+    assert not registry._retry_records  # type: ignore[attr-defined]
+    assert not registry._retry_ids_by_stream  # type: ignore[attr-defined]
+    assert not registry._in_flight_engine_by_request  # type: ignore[attr-defined]
+
+
+def test_long_request_retry_ttl_starts_at_explicit_completion_time() -> None:
+    registry = CorrelationRegistry(retry_ttl_seconds=5.0)
+    stream_id = uuid4()
+    engine = uuid4()
+    registry.observe_snapshot(
+        stream_id,
+        snapshot_record("Repeated.", "Repeated.", accepted_at=10.0),
+    )
+    first = observation("Repeated.", arrived_at=10.0, engine_instance=engine)
+    assert_bound(registry.observe_request(first), stream_id)
+    assert first.request_id is not None
+
+    registry.complete_request(first.request_id, now=100.0)
+    retry = registry.observe_request(
+        observation(
+            "Repeated.",
+            arrived_at=105.0,
+            request_id=first.request_id,
+            engine_instance=engine,
+        )
+    )
+
+    assert retry.outcome is CorrelationOutcome.RETRY
+    assert registry.next_expected_sequence(engine) == 11
 
 
 @pytest.mark.parametrize(

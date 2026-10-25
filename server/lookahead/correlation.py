@@ -293,7 +293,7 @@ class CorrelationRegistry:
             )
             return [self._decision(outcome, outcome.value)]
 
-    def complete_request(self, request_id: UUID) -> None:
+    def complete_request(self, request_id: UUID, *, now: float) -> None:
         with self._lock:
             engine = self._in_flight_engine_by_request.pop(request_id, None)
             if engine is None:
@@ -307,6 +307,7 @@ class CorrelationRegistry:
             retry_record = self._retry_records.get(request_id)
             if retry_record is not None:
                 retry_record.completed = True
+                retry_record.last_seen_at = max(retry_record.last_seen_at, now)
             self._trim_retry_records()
 
     def suspend_engine(
@@ -341,6 +342,7 @@ class CorrelationRegistry:
             in_flight = self._in_flight_by_engine.pop(engine_instance, set())
             for request_id in in_flight:
                 self._in_flight_engine_by_request.pop(request_id, None)
+                self._drop_retry_record(request_id)
             if binding is None:
                 return None
             decision = self._decision(
