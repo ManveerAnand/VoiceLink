@@ -32,6 +32,7 @@ class SpeculativeResult:
     pcm: bytes
     synthesis_seconds: float
     audio_seconds: float
+    failure: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,14 +93,24 @@ def _worker_main(
                 pcm = b"".join(model.synthesize(item.text, voice=item.voice, speed=item.speed))
                 elapsed = monotonic() - started
                 if item.id not in cancelled:
-                    results.put(
+                    results.put_nowait(
                         SpeculativeResult(
                             item.id, item.cache_key, pcm, elapsed, len(pcm) / 48_000
                         )
                     )
-            except Exception:
-                # Individual speculative failures must not affect the authoritative lane.
-                continue
+            except Exception as exc:
+                # Tell the parent to release the bounded slot; failures never touch
+                # the authoritative model or its request lane.
+                try:
+                    results.put_nowait(
+                        SpeculativeResult(
+                            item.id, item.cache_key, b"", 0.0, 0.0,
+                            failure=type(exc).__name__,
+                        )
+                    )
+                except Full:
+                    # A full result queue is reaped by the parent job deadline.
+                    pass
     finally:
         try:
             model.unload()

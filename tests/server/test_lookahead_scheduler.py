@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from threading import Event, Thread
+from dataclasses import dataclass, replace
+from threading import Event
 from uuid import UUID, uuid4
 
 import pytest
@@ -222,12 +222,26 @@ def test_scheduler_has_no_capability_or_jobs_when_worker_is_not_ready() -> None:
 
 def test_scheduler_does_not_keep_associations_when_bounded_worker_rejects_a_job() -> None:
     worker = RejectingWorker()
-    subject = scheduler(worker)
+    cancelled: list[UUID] = []
+    store = SnapshotStore(on_cancel_job=cancelled.append)
+    subject = scheduler(worker, store)
+    stream = uuid4()
+    initial = claim(stream, count=2)
+    snapshot = LookAheadSnapshot.model_validate({
+        "protocol": 1, "generation": 1, "revision": 1, "currentSequence": 10,
+        "source": {"rate": 1, "voiceName": "Heart", "lang": "en-GB"},
+        "units": [unit.model_dump(by_alias=True, exclude_none=True) for unit in initial.units],
+    })
+    assert store.replace(stream, snapshot, 1, now=0).value == "accepted"
 
-    subject.schedule_claim(claim(uuid4()))
+    subject.schedule_claim(initial)
+    assert worker.submitted
+    newer = snapshot.model_copy(update={"generation": 2, "revision": 2})
+    store.replace(stream, newer, 2, now=1)
 
     assert subject.queued_jobs == 0
     assert subject.scheduled_runway_seconds == 0
+    assert cancelled == []
 
 
 def test_scheduler_drains_associations_when_a_worker_crashes() -> None:
@@ -272,26 +286,120 @@ def test_worker_uses_bounded_nonblocking_queue_and_finite_stop(monkeypatch) -> N
     assert context.process.terminated == 1
 
 
-def test_blocked_speculative_lane_does_not_delay_authoritative_lane() -> None:
-    speculative_started = Event()
-    release_speculative = Event()
-    authoritative_started = Event()
+def test_blocked_speculative_worker_does_not_delay_independent_authoritative_lane(monkeypatch) -> None:
+    import server.lookahead.worker as worker_module
 
-    def blocked_speculative_synthesis() -> None:
-        speculative_started.set()
-        release_speculative.wait(timeout=1)
+    # A real SpeculativeWorker boundary with a child that never drains its queue.
+    # The authoritative fake shares neither the worker process nor its IPC queue.
+    context = FakeContext(status=[("ready", None)])
+    monkeypatch.setattr(worker_module, "get_context", lambda method: context)
+    speculative = SpeculativeWorker(max_jobs=1, startup_timeout=0, shutdown_timeout=0)
+    assert speculative.start()
+    subject = scheduler(speculative)
+    subject.schedule_claim(claim(uuid4(), count=2))
+    assert subject.queued_jobs == 1
 
-    speculative_thread = Thread(target=blocked_speculative_synthesis)
-    speculative_thread.start()
-    assert speculative_started.wait(timeout=0.1)
+    class AuthoritativeLane:
+        def __init__(self) -> None:
+            self.started = Event()
 
-    # This stands in for /v1/tts's model instance. It shares no worker queue,
-    # lock, or process with the speculative lane.
-    authoritative_started.set()
+        def synthesize(self) -> bytes:
+            self.started.set()
+            return b"authoritative-pcm"
 
+    authoritative = AuthoritativeLane()
     try:
-        assert authoritative_started.is_set()
+        assert authoritative.synthesize() == b"authoritative-pcm"
+        assert authoritative.started.is_set()
     finally:
-        release_speculative.set()
-        speculative_thread.join(timeout=1)
-        assert not speculative_thread.is_alive()
+        speculative.stop()
+
+
+def test_non_kokoro_claim_never_submits_or_caches_pcm() -> None:
+    worker = FakeWorker()
+    subject = scheduler(worker)
+    incompatible = BoundClaim(uuid4(), 1, 10, units(2), replace(config(), route="qwen3"))
+
+    subject.schedule_claim(incompatible)
+
+    assert worker.submitted == []
+    assert subject.queued_jobs == 0
+
+
+def test_deduplicated_job_completes_every_valid_stream_waiter() -> None:
+    worker = FakeWorker()
+    store = SnapshotStore()
+    subject = scheduler(worker, store)
+    first, second = uuid4(), uuid4()
+    first_claim, second_claim = claim(first, count=2), claim(second, count=2)
+    for stream, bound in ((first, first_claim), (second, second_claim)):
+        snapshot = LookAheadSnapshot.model_validate({
+            "protocol": 1, "generation": 1, "revision": 1, "currentSequence": 10,
+            "source": {"rate": 1, "voiceName": "Heart", "lang": "en-GB"},
+            "units": [unit.model_dump(by_alias=True, exclude_none=True) for unit in bound.units],
+        })
+        store.replace(stream, snapshot, 1, now=0)
+        subject.schedule_claim(bound)
+    job = worker.submitted[0]
+
+    subject.handle_result(SpeculativeResult(job.id, job.cache_key, b"pcm", 0.1, 1.0))
+
+    assert store.result_key(first, generation=1, sequence=11) == job.cache_key
+    assert store.result_key(second, generation=1, sequence=11) == job.cache_key
+
+
+def test_new_generation_discards_old_cached_runway_before_scheduling_again() -> None:
+    worker = FakeWorker()
+    subject = scheduler(worker)
+    stream = uuid4()
+    subject.schedule_claim(claim(stream, generation=1, count=2))
+    assert subject.scheduled_runway_seconds > 0
+
+    subject.schedule_claim(claim(stream, generation=2, count=2))
+
+    assert [job.generation for job in worker.submitted] == [1, 2]
+
+
+def test_failure_result_releases_job_and_disables_speculative_capability() -> None:
+    worker = FakeWorker()
+    subject = scheduler(worker)
+    subject.schedule_claim(claim(uuid4(), count=2))
+    job = worker.submitted[0]
+
+    subject.handle_result(SpeculativeResult(job.id, job.cache_key, b"", 0, 0, failure="synthesis-failed"))
+
+    assert subject.queued_jobs == 0
+    assert not subject.ready
+
+
+def test_result_with_a_mismatched_key_is_not_inserted_under_an_unrelated_key() -> None:
+    worker = FakeWorker()
+    subject = scheduler(worker)
+    subject.schedule_claim(claim(uuid4(), count=2))
+    job = worker.submitted[0]
+
+    subject.handle_result(SpeculativeResult(job.id, "wrong-key", b"pcm", 0.1, 1.0))
+
+    assert subject.cache.get("wrong-key", now=10) is None
+    assert not subject.ready
+
+
+def test_job_deadline_releases_slots_and_disables_capability() -> None:
+    worker = FakeWorker()
+    now = [0.0]
+    subject = LookAheadScheduler(
+        worker=worker,
+        store=SnapshotStore(),
+        cache=PcmCache(max_bytes=100_000, ttl_seconds=100),
+        settings=LookAheadSettings(enabled=True),
+        clock=lambda: now[0],
+        job_timeout_seconds=1,
+    )
+    subject.schedule_claim(claim(uuid4(), count=2))
+    assert subject.queued_jobs == 1
+
+    now[0] = 2
+    subject.poll()
+
+    assert subject.queued_jobs == 0
+    assert not subject.ready
