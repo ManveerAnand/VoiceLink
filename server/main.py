@@ -209,6 +209,7 @@ app.include_router(
         settings=settings.lookahead,
         store=lookahead_store,
         worker_ready=lambda: lookahead_scheduler.ready,
+        on_cancel_stream=lookahead_scheduler.cancel_stream,
     )
 )
 

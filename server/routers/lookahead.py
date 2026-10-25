@@ -1,6 +1,7 @@
 """HTTP endpoints for the optional VoiceLink look-ahead protocol."""
 
 import json
+import logging
 import time
 from collections.abc import Callable
 from hashlib import sha256
@@ -22,6 +23,9 @@ from server.lookahead.protocol import (
 from server.lookahead.store import ReplaceResult, SnapshotStore
 
 
+logger = logging.getLogger(__name__)
+
+
 def _error(status_code: int, code: str, message: str) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"error": {"code": code, "message": message}})
 
@@ -39,6 +43,7 @@ def create_router(
     settings: LookAheadSettings,
     store: SnapshotStore,
     worker_ready: Callable[[], bool] = lambda: False,
+    on_cancel_stream: Callable[[UUID], None] | None = None,
 ) -> APIRouter:
     """Create an injectable router so protocol tests never load a TTS model."""
     store.configure_budgets(
@@ -117,6 +122,12 @@ def create_router(
         if parsed_stream_id is None:
             return _error(400, "invalid", "streamId must be a canonical lowercase UUID")
         store.cancel(parsed_stream_id)
+        if on_cancel_stream is not None:
+            try:
+                on_cancel_stream(parsed_stream_id)
+            except Exception:
+                # Look-ahead is optional; DELETE must retain its idempotent legacy result.
+                logger.exception("look-ahead scheduler stream cancellation failed")
         return Response(status_code=204)
 
     return router

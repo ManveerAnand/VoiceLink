@@ -7,7 +7,11 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from server.config import LookAheadSettings
+from server.lookahead.cache import PcmCache, SynthesisConfig, synthesis_input_digest
+from server.lookahead.correlation import BoundClaim
 from server.lookahead.protocol import MAX_BODY_BYTES
+from server.lookahead.protocol import LookAheadSnapshot
+from server.lookahead.scheduler import LookAheadScheduler
 from server.lookahead.store import SnapshotStore
 from server.routers.lookahead import create_router
 
@@ -317,3 +321,63 @@ async def test_capabilities_omit_lookahead_until_enabled_and_worker_ready(
         "structuredPauses": True,
         "bridgeProtocolRequiredForPauses": 2,
     }
+
+
+@pytest.mark.asyncio
+async def test_delete_clears_cached_only_scheduler_runway_and_is_idempotent() -> None:
+    class ReadyWorker:
+        ready = True
+
+        def submit(self, _job) -> bool:
+            return True
+
+        def cancel(self, _job_id) -> None:
+            return None
+
+    stream_id = uuid4()
+    body = snapshot(current_sequence=10)
+    body["units"] = [deepcopy(body["units"][0]) for _ in range(3)]
+    for offset, unit in enumerate(body["units"]):
+        unit["sequence"] = 10 + offset
+    parsed = LookAheadSnapshot.model_validate(body)
+    config = SynthesisConfig(
+        route="kokoro", model_version="kokoro", voice="af_heart", speed=1.0,
+        format="pcm_24k_16bit", language="en-GB",
+    )
+    store = SnapshotStore()
+    scheduler = LookAheadScheduler(
+        worker=ReadyWorker(), store=store, cache=PcmCache(max_bytes=100_000),
+        settings=LookAheadSettings(enabled=True), clock=lambda: 10.0,
+    )
+    for unit in parsed.units[1:]:
+        scheduler.cache.put(synthesis_input_digest(unit.text, config), b"pcm", now=10)
+    app = FastAPI()
+    app.include_router(
+        create_router(
+            settings=LookAheadSettings(enabled=True), store=store, worker_ready=lambda: True,
+            on_cancel_stream=scheduler.cancel_stream,
+        )
+    )
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        assert (await client.put(f"/v1/tts/lookahead/{stream_id}", json=body)).status_code == 202
+        scheduler.schedule_claim(BoundClaim(stream_id, 3, 10, tuple(parsed.units), config))
+        assert scheduler.scheduled_runway_seconds > 0
+
+        assert (await client.delete(f"/v1/tts/lookahead/{stream_id}")).status_code == 204
+        assert scheduler.scheduled_runway_seconds == 0
+        assert (await client.delete(f"/v1/tts/lookahead/{stream_id}")).status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_delete_ignores_optional_scheduler_callback_failure() -> None:
+    app = FastAPI()
+    app.include_router(
+        create_router(
+            settings=LookAheadSettings(enabled=True), store=SnapshotStore(), worker_ready=lambda: True,
+            on_cancel_stream=lambda _stream_id: (_ for _ in ()).throw(RuntimeError("worker unavailable")),
+        )
+    )
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        assert (await client.delete(f"/v1/tts/lookahead/{uuid4()}")).status_code == 204
