@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from uuid import UUID, uuid4
 
 import pytest
@@ -597,6 +598,76 @@ def test_released_binding_retry_never_returns_a_claim(release_kind: str) -> None
 
     assert retry.outcome is CorrelationOutcome.RETRY
     assert retry.claim is None
+
+
+def test_completed_retry_metadata_is_bounded_by_cap_and_ttl() -> None:
+    registry = CorrelationRegistry(
+        correlation_ttl_seconds=5.0,
+        retry_ttl_seconds=5.0,
+        max_retry_records=8,
+    )
+    latest: AuthoritativeObservation | None = None
+    for index in range(100):
+        latest = observation(
+            f"Request {index}.",
+            arrived_at=10.0,
+            engine_instance=uuid4(),
+        )
+        registry.observe_request(latest)
+        assert latest.request_id is not None
+        registry.complete_request(latest.request_id)
+
+    assert len(registry._retry_records) <= 8  # type: ignore[attr-defined]
+    assert latest is not None and latest.request_id is not None
+    retry = registry.observe_request(
+        observation(
+            latest.text,
+            arrived_at=11.0,
+            request_id=latest.request_id,
+            engine_instance=latest.engine_instance,
+        )
+    )
+    assert retry.outcome is CorrelationOutcome.RETRY
+
+    registry.expire(16.000001)
+
+    assert not registry._retry_records  # type: ignore[attr-defined]
+    assert not registry._retry_ids_by_stream  # type: ignore[attr-defined]
+    assert not hasattr(registry, "_request_fingerprints")
+    assert not hasattr(registry, "_request_decisions")
+
+
+def test_release_uses_stream_retry_index_without_scanning_unrelated_history() -> None:
+    registry = CorrelationRegistry(max_retry_records=64)
+    for index in range(20):
+        unrelated = observation(
+            f"Unrelated {index}.",
+            engine_instance=uuid4(),
+        )
+        registry.observe_request(unrelated)
+        assert unrelated.request_id is not None
+        registry.complete_request(unrelated.request_id)
+
+    stream_id = uuid4()
+    registry.observe_snapshot(stream_id, snapshot_record("Bound."))
+    bound = observation("Bound.")
+    assert_bound(registry.observe_request(bound), stream_id)
+    assert bound.request_id is not None
+    assert registry._retry_ids_by_stream[stream_id] == {  # type: ignore[attr-defined]
+        bound.request_id
+    }
+
+    class NoLifetimeScan(OrderedDict[UUID, object]):
+        def items(self):  # type: ignore[no-untyped-def]
+            raise AssertionError("release scanned lifetime retry history")
+
+    registry._retry_records = NoLifetimeScan(  # type: ignore[attr-defined]
+        registry._retry_records  # type: ignore[attr-defined]
+    )
+
+    registry.release_stream(stream_id)
+
+    assert stream_id not in registry._retry_ids_by_stream  # type: ignore[attr-defined]
 
 
 @pytest.mark.parametrize(

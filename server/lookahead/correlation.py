@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import unicodedata
+from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum
 from hashlib import sha256
@@ -88,6 +89,15 @@ class _RequestFingerprint:
 
 
 @dataclass(slots=True)
+class _RetryRecord:
+    fingerprint: _RequestFingerprint
+    decision: CorrelationDecision
+    last_seen_at: float
+    completed: bool = False
+    stream_id: UUID | None = None
+
+
+@dataclass(slots=True)
 class _GenerationSuspension:
     generation: int
     last_seen_at: float
@@ -101,13 +111,17 @@ class CorrelationRegistry:
         *,
         correlation_ttl_seconds: float = 5.0,
         binding_ttl_seconds: float = 30.0,
+        retry_ttl_seconds: float = 30.0,
+        max_retry_records: int = 256,
     ) -> None:
         self._correlation_ttl = correlation_ttl_seconds
         self._binding_ttl = binding_ttl_seconds
+        self._retry_ttl = retry_ttl_seconds
+        self._max_retry_records = max_retry_records
         self._snapshots: dict[UUID, SnapshotRecord] = {}
         self._requests: dict[UUID, AuthoritativeObservation] = {}
-        self._request_fingerprints: dict[UUID, _RequestFingerprint] = {}
-        self._request_decisions: dict[UUID, CorrelationDecision] = {}
+        self._retry_records: OrderedDict[UUID, _RetryRecord] = OrderedDict()
+        self._retry_ids_by_stream: dict[UUID, set[UUID]] = {}
         self._claimed_requests: set[UUID] = set()
         self._blocked_requests: set[UUID] = set()
         self._blocked_streams: set[UUID] = set()
@@ -115,6 +129,7 @@ class CorrelationRegistry:
         self._bindings_by_engine: dict[UUID, _Binding] = {}
         self._engine_by_stream: dict[UUID, UUID] = {}
         self._in_flight_by_engine: dict[UUID, set[UUID]] = {}
+        self._in_flight_engine_by_request: dict[UUID, UUID] = {}
         self._lock = RLock()
 
     def observe_request(
@@ -135,29 +150,39 @@ class CorrelationRegistry:
             engine = observation.engine_instance
             assert request_id is not None and engine is not None
 
-            prior = self._request_decisions.get(request_id)
+            prior = self._retry_records.get(request_id)
             if prior is not None:
-                if not self._same_authoritative_call(
-                    self._request_fingerprints.get(request_id), observation
-                ):
+                if not self._same_authoritative_call(prior.fingerprint, observation):
                     return self._suspend_for_request(observation, "request-id-conflict")
+                prior.last_seen_at = max(prior.last_seen_at, observation.arrived_at)
+                self._retry_records.move_to_end(request_id)
                 retry = self._decision(
                     CorrelationOutcome.RETRY,
                     "retry",
                     request_id=request_id,
-                    claim=prior.claim,
+                    claim=prior.decision.claim,
                 )
-                self._request_decisions[request_id] = retry
+                self._set_retry_decision(request_id, retry)
                 return retry
 
-            self._request_fingerprints[request_id] = self._fingerprint(observation)
+            self._retry_records[request_id] = _RetryRecord(
+                fingerprint=self._fingerprint(observation),
+                decision=self._decision(
+                    CorrelationOutcome.UNCLAIMED,
+                    "pending",
+                    request_id=request_id,
+                ),
+                last_seen_at=observation.arrived_at,
+            )
+            self._trim_retry_records()
 
             in_flight = self._in_flight_by_engine.setdefault(engine, set())
+            self._in_flight_engine_by_request[request_id] = engine
             if in_flight:
                 in_flight.add(request_id)
                 self._requests[request_id] = observation
                 decision = self._suspend_for_request(observation, "concurrent-request")
-                self._request_decisions[request_id] = decision
+                self._set_retry_decision(request_id, decision)
                 return decision
 
             in_flight.add(request_id)
@@ -179,19 +204,19 @@ class CorrelationRegistry:
                     "ambiguous",
                     request_id=request_id,
                 )
-                self._request_decisions[request_id] = decision
+                self._set_retry_decision(request_id, decision)
                 return decision
 
             binding = self._bindings_by_engine.get(engine)
             if binding is not None:
                 decision = self._advance(binding, observation)
-                self._request_decisions[request_id] = decision
+                self._set_retry_decision(request_id, decision)
                 return decision
 
             decisions = self._recompute()
             for decision in decisions:
                 if decision.request_id == request_id:
-                    self._request_decisions[request_id] = decision
+                    self._set_retry_decision(request_id, decision)
                     return decision
 
             outcome = (
@@ -200,7 +225,7 @@ class CorrelationRegistry:
                 else CorrelationOutcome.UNCLAIMED
             )
             decision = self._decision(outcome, outcome.value, request_id=request_id)
-            self._request_decisions[request_id] = decision
+            self._set_retry_decision(request_id, decision)
             return decision
 
     def observe_snapshot(
@@ -270,15 +295,19 @@ class CorrelationRegistry:
 
     def complete_request(self, request_id: UUID) -> None:
         with self._lock:
-            fingerprint = self._request_fingerprints.get(request_id)
-            if fingerprint is None:
+            engine = self._in_flight_engine_by_request.pop(request_id, None)
+            if engine is None:
                 return
-            in_flight = self._in_flight_by_engine.get(fingerprint.engine_instance)
+            in_flight = self._in_flight_by_engine.get(engine)
             if in_flight is None:
                 return
             in_flight.discard(request_id)
             if not in_flight:
-                self._in_flight_by_engine.pop(fingerprint.engine_instance, None)
+                self._in_flight_by_engine.pop(engine, None)
+            retry_record = self._retry_records.get(request_id)
+            if retry_record is not None:
+                retry_record.completed = True
+            self._trim_retry_records()
 
     def suspend_engine(
         self, engine_instance: UUID, reason: str = "suspended"
@@ -309,7 +338,9 @@ class CorrelationRegistry:
     def release_engine(self, engine_instance: UUID) -> CorrelationDecision | None:
         with self._lock:
             binding = self._remove_binding(engine_instance)
-            self._in_flight_by_engine.pop(engine_instance, None)
+            in_flight = self._in_flight_by_engine.pop(engine_instance, set())
+            for request_id in in_flight:
+                self._in_flight_engine_by_request.pop(request_id, None)
             if binding is None:
                 return None
             decision = self._decision(
@@ -464,7 +495,7 @@ class CorrelationRegistry:
                 request_id=request_id,
                 claim=claim,
             )
-            self._request_decisions[request_id] = decision
+            self._set_retry_decision(request_id, decision)
             self._log(decision)
             decisions.append(decision)
 
@@ -484,7 +515,7 @@ class CorrelationRegistry:
             decision = self._decision(
                 CorrelationOutcome.AMBIGUOUS, "ambiguous", request_id=request_id
             )
-            self._request_decisions[request_id] = decision
+            self._set_retry_decision(request_id, decision)
             decisions.append(decision)
         if ambiguous_streams and not ambiguous_requests:
             decisions.append(self._decision(CorrelationOutcome.AMBIGUOUS, "ambiguous"))
@@ -630,10 +661,13 @@ class CorrelationRegistry:
             request_id=binding.claim_request_id,
             claim=claim,
         )
-        self._request_decisions[binding.claim_request_id] = self._decision(
-            CorrelationOutcome.SUSPENDED,
-            reason,
-            request_id=binding.claim_request_id,
+        self._set_retry_decision(
+            binding.claim_request_id,
+            self._decision(
+                CorrelationOutcome.SUSPENDED,
+                reason,
+                request_id=binding.claim_request_id,
+            ),
         )
         self._log(decision)
         return decision
@@ -646,6 +680,7 @@ class CorrelationRegistry:
         return binding
 
     def _prune_candidates(self, now: float) -> None:
+        self._prune_retry_records(now)
         expired_requests = {
             request_id
             for request_id, observation in self._requests.items()
@@ -706,14 +741,72 @@ class CorrelationRegistry:
         )
 
     def _invalidate_retry_claims(self, stream_id: UUID) -> None:
-        for request_id, decision in tuple(self._request_decisions.items()):
-            if decision.claim is None or decision.claim.stream_id != stream_id:
+        for request_id in self._retry_ids_by_stream.pop(stream_id, set()):
+            record = self._retry_records.get(request_id)
+            if record is None:
                 continue
-            self._request_decisions[request_id] = self._decision(
+            decision = record.decision
+            record.decision = self._decision(
                 decision.outcome,
                 decision.reason,
                 request_id=request_id,
             )
+            record.stream_id = None
+
+    def _set_retry_decision(
+        self,
+        request_id: UUID,
+        decision: CorrelationDecision,
+    ) -> None:
+        record = self._retry_records.get(request_id)
+        if record is None:
+            return
+        previous_stream = record.stream_id
+        current_stream = None if decision.claim is None else decision.claim.stream_id
+        if previous_stream != current_stream:
+            if previous_stream is not None:
+                ids = self._retry_ids_by_stream.get(previous_stream)
+                if ids is not None:
+                    ids.discard(request_id)
+                    if not ids:
+                        self._retry_ids_by_stream.pop(previous_stream, None)
+            if current_stream is not None:
+                self._retry_ids_by_stream.setdefault(current_stream, set()).add(
+                    request_id
+                )
+        record.decision = decision
+        record.stream_id = current_stream
+
+    def _drop_retry_record(self, request_id: UUID) -> None:
+        record = self._retry_records.pop(request_id, None)
+        if record is None or record.stream_id is None:
+            return
+        ids = self._retry_ids_by_stream.get(record.stream_id)
+        if ids is None:
+            return
+        ids.discard(request_id)
+        if not ids:
+            self._retry_ids_by_stream.pop(record.stream_id, None)
+
+    def _prune_retry_records(self, now: float) -> None:
+        for request_id, record in tuple(self._retry_records.items()):
+            if record.completed and now - record.last_seen_at > self._retry_ttl:
+                self._drop_retry_record(request_id)
+        self._trim_retry_records()
+
+    def _trim_retry_records(self) -> None:
+        while len(self._retry_records) > self._max_retry_records:
+            completed_id = next(
+                (
+                    request_id
+                    for request_id, record in self._retry_records.items()
+                    if record.completed
+                ),
+                None,
+            )
+            if completed_id is None:
+                return
+            self._drop_retry_record(completed_id)
 
     @staticmethod
     def _unit_at(snapshot: LookAheadSnapshot, sequence: int) -> LookAheadUnit | None:
