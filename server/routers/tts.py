@@ -162,21 +162,23 @@ async def synthesize(http_request: Request, request: TTSRequest):
         f"text_len={len(request.text)}"
     )
 
+    wall_started_at = time.perf_counter()
     service = _lookahead_service
     context = None
     service_clock = None
+    service_started_at = None
     if service is not None:
         try:
             service_clock = service.now
-            t0 = service_clock()
-            context = service.begin_authoritative(http_request.headers, request, t0)
+            service_started_at = service_clock()
+            context = service.begin_authoritative(
+                http_request.headers, request, service_started_at
+            )
         except Exception:
             logger.error("Look-ahead begin failed; using legacy synthesis")
             context = None
             service_clock = None
-            t0 = time.perf_counter()
-    else:
-        t0 = time.perf_counter()
+            service_started_at = None
 
     def _run_synthesis() -> list[bytes]:
         """Run blocking synthesis in a thread so the event loop stays responsive."""
@@ -191,6 +193,7 @@ async def synthesize(http_request: Request, request: TTSRequest):
 
     synthesis_error: Exception | None = None
     cached_speech = getattr(context, "cached_speech", None)
+    authoritative_synthesis_ran = cached_speech is None
     try:
         chunks = (
             [cached_speech]
@@ -201,27 +204,45 @@ async def synthesize(http_request: Request, request: TTSRequest):
         chunks = []
         synthesis_error = error
 
-    try:
-        finished_at = (
-            service_clock() if service_clock is not None else time.perf_counter()
-        )
-    except Exception:
-        logger.error("Look-ahead clock failed; using legacy timing")
-        finished_at = time.perf_counter()
-    elapsed = max(0.0, finished_at - t0)
     speech_pcm = b"".join(chunks)
     envelope = AudioEnvelope(b"", speech_pcm)
+    service_failed = False
+    service_elapsed = time.perf_counter() - wall_started_at
     if context is not None and service is not None:
         try:
-            envelope = service.finish_authoritative(
+            if service_clock is None or service_started_at is None:
+                raise RuntimeError("look-ahead clock unavailable after begin")
+            finished_at = service_clock()
+            service_elapsed = max(0.0, finished_at - service_started_at)
+        except Exception:
+            logger.error("Look-ahead clock failed; using legacy synthesis")
+            service_failed = True
+            service_elapsed = time.perf_counter() - wall_started_at
+            finished_at = (service_started_at or 0.0) + service_elapsed
+        try:
+            candidate = service.finish_authoritative(
                 context,
-                None if synthesis_error is not None else speech_pcm,
-                elapsed,
+                None if synthesis_error is not None or service_failed else speech_pcm,
+                service_elapsed,
                 finished_at,
             )
+            if not service_failed:
+                envelope = candidate
         except Exception:
             logger.error("Look-ahead finish failed; using legacy synthesis")
-            envelope = AudioEnvelope(b"", speech_pcm)
+            service_failed = True
+
+    if service_failed:
+        if not authoritative_synthesis_ran:
+            authoritative_synthesis_ran = True
+            try:
+                chunks = await asyncio.to_thread(_run_synthesis)
+                synthesis_error = None
+            except Exception as error:
+                chunks = []
+                synthesis_error = error
+        speech_pcm = b"".join(chunks)
+        envelope = AudioEnvelope(b"", speech_pcm)
 
     if synthesis_error is not None:
         logger.error("Synthesis failed")
@@ -229,6 +250,11 @@ async def synthesize(http_request: Request, request: TTSRequest):
             status_code=500, detail=f"Synthesis failed: {synthesis_error}"
         )
 
+    elapsed = (
+        time.perf_counter() - wall_started_at
+        if service_failed or context is None
+        else service_elapsed
+    )
     total_bytes = len(envelope.body)
     audio_seconds = len(envelope.speech_pcm) / (24000 * 2)  # 24kHz * 2 bytes/sample
     realtime = audio_seconds / elapsed if elapsed > 0 else float("inf")

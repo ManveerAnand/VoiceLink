@@ -311,7 +311,7 @@ async def test_snapshot_first_claim_schedules_future_and_serves_exact_cache_hit(
 
 
 @pytest.mark.asyncio
-async def test_request_first_late_snapshot_claims_and_schedules_future() -> None:
+async def test_request_first_late_snapshot_claims_and_serves_future_cache_hit() -> None:
     clock = ManualClock()
     model = BlockingModel(clock)
     engine = uuid4()
@@ -320,13 +320,22 @@ async def test_request_first_late_snapshot_claims_and_schedules_future() -> None
             post_tts(stack, "current", headers=bridge_headers(engine))
         )
         assert await asyncio.to_thread(model.started.wait, 1.0)
-        accepted = await put_snapshot(stack, snapshot("current", "future"))
+        accepted = await put_snapshot(
+            stack,
+            snapshot("current", "future", boundaries=("sentence", "paragraph")),
+        )
         model.release.set()
         response = await request
+        cached = b"request-first-future-pcm"
+        complete_first_speculative_job(stack, cached)
+        future = await post_tts(stack, "future", headers=bridge_headers(engine))
 
         assert accepted.status_code == 202
         assert response.headers["X-Audio-Prefix-Bytes"] == "0"
         assert [job.text for job in stack.worker.submitted] == ["future"]
+        assert future.content == (b"\x00" * 8_640) + cached
+        assert future.headers["X-Speech-Audio-Length"] == str(len(cached))
+        assert model.calls == [("current", "af_heart", 1.0)]
 
 
 @pytest.mark.asyncio
@@ -429,6 +438,23 @@ async def test_old_bridge_never_receives_prefix_or_new_timing_headers() -> None:
 
 
 @pytest.mark.asyncio
+async def test_old_bridge_can_reuse_exact_canonical_pcm_without_new_headers() -> None:
+    cached = b"old-bridge-exact-canonical-pcm"
+    async with running_stack() as stack:
+        stack.cache.put(
+            synthesis_input_digest("old cached", synthesis_config()),
+            cached,
+            stack.clock(),
+        )
+        response = await post_tts(stack, "old cached")
+
+    assert response.content == cached
+    assert stack.model.calls == []
+    assert "X-Audio-Prefix-Bytes" not in response.headers
+    assert "X-Speech-Audio-Length" not in response.headers
+
+
+@pytest.mark.asyncio
 async def test_evicted_prefetch_falls_back_to_synthesis_with_safe_residual_pause() -> (
     None
 ):
@@ -472,6 +498,51 @@ class ExplodingFinishService:
         raise RuntimeError("look-ahead finish exploded")
 
 
+class FailAfterBeginClockService:
+    def __init__(self, delegate: LookAheadService) -> None:
+        self.delegate = delegate
+        self.now_calls = 0
+        self.begin_calls = 0
+        self.finish_calls = 0
+        self.finished_context = None
+        self.finished_speech: bytes | None = b"not-called"
+
+    def now(self) -> float:
+        self.now_calls += 1
+        if self.now_calls == 1:
+            return self.delegate.now()
+        raise RuntimeError("clock failed after begin")
+
+    def begin_authoritative(self, headers, request, now):
+        self.begin_calls += 1
+        return self.delegate.begin_authoritative(headers, request, now)
+
+    def finish_authoritative(self, context, speech_pcm, elapsed, now):
+        self.finish_calls += 1
+        self.finished_context = context
+        self.finished_speech = speech_pcm
+        return self.delegate.finish_authoritative(context, speech_pcm, elapsed, now)
+
+
+class RaiseAfterExactCacheFinishService:
+    def __init__(self, delegate: LookAheadService) -> None:
+        self.delegate = delegate
+        self.finish_calls = 0
+        self.finished_context = None
+
+    def now(self) -> float:
+        return self.delegate.now()
+
+    def begin_authoritative(self, headers, request, now):
+        return self.delegate.begin_authoritative(headers, request, now)
+
+    def finish_authoritative(self, context, speech_pcm, elapsed, now):
+        self.finish_calls += 1
+        self.finished_context = context
+        self.delegate.finish_authoritative(context, speech_pcm, elapsed, now)
+        raise RuntimeError("finish failed after exact cache hit")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "service",
@@ -486,6 +557,57 @@ async def test_every_service_exception_uses_legacy_synthesis(service: object) ->
     assert response.content == pcm_for("fallback")
     assert "X-Audio-Prefix-Bytes" not in response.headers
     assert "X-Speech-Audio-Length" not in response.headers
+
+
+@pytest.mark.asyncio
+async def test_clock_failure_after_begin_discards_cache_and_finishes_once() -> None:
+    text = "clock failure fallback"
+    engine = uuid4()
+    async with running_stack() as stack:
+        await put_snapshot(stack, snapshot(text))
+        stack.cache.put(
+            synthesis_input_digest(text, synthesis_config()),
+            b"cached-clock-pcm",
+            stack.clock(),
+        )
+        service = FailAfterBeginClockService(stack.service)
+        tts_router.set_lookahead_service(service)
+        response = await post_tts(stack, text, headers=bridge_headers(engine))
+
+    assert response.content == pcm_for(text)
+    assert stack.model.calls == [(text, "af_heart", 1.0)]
+    assert response.headers["X-Audio-Length"] == str(len(pcm_for(text)))
+    assert "X-Audio-Prefix-Bytes" not in response.headers
+    assert "X-Speech-Audio-Length" not in response.headers
+    assert service.now_calls == 2
+    assert service.begin_calls == 1
+    assert service.finish_calls == 1
+    assert service.finished_speech is None
+    assert service.finished_context.finished is True
+
+
+@pytest.mark.asyncio
+async def test_finish_failure_after_exact_cache_hit_runs_legacy_model_once() -> None:
+    text = "finish failure fallback"
+    engine = uuid4()
+    async with running_stack() as stack:
+        await put_snapshot(stack, snapshot(text))
+        stack.cache.put(
+            synthesis_input_digest(text, synthesis_config()),
+            b"cached-finish-pcm",
+            stack.clock(),
+        )
+        service = RaiseAfterExactCacheFinishService(stack.service)
+        tts_router.set_lookahead_service(service)
+        response = await post_tts(stack, text, headers=bridge_headers(engine))
+
+    assert response.content == pcm_for(text)
+    assert stack.model.calls == [(text, "af_heart", 1.0)]
+    assert response.headers["X-Audio-Length"] == str(len(pcm_for(text)))
+    assert "X-Audio-Prefix-Bytes" not in response.headers
+    assert "X-Speech-Audio-Length" not in response.headers
+    assert service.finish_calls == 1
+    assert service.finished_context.finished is True
 
 
 class RecordingService:
