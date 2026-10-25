@@ -1,13 +1,17 @@
 """Atomic storage for the latest accepted snapshot of each stream."""
 
+import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from hashlib import sha256
 from threading import RLock
-from collections.abc import Callable
 from uuid import UUID
 
 from server.lookahead.protocol import LookAheadSnapshot
+
+
+logger = logging.getLogger(__name__)
 
 
 class ReplaceResult(str, Enum):
@@ -29,9 +33,9 @@ class SnapshotRecord:
 class SnapshotStore:
     """Keep one replaceable snapshot per stream under a single lock."""
 
-    def __init__(self, *, on_cancel_job: Callable[[str], None] | None = None) -> None:
+    def __init__(self, *, on_cancel_job: Callable[[UUID], None] | None = None) -> None:
         self._records: dict[UUID, SnapshotRecord] = {}
-        self._pending_jobs: dict[UUID, dict[int, set[str]]] = {}
+        self._pending_jobs: dict[UUID, dict[int, set[UUID]]] = {}
         self._result_keys: dict[UUID, dict[int, dict[int, str]]] = {}
         self._on_cancel_job = on_cancel_job or (lambda _job_id: None)
         self._lock = RLock()
@@ -54,7 +58,7 @@ class SnapshotStore:
         # The router supplies the exact body digest through this private attribute so the
         # public method keeps the normative protocol signature.
         digest = getattr(snapshot, "_body_digest", digest)
-        cancelled_jobs: tuple[str, ...] = ()
+        cancelled_jobs: tuple[UUID, ...] = ()
         with self._lock:
             previous = self._records.get(stream_id)
             if previous is not None:
@@ -73,17 +77,34 @@ class SnapshotStore:
                 body_digest=digest,
                 accepted_at=now,
             )
-        for job_id in cancelled_jobs:
-            self._on_cancel_job(job_id)
+        self._notify_cancelled_jobs(cancelled_jobs)
         return ReplaceResult.ACCEPTED
 
-    def track_pending_job(self, stream_id: UUID, *, generation: int, job_id: str) -> bool:
+    def track_pending_job(self, stream_id: UUID, *, generation: int, job_id: UUID) -> bool:
         """Associate speculative work with the currently accepted generation only."""
+        self._require_uuid(job_id)
         with self._lock:
             record = self._records.get(stream_id)
             if record is None or generation != record.snapshot.generation:
                 return False
             self._pending_jobs.setdefault(stream_id, {}).setdefault(generation, set()).add(job_id)
+            return True
+
+    def complete_pending_job(self, stream_id: UUID, *, generation: int, job_id: UUID) -> bool:
+        """Remove a completed job so future invalidation does not cancel it again."""
+        self._require_uuid(job_id)
+        with self._lock:
+            jobs_by_generation = self._pending_jobs.get(stream_id)
+            if jobs_by_generation is None:
+                return False
+            jobs = jobs_by_generation.get(generation)
+            if jobs is None or job_id not in jobs:
+                return False
+            jobs.remove(job_id)
+            if not jobs:
+                del jobs_by_generation[generation]
+            if not jobs_by_generation:
+                del self._pending_jobs[stream_id]
             return True
 
     def track_result(self, stream_id: UUID, *, generation: int, sequence: int, cache_key: str) -> bool:
@@ -99,7 +120,7 @@ class SnapshotStore:
         with self._lock:
             return self._result_keys.get(stream_id, {}).get(generation, {}).get(sequence)
 
-    def _invalidate_generations_before(self, stream_id: UUID, generation: int) -> tuple[str, ...]:
+    def _invalidate_generations_before(self, stream_id: UUID, generation: int) -> tuple[UUID, ...]:
         pending = self._pending_jobs.get(stream_id, {})
         cancelled = tuple(
             job_id
@@ -128,6 +149,19 @@ class SnapshotStore:
         else:
             self._result_keys.pop(stream_id, None)
         return cancelled
+
+    @staticmethod
+    def _require_uuid(job_id: UUID) -> None:
+        if not isinstance(job_id, UUID):
+            raise TypeError("job_id must be a UUID")
+
+    def _notify_cancelled_jobs(self, job_ids: tuple[UUID, ...]) -> None:
+        """Best-effort external cancellation after internal state is already final."""
+        for job_id in job_ids:
+            try:
+                self._on_cancel_job(job_id)
+            except Exception:
+                logger.exception("look-ahead speculative-job cancellation callback failed")
 
     @staticmethod
     def _compare(
@@ -163,7 +197,7 @@ class SnapshotStore:
         return total + snapshot.scalar_count() > self._max_global_characters
 
     def cancel(self, stream_id: UUID) -> None:
-        cancelled_jobs: tuple[str, ...]
+        cancelled_jobs: tuple[UUID, ...]
         with self._lock:
             self._records.pop(stream_id, None)
             cancelled_jobs = tuple(
@@ -172,8 +206,7 @@ class SnapshotStore:
                 for job_id in job_ids
             )
             self._result_keys.pop(stream_id, None)
-        for job_id in cancelled_jobs:
-            self._on_cancel_job(job_id)
+        self._notify_cancelled_jobs(cancelled_jobs)
 
     def get(self, stream_id: UUID) -> SnapshotRecord | None:
         with self._lock:

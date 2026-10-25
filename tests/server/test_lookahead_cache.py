@@ -1,4 +1,4 @@
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -96,18 +96,56 @@ def test_oversized_pcm_does_not_evict_existing_entries() -> None:
 
 
 def test_higher_generation_discards_stream_work_but_preserves_canonical_pcm() -> None:
-    cancelled: list[str] = []
+    cancelled: list[UUID] = []
     store = SnapshotStore(on_cancel_job=cancelled.append)
     cache = PcmCache(max_bytes=10, ttl_seconds=10)
     stream_id = uuid4()
     key = synthesis_input_digest("One.", config())
     assert cache.put(key, b"pcm", now=0)
     assert store.replace(stream_id, lookahead_snapshot(1), raw_body_bytes=1, now=0) is ReplaceResult.ACCEPTED
-    store.track_pending_job(stream_id, generation=1, job_id="job-1")
+    job_id = uuid4()
+    assert store.track_pending_job(stream_id, generation=1, job_id=job_id)
     store.track_result(stream_id, generation=1, sequence=1, cache_key=key)
 
     assert store.replace(stream_id, lookahead_snapshot(2), raw_body_bytes=2, now=1) is ReplaceResult.ACCEPTED
 
-    assert cancelled == ["job-1"]
+    assert cancelled == [job_id]
     assert store.result_key(stream_id, generation=1, sequence=1) is None
     assert cache.get(key, now=1) == b"pcm"
+
+
+def test_callback_failure_preserves_accepted_and_idempotent_snapshot_state() -> None:
+    def fail_cancellation(_: UUID) -> None:
+        raise RuntimeError("worker unavailable")
+
+    store = SnapshotStore(on_cancel_job=fail_cancellation)
+    stream_id = uuid4()
+    assert store.replace(stream_id, lookahead_snapshot(1), raw_body_bytes=1, now=0) is ReplaceResult.ACCEPTED
+    assert store.track_pending_job(stream_id, generation=1, job_id=uuid4())
+
+    assert store.replace(stream_id, lookahead_snapshot(2), raw_body_bytes=2, now=1) is ReplaceResult.ACCEPTED
+    assert store.get(stream_id).snapshot.generation == 2  # type: ignore[union-attr]
+    assert store.replace(stream_id, lookahead_snapshot(2), raw_body_bytes=2, now=2) is ReplaceResult.DUPLICATE
+
+
+def test_completed_job_is_not_cancelled_by_a_later_generation() -> None:
+    cancelled: list[UUID] = []
+    store = SnapshotStore(on_cancel_job=cancelled.append)
+    stream_id = uuid4()
+    job_id = uuid4()
+    assert store.replace(stream_id, lookahead_snapshot(1), raw_body_bytes=1, now=0) is ReplaceResult.ACCEPTED
+    assert store.track_pending_job(stream_id, generation=1, job_id=job_id)
+
+    assert store.complete_pending_job(stream_id, generation=1, job_id=job_id)
+    assert store.replace(stream_id, lookahead_snapshot(2), raw_body_bytes=2, now=1) is ReplaceResult.ACCEPTED
+
+    assert cancelled == []
+
+
+def test_pending_job_ids_must_be_uuids() -> None:
+    store = SnapshotStore()
+    stream_id = uuid4()
+    assert store.replace(stream_id, lookahead_snapshot(1), raw_body_bytes=1, now=0) is ReplaceResult.ACCEPTED
+
+    with pytest.raises(TypeError, match="UUID"):
+        store.track_pending_job(stream_id, generation=1, job_id="job-1")  # type: ignore[arg-type]
