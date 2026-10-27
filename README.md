@@ -107,6 +107,30 @@ Everything runs on your computer. No internet needed after the initial setup. No
 
 > 🔍 Want to understand the full architecture? Read the [Deep Dive Manual](DEEP_DIVE.md), a comprehensive technical reference covering every layer of the system.
 
+### Experimental adaptive look-ahead
+
+Operators can opt in to Kokoro look-ahead synthesis by setting
+`VOICELINK_LOOKAHEAD__ENABLED=true` before starting the server. It is disabled
+by default and is not used for Qwen3. The feature starts a second, isolated
+Kokoro model process, so plan for roughly another model's RAM or VRAM footprint
+and additional inference load.
+
+The speculative lane is deliberately bounded: at most 8 active streams, 48
+queued jobs, 60 seconds of estimated runway per stream, and 256 MiB of PCM cache
+with a 10-minute TTL by default. These limits can be changed with the matching
+`VOICELINK_LOOKAHEAD__...` settings in `server/config.py`. Numeric operational
+metrics are emitted as a fixed-size `lookahead_metrics` structured logging field
+at most once every 30 seconds by default; change the interval with
+`VOICELINK_LOOKAHEAD__METRICS_LOG_INTERVAL_SECONDS`.
+
+Look-ahead is always optional. Ambiguous readers, stale snapshots, voice or rate
+mismatches, exhausted limits, a stopped worker, and synthesis failures fall back
+to authoritative TTS. Exact canonical cached audio may still be reused when its
+full synthesis key matches, but structural pause prefixes and their timing
+headers are returned only for a uniquely correlated bridge-protocol-2 request.
+Logs and metrics contain only bounded counters, timings, sizes, and lengths; they
+do not contain book text or cache-key digests.
+
 <br>
 
 ## 🚀 Getting Started

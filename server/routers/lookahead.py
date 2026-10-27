@@ -56,6 +56,14 @@ def create_router(
     )
     router = APIRouter(prefix="/v1", tags=["Look-ahead"])
 
+    def record_snapshot_status(status: str) -> None:
+        if service is None:
+            return
+        try:
+            service.record_snapshot_status(status)
+        except Exception:
+            logger.error("look-ahead metrics update failed")
+
     @router.get("/capabilities")
     async def capabilities() -> dict[str, object]:
         body: dict[str, object] = {
@@ -79,18 +87,22 @@ def create_router(
     async def replace_snapshot(stream_id: str, request: Request) -> JSONResponse:
         parsed_stream_id = _parse_stream_id(stream_id)
         if parsed_stream_id is None:
+            record_snapshot_status("invalid")
             return _error(400, "invalid", "streamId must be a canonical lowercase UUID")
 
         raw_body = await request.body()
         if len(raw_body) > MAX_BODY_BYTES:
+            record_snapshot_status("over-limit")
             return _error(
                 413, "over-limit", "request body exceeds the protocol byte limit"
             )
         try:
             payload = json.loads(raw_body)
         except (UnicodeDecodeError, json.JSONDecodeError):
+            record_snapshot_status("invalid")
             return _error(400, "invalid", "request body must be valid JSON")
         if not isinstance(payload, dict):
+            record_snapshot_status("invalid")
             return _error(400, "invalid", "request body must be a JSON object")
         protocol = payload.get("protocol")
         if (
@@ -98,15 +110,18 @@ def create_router(
             and not isinstance(protocol, bool)
             and protocol != PROTOCOL
         ):
+            record_snapshot_status("unsupported-protocol")
             return _error(
                 426, "unsupported-protocol", f"protocol {protocol} is not supported"
             )
         try:
             snapshot = LookAheadSnapshot.model_validate(payload)
         except ValidationError:
+            record_snapshot_status("invalid")
             return _error(400, "invalid", "request body does not match protocol 1")
         limit_error = snapshot.limit_error()
         if limit_error is not None:
+            record_snapshot_status("over-limit")
             return _error(413, "over-limit", limit_error)
 
         # The digest is intentionally of the original bytes, not a normalized model.
@@ -120,6 +135,7 @@ def create_router(
                     "look-ahead clock failed; snapshot will remain an optional optimization"
                 )
         result = store.replace(parsed_stream_id, snapshot, len(raw_body), accepted_at)
+        record_snapshot_status(result.value)
         if result is ReplaceResult.ACCEPTED:
             if service is not None:
                 record = store.get(parsed_stream_id)

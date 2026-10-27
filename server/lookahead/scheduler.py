@@ -107,6 +107,7 @@ class LookAheadScheduler:
         self._waiters_by_association: dict[UUID, _Waiter] = {}
         self._runway_by_stream: dict[tuple[UUID, int], float] = {}
         self._failed = False
+        self._cancelled_jobs = 0
 
     @property
     def ready(self) -> bool:
@@ -119,6 +120,10 @@ class LookAheadScheduler:
     @property
     def scheduled_runway_seconds(self) -> float:
         return sum(self._runway_by_stream.values())
+
+    @property
+    def cancelled_jobs(self) -> int:
+        return self._cancelled_jobs
 
     def schedule_claim(self, claim: BoundClaim) -> None:
         """Schedule only a contiguous future prefix from a Kokoro claim."""
@@ -181,13 +186,13 @@ class LookAheadScheduler:
             return
         queued = self._jobs.pop(job_id, None)
         if queued is None:
-            self.worker.cancel(job_id)
+            self._cancel_worker(job_id)
             return
         key = queued.job.cache_key
         self._job_ids_by_key.pop(key, None)
         for waiter in tuple(self._waiters_by_key.pop(key, {}).values()):
             self._complete_waiter(waiter)
-        self.worker.cancel(job_id)
+        self._cancel_worker(job_id)
 
     def cancel_stream(self, stream_id: UUID) -> None:
         """Drop every stream association, including cached-only runway accounting."""
@@ -228,7 +233,7 @@ class LookAheadScheduler:
             failure = "cache-key-mismatch"
         if failure is not None:
             self._failed = True
-            self.worker.cancel(result.job_id)
+            self._cancel_worker(result.job_id)
             self._detach_all_jobs()
             return
         self.cache.put(expected_key, result.pcm, self._clock())
@@ -286,7 +291,7 @@ class LookAheadScheduler:
         worker_job_id = self._job_ids_by_key.pop(waiter.cache_key, None)
         if worker_job_id is not None:
             self._jobs.pop(worker_job_id, None)
-            self.worker.cancel(worker_job_id)
+            self._cancel_worker(worker_job_id)
 
     def _discard_stale_stream_generations(self, stream_id: UUID, generation: int) -> None:
         for stream_key in tuple(self._runway_by_stream):
@@ -302,7 +307,11 @@ class LookAheadScheduler:
             job_id = self._job_ids_by_key.pop(key, None)
             if job_id is not None:
                 self._jobs.pop(job_id, None)
-                self.worker.cancel(job_id)
+                self._cancel_worker(job_id)
+
+    def _cancel_worker(self, job_id: UUID) -> None:
+        self._cancelled_jobs = min((1 << 63) - 1, self._cancelled_jobs + 1)
+        self.worker.cancel(job_id)
 
     def _detach_all_jobs(self) -> None:
         for job_id in tuple(self._jobs):

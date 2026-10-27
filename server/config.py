@@ -110,6 +110,7 @@ class LookAheadSettings(BaseSettings):
     max_queued_jobs: int = Field(default=48, ge=1)
     max_runway_seconds: int = Field(default=60, ge=1)
     correlation_ttl_seconds: int = Field(default=5, ge=1)
+    metrics_log_interval_seconds: float = Field(default=30.0, ge=1.0, le=3600.0)
 
 
 class Settings(BaseSettings):

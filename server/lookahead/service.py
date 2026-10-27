@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass, field
+import logging
 from time import monotonic
 from threading import RLock
 from typing import Callable, Mapping, Protocol
@@ -31,6 +32,8 @@ _SAFE_OUTCOMES = {
     CorrelationOutcome.ADVANCED,
     CorrelationOutcome.RETRY,
 }
+_MAX_COUNTER = (1 << 63) - 1
+logger = logging.getLogger(__name__)
 
 
 class AuthoritativeRequest(Protocol):
@@ -91,6 +94,22 @@ class LookAheadService:
         self._clock = clock
         self._active: dict[UUID, AuthoritativeContext] = {}
         self._stream_start_by_request: OrderedDict[UUID, bool] = OrderedDict()
+        self._counters = {
+            "snapshot_accepted": 0,
+            "snapshot_duplicate": 0,
+            "snapshot_rejected": 0,
+            "snapshot_stale": 0,
+            "snapshot_revision_conflict": 0,
+            "snapshot_budget_exhausted": 0,
+            "snapshot_invalid": 0,
+            "snapshot_over_limit": 0,
+            "snapshot_unsupported_protocol": 0,
+            **{f"correlation_{outcome.value}": 0 for outcome in CorrelationOutcome},
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "prefix_bytes": 0,
+        }
+        self._last_metrics_log_at = float("-inf")
         self._lock = RLock()
 
     def now(self) -> float:
@@ -119,17 +138,23 @@ class LookAheadService:
         decision = self.registry.observe_request(observation)
         try:
             cache_key = synthesis_input_digest(request.text, config)
+            cached_speech = self.scheduler.cache.get(cache_key, now)
             context = AuthoritativeContext(
                 request_id=request_id,
                 observation=observation,
                 cache_key=cache_key,
-                cached_speech=self.scheduler.cache.get(cache_key, now),
+                cached_speech=cached_speech,
                 outcome=decision.outcome,
             )
             with self._lock:
+                self._increment(f"correlation_{decision.outcome.value}")
+                self._increment(
+                    "cache_hits" if cached_speech is not None else "cache_misses"
+                )
                 self._apply_decision(context, decision)
                 if request_id is not None:
                     self._active[request_id] = context
+            self._emit_metrics_if_due(now)
             return context
         except Exception:
             if request_id is not None:
@@ -145,6 +170,7 @@ class LookAheadService:
         decisions = self.registry.observe_snapshot(stream_id, record)
         with self._lock:
             for decision in decisions:
+                self._increment(f"correlation_{decision.outcome.value}")
                 if decision.claim is not None and decision.outcome in _SAFE_OUTCOMES:
                     self.scheduler.schedule_claim(decision.claim)
                 if decision.request_id is None:
@@ -157,6 +183,7 @@ class LookAheadService:
                         decision.request_id,
                         decision.outcome is CorrelationOutcome.BOUND,
                     )
+        self._emit_metrics_if_due(record.accepted_at)
         return decisions
 
     def finish_authoritative(
@@ -182,6 +209,8 @@ class LookAheadService:
             else:
                 self.scheduler.cache.put(context.cache_key, speech_pcm, now)
                 prefix = self._safe_prefix(context, elapsed)
+                with self._lock:
+                    self._increment("prefix_bytes", len(prefix))
                 if context.claim is None:
                     envelope = AudioEnvelope(b"", speech_pcm)
                 else:
@@ -196,6 +225,7 @@ class LookAheadService:
                         },
                     )
             context.envelope = envelope
+            self._emit_metrics_if_due(now)
             return envelope
         finally:
             if context.request_id is not None:
@@ -212,6 +242,55 @@ class LookAheadService:
                     context.claim = None
                     context.outcome = CorrelationOutcome.RELEASED
         self.scheduler.cancel_stream(stream_id)
+        self._emit_metrics_if_due(self._clock())
+
+    def record_snapshot_status(self, status: str) -> None:
+        """Count one bounded protocol result without retaining request data."""
+        normalized = status.replace("-", "_")
+        name = f"snapshot_{normalized}"
+        with self._lock:
+            if name in self._counters:
+                self._increment(name)
+            if status not in {"accepted", "duplicate"}:
+                self._increment("snapshot_rejected")
+        self._emit_metrics_if_due(self._clock())
+
+    def metrics_snapshot(self, *, now: float | None = None) -> dict[str, int | float]:
+        """Return a fixed-size, numeric-only operational snapshot."""
+        with self._lock:
+            counters = dict(self._counters)
+        cache_entries, cache_bytes = self.scheduler.cache.stats(
+            self._clock() if now is None else now
+        )
+        return {
+            **counters,
+            "speculative_rtf": round(self.scheduler.estimator.rtf, 6),
+            "runway_seconds": round(self.scheduler.scheduled_runway_seconds, 6),
+            "cancellations": self.scheduler.cancelled_jobs,
+            "cache_entries": cache_entries,
+            "cache_bytes": cache_bytes,
+            "queue_size": self.scheduler.queued_jobs,
+        }
+
+    def _increment(self, name: str, amount: int = 1) -> None:
+        self._counters[name] = min(_MAX_COUNTER, self._counters[name] + amount)
+
+    def _emit_metrics_if_due(self, now: float) -> None:
+        with self._lock:
+            if (
+                now - self._last_metrics_log_at
+                < self.settings.metrics_log_interval_seconds
+            ):
+                return
+            self._last_metrics_log_at = now
+        try:
+            logger.info(
+                "look-ahead metrics",
+                extra={"lookahead_metrics": self.metrics_snapshot(now=now)},
+            )
+        except Exception:
+            # Instrumentation must never change authoritative synthesis behavior.
+            pass
 
     def _config_for(self, request: AuthoritativeRequest) -> SynthesisConfig:
         version = (

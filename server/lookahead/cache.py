@@ -93,6 +93,12 @@ class PcmCache:
         self._total_bytes = 0
         self._lock = RLock()
 
+    def stats(self, now: float) -> tuple[int, int]:
+        """Return live entry and byte counts after applying TTL expiry."""
+        with self._lock:
+            self._remove_expired(now)
+            return len(self._entries), self._total_bytes
+
     def get(self, key: str, now: float) -> bytes | None:
         with self._lock:
             entry = self._entries.get(key)
