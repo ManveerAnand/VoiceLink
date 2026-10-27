@@ -137,6 +137,49 @@ void TestProportionalOffsetUsesSpeechAndAddsPrefix()
           "positions beyond the text span are clamped safely");
 }
 
+void TestAudioChunkWriteProgressConsumesEveryAcceptedByte()
+{
+    AudioChunkWriteProgress progress{0, 100};
+
+    Check(AdvanceAudioChunkWriteProgress(progress, 40) &&
+              progress.offset == 40 && progress.remaining == 60,
+          "short writes advance the pointer and retain the unaccepted suffix");
+    Check(AdvanceAudioChunkWriteProgress(progress, 60) &&
+              progress.offset == 100 && progress.remaining == 0,
+          "successive writes consume the complete chunk");
+}
+
+void TestAudioChunkWriteProgressRejectsNoProgressAndOverReporting()
+{
+    AudioChunkWriteProgress progress{25, 75};
+
+    Check(!AdvanceAudioChunkWriteProgress(progress, 0) &&
+              progress.offset == 25 && progress.remaining == 75,
+          "successful zero-byte writes are rejected without mutating progress");
+    Check(!AdvanceAudioChunkWriteProgress(progress, 76) &&
+              progress.offset == 25 && progress.remaining == 75,
+          "writes cannot report more bytes than remain");
+
+    const std::uint32_t maximum = (std::numeric_limits<std::uint32_t>::max)();
+    AudioChunkWriteProgress overflowing{maximum, 1};
+    Check(!AdvanceAudioChunkWriteProgress(overflowing, 1) &&
+              overflowing.offset == maximum && overflowing.remaining == 1,
+          "write progress rejects pointer-offset overflow");
+}
+
+void TestAudioChunkWriteProgressHandlesMaximumDwordChunk()
+{
+    const std::uint32_t maximum = (std::numeric_limits<std::uint32_t>::max)();
+    AudioChunkWriteProgress progress{0, maximum};
+
+    Check(AdvanceAudioChunkWriteProgress(progress, maximum - 1) &&
+              progress.offset == maximum - 1 && progress.remaining == 1,
+          "near-maximum chunk progress does not wrap");
+    Check(AdvanceAudioChunkWriteProgress(progress, 1) &&
+              progress.offset == maximum && progress.remaining == 0,
+          "maximum DWORD chunk completes without overflow");
+}
+
 void TestRequestIdReusedAcrossRetries()
 {
     const std::string engineId = GenerateUuid();
@@ -165,6 +208,9 @@ int main()
     TestMissingAndMalformedTimingFallback();
     TestInconsistentAndOverflowingTimingFallback();
     TestProportionalOffsetUsesSpeechAndAddsPrefix();
+    TestAudioChunkWriteProgressConsumesEveryAcceptedByte();
+    TestAudioChunkWriteProgressRejectsNoProgressAndOverReporting();
+    TestAudioChunkWriteProgressHandlesMaximumDwordChunk();
     TestRequestIdReusedAcrossRetries();
 
     if (failures == 0)

@@ -129,3 +129,19 @@ std::uint64_t CalculateProportionalAudioOffset(
         return maximum;
     return prefixBytes + proportional;
 }
+
+bool AdvanceAudioChunkWriteProgress(
+    AudioChunkWriteProgress &progress,
+    std::uint32_t bytesWritten)
+{
+    constexpr std::uint32_t maximum = (std::numeric_limits<std::uint32_t>::max)();
+    if (bytesWritten == 0 || bytesWritten > progress.remaining ||
+        bytesWritten > maximum - progress.offset)
+    {
+        return false;
+    }
+
+    progress.offset += bytesWritten;
+    progress.remaining -= bytesWritten;
+    return true;
+}

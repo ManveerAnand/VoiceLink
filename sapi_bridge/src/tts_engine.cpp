@@ -552,6 +552,32 @@ STDMETHODIMP VoiceLinkEngine::Speak(
     // legacy X-Audio-Length value with a zero prefix.
     AudioResponseMetadata audioMetadata;
 
+    const auto checkAbort = [&]() -> bool
+    {
+        // GetActions() clears the flags after reading, so handle every flag
+        // from a single call.
+        DWORD actions = pOutputSite->GetActions();
+
+        if (actions & SPVES_ABORT)
+        {
+            VLOG(L"Abort requested by SAPI");
+            return true;
+        }
+
+        if (actions & SPVES_SKIP)
+        {
+            SPVSKIPTYPE skipType;
+            long skipCount;
+            if (SUCCEEDED(pOutputSite->GetSkipInfo(&skipType, &skipCount)))
+                pOutputSite->CompleteSkip(skipCount);
+
+            VLOG(L"Skip requested by SAPI - aborting for repositioning");
+            return true;
+        }
+
+        return false;
+    };
+
     HRESULT hr = m_httpClient.StreamSynthesize(
         jsonBody.c_str(),
         static_cast<DWORD>(jsonBody.size()),
@@ -599,132 +625,127 @@ STDMETHODIMP VoiceLinkEngine::Speak(
             //   - Write() blocks if the buffer is full (backpressure)
             //
             // The &written output tells us how many bytes SAPI accepted.
-            // Usually it's all of them, but we should check.
-            ULONG written = 0;
-            HRESULT writeHr = pOutputSite->Write(writeData, size, &written);
-
-            if (FAILED(writeHr))
+            // A successful call may accept only part of the buffer, so keep
+            // writing the unaccepted suffix until the whole HTTP chunk has
+            // been delivered.
+            AudioChunkWriteProgress writeProgress{0, static_cast<std::uint32_t>(size)};
+            while (writeProgress.remaining > 0)
             {
-                VERR(L"ISpTTSEngineSite::Write failed: 0x%08lX", writeHr);
-                return writeHr;
-            }
+                ULONG written = 0;
+                HRESULT writeHr = pOutputSite->Write(
+                    writeData + writeProgress.offset,
+                    static_cast<ULONG>(writeProgress.remaining),
+                    &written);
 
-            constexpr std::uint64_t maximumAudioBytes =
-                (std::numeric_limits<std::uint64_t>::max)();
-            if (static_cast<std::uint64_t>(written) > maximumAudioBytes - totalBytesWritten)
-                totalBytesWritten = maximumAudioBytes;
-            else
-                totalBytesWritten += written;
-
-            // ---------------------------------------------------------------
-            // Use server-reported exact audio length if available.
-            //
-            // The server pre-generates all audio and sends the total byte
-            // count in the X-Audio-Length header. Using the EXACT total
-            // instead of our rough estimate gives perfect proportional
-            // word-boundary event timing — no highlight drift.
-            // ---------------------------------------------------------------
-            if (audioMetadata.totalBytes > 0 &&
-                estSpeechAudioBytes != audioMetadata.speechBytes)
-            {
-                VLOG(L"Updating estimated speech bytes: %llu -> %llu (from server)",
-                     static_cast<unsigned long long>(estSpeechAudioBytes),
-                     static_cast<unsigned long long>(audioMetadata.speechBytes));
-                estSpeechAudioBytes = audioMetadata.speechBytes;
-            }
-
-            // ---------------------------------------------------------------
-            // Fire SPEI_WORD_BOUNDARY (and SPEI_SENTENCE_BOUNDARY) events
-            // for words whose proportional audio offset we have now passed.
-            //
-            // Each word's audio offset is:
-            //   prefixBytes + (charPos / totalTextChars) * speechBytes
-            //
-            // With the server-reported total, this is exact. With the
-            // fallback estimate, it's approximate.
-            // ---------------------------------------------------------------
-            while (nextWordIdx < wordBoundaries.size())
-            {
-                const std::uint64_t estOffset = CalculateProportionalAudioOffset(
-                    estSpeechAudioBytes,
-                    audioMetadata.prefixBytes,
-                    wordBoundaries[nextWordIdx].charPos,
-                    totalTextChars);
-
-                if (estOffset <= totalBytesWritten)
+                if (FAILED(writeHr))
                 {
-                    // Fire sentence boundary before the first word of a sentence
-                    if (wordBoundaries[nextWordIdx].sentStart)
-                    {
-                        // Calculate sentence length (chars to next sentence or end)
-                        ULONG sentLen = 0;
-                        for (size_t si = nextWordIdx + 1; si < wordBoundaries.size(); si++)
-                        {
-                            if (wordBoundaries[si].sentStart)
-                            {
-                                sentLen = wordBoundaries[si].charPos - wordBoundaries[nextWordIdx].charPos;
-                                break;
-                            }
-                        }
-                        if (sentLen == 0 && totalTextChars > wordBoundaries[nextWordIdx].charPos)
-                            sentLen = totalTextChars - wordBoundaries[nextWordIdx].charPos;
+                    VERR(L"ISpTTSEngineSite::Write failed: 0x%08lX", writeHr);
+                    return writeHr;
+                }
 
-                        SPEVENT sentEvt = {};
-                        sentEvt.eEventId = SPEI_SENTENCE_BOUNDARY;
-                        sentEvt.elParamType = SPET_LPARAM_IS_UNDEFINED;
-                        sentEvt.ullAudioStreamOffset = estOffset;
-                        sentEvt.wParam = static_cast<WPARAM>(sentLen);
-                        sentEvt.lParam = static_cast<LPARAM>(wordBoundaries[nextWordIdx].charPos);
-                        pOutputSite->AddEvents(&sentEvt, 1);
-                    }
+                if (!AdvanceAudioChunkWriteProgress(
+                        writeProgress,
+                        static_cast<std::uint32_t>(written)))
+                {
+                    VERR(L"ISpTTSEngineSite::Write made invalid progress: "
+                         L"written=%lu, remaining=%lu",
+                         written,
+                         static_cast<unsigned long>(writeProgress.remaining));
+                    return E_FAIL;
+                }
 
-                    SPEVENT evt = {};
-                    evt.eEventId = SPEI_WORD_BOUNDARY;
-                    evt.elParamType = SPET_LPARAM_IS_UNDEFINED;
-                    evt.ullAudioStreamOffset = estOffset;
-                    evt.wParam = static_cast<WPARAM>(wordBoundaries[nextWordIdx].charLen);
-                    evt.lParam = static_cast<LPARAM>(wordBoundaries[nextWordIdx].charPos);
-                    pOutputSite->AddEvents(&evt, 1);
-                    nextWordIdx++;
+                constexpr std::uint64_t maximumAudioBytes =
+                    (std::numeric_limits<std::uint64_t>::max)();
+                if (static_cast<std::uint64_t>(written) >
+                    maximumAudioBytes - totalBytesWritten)
+                {
+                    totalBytesWritten = maximumAudioBytes;
                 }
                 else
-                    break;
+                {
+                    totalBytesWritten += written;
+                }
+
+                // -----------------------------------------------------------
+                // Use server-reported exact audio length if available.
+                // -----------------------------------------------------------
+                if (audioMetadata.totalBytes > 0 &&
+                    estSpeechAudioBytes != audioMetadata.speechBytes)
+                {
+                    VLOG(L"Updating estimated speech bytes: %llu -> %llu (from server)",
+                         static_cast<unsigned long long>(estSpeechAudioBytes),
+                         static_cast<unsigned long long>(audioMetadata.speechBytes));
+                    estSpeechAudioBytes = audioMetadata.speechBytes;
+                }
+
+                // Fire events after every accepted portion of a short write,
+                // so thresholds reflect bytes SAPI actually received.
+                while (nextWordIdx < wordBoundaries.size())
+                {
+                    const std::uint64_t estOffset = CalculateProportionalAudioOffset(
+                        estSpeechAudioBytes,
+                        audioMetadata.prefixBytes,
+                        wordBoundaries[nextWordIdx].charPos,
+                        totalTextChars);
+
+                    if (estOffset <= totalBytesWritten)
+                    {
+                        // Fire sentence boundary before the first word of a sentence
+                        if (wordBoundaries[nextWordIdx].sentStart)
+                        {
+                            // Calculate sentence length (chars to next sentence or end)
+                            ULONG sentLen = 0;
+                            for (size_t si = nextWordIdx + 1; si < wordBoundaries.size(); si++)
+                            {
+                                if (wordBoundaries[si].sentStart)
+                                {
+                                    sentLen = wordBoundaries[si].charPos -
+                                              wordBoundaries[nextWordIdx].charPos;
+                                    break;
+                                }
+                            }
+                            if (sentLen == 0 &&
+                                totalTextChars > wordBoundaries[nextWordIdx].charPos)
+                            {
+                                sentLen = totalTextChars -
+                                          wordBoundaries[nextWordIdx].charPos;
+                            }
+
+                            SPEVENT sentEvt = {};
+                            sentEvt.eEventId = SPEI_SENTENCE_BOUNDARY;
+                            sentEvt.elParamType = SPET_LPARAM_IS_UNDEFINED;
+                            sentEvt.ullAudioStreamOffset = estOffset;
+                            sentEvt.wParam = static_cast<WPARAM>(sentLen);
+                            sentEvt.lParam = static_cast<LPARAM>(
+                                wordBoundaries[nextWordIdx].charPos);
+                            pOutputSite->AddEvents(&sentEvt, 1);
+                        }
+
+                        SPEVENT evt = {};
+                        evt.eEventId = SPEI_WORD_BOUNDARY;
+                        evt.elParamType = SPET_LPARAM_IS_UNDEFINED;
+                        evt.ullAudioStreamOffset = estOffset;
+                        evt.wParam = static_cast<WPARAM>(
+                            wordBoundaries[nextWordIdx].charLen);
+                        evt.lParam = static_cast<LPARAM>(
+                            wordBoundaries[nextWordIdx].charPos);
+                        pOutputSite->AddEvents(&evt, 1);
+                        nextWordIdx++;
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+
+                if (writeProgress.remaining > 0 && checkAbort())
+                    return E_ABORT;
             }
 
             return S_OK;
         },
 
-        // checkAbort: called between chunks to see if we should stop
-        [&]() -> bool
-        {
-            // GetActions() returns a bitmask of pending actions.
-            // IMPORTANT: GetActions() CLEARS the flags after reading,
-            // so we must handle all flags in a single call.
-            DWORD actions = pOutputSite->GetActions();
-
-            if (actions & SPVES_ABORT)
-            {
-                VLOG(L"Abort requested by SAPI");
-                return true;
-            }
-
-            // SPVES_SKIP: Edge Read Aloud sends this when the user clicks
-            // on a different position in the text. We acknowledge the skip
-            // and abort so Edge can start a new Speak() from that position.
-            if (actions & SPVES_SKIP)
-            {
-                SPVSKIPTYPE skipType;
-                long skipCount;
-                if (SUCCEEDED(pOutputSite->GetSkipInfo(&skipType, &skipCount)))
-                {
-                    pOutputSite->CompleteSkip(skipCount);
-                }
-                VLOG(L"Skip requested by SAPI — aborting for repositioning");
-                return true;
-            }
-
-            return false;
-        },
+        checkAbort,
         &audioMetadata,
         endpoint);
 

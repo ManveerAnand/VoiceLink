@@ -18,6 +18,12 @@ struct AudioResponseMetadata
     std::uint64_t speechBytes = 0;
 };
 
+struct AudioChunkWriteProgress
+{
+    std::uint32_t offset = 0;
+    std::uint32_t remaining = 0;
+};
+
 std::string GenerateUuid();
 RequestMetadata CreateRequestMetadata(const std::string &engineInstanceId);
 std::wstring BuildProtocolRequestHeaders(const RequestMetadata &metadata);
@@ -32,3 +38,6 @@ std::uint64_t CalculateProportionalAudioOffset(
     std::uint64_t prefixBytes,
     std::uint32_t position,
     std::uint32_t span);
+bool AdvanceAudioChunkWriteProgress(
+    AudioChunkWriteProgress &progress,
+    std::uint32_t bytesWritten);
