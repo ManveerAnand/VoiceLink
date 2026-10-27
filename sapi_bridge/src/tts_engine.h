@@ -164,6 +164,7 @@ private:
     LONG m_refCount;            // COM reference count (InterlockedIncrement/Decrement)
     ISpObjectToken *m_pToken;   // Our voice token (AddRef'd, released in destructor)
     TtsHttpClient m_httpClient; // HTTP connection to the inference server
+    std::string m_engineInstanceId; // UUID retained for this COM object's lifetime
     std::string m_voiceId;      // Voice ID from token ("af_heart", "qwen3_Chelsie", etc.)
     std::string m_model;        // Model backend: "kokoro" (default) or "qwen3"
     INTERNET_PORT m_serverPort; // Server port from token (default: 7860)

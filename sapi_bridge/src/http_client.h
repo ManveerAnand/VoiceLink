@@ -35,6 +35,8 @@
 #include <functional>
 #include <string>
 
+#include "protocol.h"
+
 // Forward declaration — defined in winhttp.h but just in case
 #ifndef HINTERNET
 typedef LPVOID HINTERNET;
@@ -108,9 +110,10 @@ public:
     HRESULT StreamSynthesize(
         const char *jsonBody,
         DWORD jsonBodyLen,
+        const RequestMetadata &requestMetadata,
         const std::function<HRESULT(const BYTE *data, DWORD size)> &onChunk,
         const std::function<bool()> &checkAbort,
-        ULONGLONG *pTotalAudioBytes = nullptr,
+        AudioResponseMetadata *pAudioMetadata = nullptr,
         const wchar_t *endpoint = L"/v1/tts");
 
     // -----------------------------------------------------------------------
@@ -123,9 +126,10 @@ private:
     HRESULT StreamSynthesizeOnce(
         const char *jsonBody,
         DWORD jsonBodyLen,
+        const RequestMetadata &requestMetadata,
         const std::function<HRESULT(const BYTE *data, DWORD size)> &onChunk,
         const std::function<bool()> &checkAbort,
-        ULONGLONG *pTotalAudioBytes,
+        AudioResponseMetadata *pAudioMetadata,
         const wchar_t *endpoint);
 
     HINTERNET m_hSession = nullptr; // WinHTTP session (like a browser instance)

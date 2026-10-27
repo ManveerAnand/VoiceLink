@@ -45,6 +45,26 @@ static constexpr DWORD CONNECT_TIMEOUT_MS = 2000;   // TCP connect timeout
 static constexpr DWORD SEND_TIMEOUT_MS = 5000;      // Time to send request
 static constexpr DWORD RECEIVE_TIMEOUT_MS = 120000; // Time waiting for response headers (Qwen3 can take 60s+)
 
+namespace
+{
+std::wstring QueryStringHeader(HINTERNET request, const wchar_t *name)
+{
+    wchar_t value[64] = {};
+    DWORD valueSize = sizeof(value);
+    if (!WinHttpQueryHeaders(
+            request,
+            WINHTTP_QUERY_CUSTOM,
+            name,
+            value,
+            &valueSize,
+            WINHTTP_NO_HEADER_INDEX))
+    {
+        return {};
+    }
+    return value;
+}
+} // namespace
+
 // ============================================================================
 // TtsHttpClient Implementation
 // ============================================================================
@@ -138,9 +158,10 @@ void TtsHttpClient::Close()
 HRESULT TtsHttpClient::StreamSynthesize(
     const char *jsonBody,
     DWORD jsonBodyLen,
+    const RequestMetadata &requestMetadata,
     const std::function<HRESULT(const BYTE *data, DWORD size)> &onChunk,
     const std::function<bool()> &checkAbort,
-    ULONGLONG *pTotalAudioBytes,
+    AudioResponseMetadata *pAudioMetadata,
     const wchar_t *endpoint)
 {
     if (!m_hConnect)
@@ -148,6 +169,9 @@ HRESULT TtsHttpClient::StreamSynthesize(
         VERR(L"StreamSynthesize called but client not initialized");
         return E_FAIL;
     }
+
+    if (pAudioMetadata)
+        *pAudioMetadata = {};
 
     // -----------------------------------------------------------------------
     // Retry loop: if the server is down or starting up, retry a few times
@@ -173,8 +197,8 @@ HRESULT TtsHttpClient::StreamSynthesize(
             }
         }
 
-        lastHr = StreamSynthesizeOnce(jsonBody, jsonBodyLen, onChunk,
-                                      checkAbort, pTotalAudioBytes, endpoint);
+        lastHr = StreamSynthesizeOnce(jsonBody, jsonBodyLen, requestMetadata,
+                                      onChunk, checkAbort, pAudioMetadata, endpoint);
 
         // Success or user abort: stop retrying
         if (SUCCEEDED(lastHr) || lastHr == E_ABORT)
@@ -197,11 +221,15 @@ HRESULT TtsHttpClient::StreamSynthesize(
 HRESULT TtsHttpClient::StreamSynthesizeOnce(
     const char *jsonBody,
     DWORD jsonBodyLen,
+    const RequestMetadata &requestMetadata,
     const std::function<HRESULT(const BYTE *data, DWORD size)> &onChunk,
     const std::function<bool()> &checkAbort,
-    ULONGLONG *pTotalAudioBytes,
+    AudioResponseMetadata *pAudioMetadata,
     const wchar_t *endpoint)
 {
+
+    if (pAudioMetadata)
+        *pAudioMetadata = {};
 
     // -----------------------------------------------------------------------
     // Step 1: Create a POST request to /v1/tts
@@ -234,11 +262,12 @@ HRESULT TtsHttpClient::StreamSynthesizeOnce(
     // Content-Type tells the server we're sending JSON.
     // The server uses this to parse the request body correctly.
     // -----------------------------------------------------------------------
-    const wchar_t *headers = L"Content-Type: application/json\r\n";
+    std::wstring headers = L"Content-Type: application/json\r\n";
+    headers += BuildProtocolRequestHeaders(requestMetadata);
     BOOL headerOk = WinHttpAddRequestHeaders(
         hRequest,
-        headers,
-        static_cast<DWORD>(wcslen(headers)),
+        headers.c_str(),
+        static_cast<DWORD>(headers.size()),
         WINHTTP_ADDREQ_FLAG_ADD);
 
     if (!headerOk)
@@ -316,29 +345,26 @@ HRESULT TtsHttpClient::StreamSynthesizeOnce(
         WINHTTP_NO_HEADER_INDEX);
 
     // -----------------------------------------------------------------------
-    // Step 5b: Read X-Audio-Length header (if present)
+    // Step 5b: Read response audio timing headers (if present)
     //
     // The server pre-generates all audio and reports the exact total byte
     // count in this header. The TTS engine uses it for perfectly
     // proportional SPEI_WORD_BOUNDARY event offsets, so Edge Read Aloud
     // text highlighting stays in sync with the audio.
     // -----------------------------------------------------------------------
-    if (pTotalAudioBytes)
+    if (pAudioMetadata)
     {
-        *pTotalAudioBytes = 0;
-        wchar_t headerBuf[64] = {};
-        DWORD headerBufSize = sizeof(headerBuf);
-        BOOL hdrOk = WinHttpQueryHeaders(
-            hRequest,
-            WINHTTP_QUERY_CUSTOM,
-            L"X-Audio-Length",
-            headerBuf,
-            &headerBufSize,
-            WINHTTP_NO_HEADER_INDEX);
-        if (hdrOk && headerBufSize > 0)
+        const std::wstring totalBytes = QueryStringHeader(hRequest, L"X-Audio-Length");
+        const std::wstring prefixBytes = QueryStringHeader(hRequest, L"X-Audio-Prefix-Bytes");
+        const std::wstring speechBytes = QueryStringHeader(hRequest, L"X-Speech-Audio-Length");
+        *pAudioMetadata = ParseAudioResponseMetadata(totalBytes, prefixBytes, speechBytes);
+
+        if (pAudioMetadata->totalBytes > 0)
         {
-            *pTotalAudioBytes = static_cast<ULONGLONG>(_wtoi64(headerBuf));
-            VLOG(L"Server reported X-Audio-Length: %llu bytes", *pTotalAudioBytes);
+            VLOG(L"Server reported audio bytes: total=%llu, prefix=%llu, speech=%llu",
+                 static_cast<unsigned long long>(pAudioMetadata->totalBytes),
+                 static_cast<unsigned long long>(pAudioMetadata->prefixBytes),
+                 static_cast<unsigned long long>(pAudioMetadata->speechBytes));
         }
     }
 
