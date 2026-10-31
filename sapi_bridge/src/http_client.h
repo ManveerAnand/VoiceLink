@@ -130,6 +130,7 @@ private:
         const std::function<HRESULT(const BYTE *data, DWORD size)> &onChunk,
         const std::function<bool()> &checkAbort,
         AudioResponseMetadata *pAudioMetadata,
+        bool *responseBodyReceived,
         const wchar_t *endpoint);
 
     HINTERNET m_hSession = nullptr; // WinHTTP session (like a browser instance)

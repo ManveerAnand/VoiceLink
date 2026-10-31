@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+import logging
 from threading import Event
 from types import SimpleNamespace
 from typing import AsyncIterator
@@ -160,7 +161,11 @@ def snapshot(
                     "lastInBlock": offset == len(texts) - 1,
                 },
                 "boundaryBefore": chosen_boundaries[offset],
-                "boundaryAfter": chosen_boundaries[offset],
+                "boundaryAfter": (
+                    chosen_boundaries[offset + 1]
+                    if offset + 1 < len(chosen_boundaries)
+                    else chosen_boundaries[offset]
+                ),
             }
             for offset, text in enumerate(texts)
         ],
@@ -389,6 +394,38 @@ async def test_transport_retry_does_not_advance_bound_sequence_twice() -> None:
         assert stack.registry.next_expected_sequence(engine) == 12
         assert [call[0] for call in stack.model.calls] == ["first", "second"]
         assert "X-Audio-Prefix-Bytes" in second.headers
+
+
+@pytest.mark.asyncio
+async def test_overlapping_same_request_id_synthesizes_once_and_mismatched_payloads_do_not_join() -> None:
+    clock = ManualClock()
+    model = BlockingModel(clock)
+    engine, request_id = uuid4(), uuid4()
+    headers = bridge_headers(engine, request_id)
+    async with running_stack(model=model) as stack:
+        first = asyncio.create_task(post_tts(stack, "same", headers=headers))
+        assert await asyncio.to_thread(model.started.wait, 1.0)
+        same_retry = asyncio.create_task(post_tts(stack, "same", headers=headers))
+        await asyncio.sleep(0.01)
+        try:
+            assert [call[0] for call in model.calls] == ["same"]
+        finally:
+            model.release.set()
+        first_response, retry_response = await asyncio.gather(first, same_retry)
+
+    assert first_response.content == retry_response.content == pcm_for("same")
+
+    mismatched_model = BlockingModel(ManualClock())
+    async with running_stack(model=mismatched_model) as stack:
+        first = asyncio.create_task(post_tts(stack, "first", headers=headers))
+        assert await asyncio.to_thread(mismatched_model.started.wait, 1.0)
+        mismatch = asyncio.create_task(post_tts(stack, "second", headers=headers))
+        await asyncio.sleep(0.01)
+        try:
+            assert [call[0] for call in mismatched_model.calls] == ["first", "second"]
+        finally:
+            mismatched_model.release.set()
+        await asyncio.gather(first, mismatch)
 
 
 @pytest.mark.asyncio
@@ -655,6 +692,14 @@ async def test_protocol_worker_cache_and_tts_logs_never_contain_raw_secret() -> 
     model._pipeline = fake_pipeline
     model.clock = clock
     messages: list[str] = []
+    standard_messages: list[str] = []
+
+    class CaptureHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            standard_messages.append(self.format(record))
+
+    standard_handler = CaptureHandler()
+    logging.getLogger().addHandler(standard_handler)
     sink = logger.add(messages.append, level="DEBUG", format="{message}")
     try:
         async with running_stack(model=model) as stack:
@@ -663,5 +708,6 @@ async def test_protocol_worker_cache_and_tts_logs_never_contain_raw_secret() -> 
             assert response.status_code == 200
     finally:
         logger.remove(sink)
+        logging.getLogger().removeHandler(standard_handler)
 
-    assert secret not in "".join(messages)
+    assert secret not in "".join(messages + standard_messages)

@@ -18,7 +18,11 @@ from server.lookahead.protocol import (
     MAX_UNIT_CHARACTERS,
     MAX_UNITS,
     PROTOCOL,
+    LookAheadCapabilities,
+    LookAheadCapabilitiesResponse,
     LookAheadSnapshot,
+    ProtocolError,
+    ProtocolErrorBody,
 )
 from server.lookahead.store import ReplaceResult, SnapshotStore
 from server.lookahead.service import LookAheadService
@@ -27,9 +31,37 @@ from server.lookahead.service import LookAheadService
 logger = logging.getLogger(__name__)
 
 
+class _BodyTooLarge(Exception):
+    pass
+
+
+async def _read_bounded_body(request: Request) -> bytes:
+    """Read no more than the protocol limit plus one detection byte."""
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > MAX_BODY_BYTES:
+                raise _BodyTooLarge
+        except ValueError:
+            pass
+
+    body = bytearray()
+    async for chunk in request.stream():
+        remaining = MAX_BODY_BYTES + 1 - len(body)
+        if remaining <= 0:
+            raise _BodyTooLarge
+        body.extend(chunk[:remaining])
+        if len(chunk) > remaining or len(body) > MAX_BODY_BYTES:
+            raise _BodyTooLarge
+    return bytes(body)
+
+
 def _error(status_code: int, code: str, message: str) -> JSONResponse:
     return JSONResponse(
-        status_code=status_code, content={"error": {"code": code, "message": message}}
+        status_code=status_code,
+        content=ProtocolErrorBody(
+            error=ProtocolError(code=code, message=message)
+        ).model_dump(),
     )
 
 
@@ -53,6 +85,7 @@ def create_router(
     store.configure_budgets(
         max_active_streams=settings.max_active_streams,
         max_global_characters=settings.max_active_streams * MAX_CHARACTERS,
+        stream_ttl_seconds=settings.stream_ttl_seconds,
     )
     router = APIRouter(prefix="/v1", tags=["Look-ahead"])
 
@@ -64,34 +97,46 @@ def create_router(
         except Exception:
             logger.error("look-ahead metrics update failed")
 
-    @router.get("/capabilities")
-    async def capabilities() -> dict[str, object]:
-        body: dict[str, object] = {
-            "structuredPauses": True,
-            "bridgeProtocolRequiredForPauses": 2,
-        }
+    @router.get(
+        "/capabilities",
+        response_model=LookAheadCapabilitiesResponse,
+        response_model_exclude_none=True,
+    )
+    async def capabilities() -> LookAheadCapabilitiesResponse:
+        lookahead: LookAheadCapabilities | None = None
         if settings.enabled and worker_ready():
-            body = {
-                "lookahead": {
-                    "protocols": [PROTOCOL],
-                    "maxUnits": MAX_UNITS,
-                    "maxCharacters": MAX_CHARACTERS,
-                    "maxUnitCharacters": MAX_UNIT_CHARACTERS,
-                    "maxBodyBytes": MAX_BODY_BYTES,
-                },
-                **body,
-            }
-        return body
+            lookahead = LookAheadCapabilities(
+                protocols=[PROTOCOL],
+                maxUnits=MAX_UNITS,
+                maxCharacters=MAX_CHARACTERS,
+                maxUnitCharacters=MAX_UNIT_CHARACTERS,
+                maxBodyBytes=MAX_BODY_BYTES,
+            )
+        return LookAheadCapabilitiesResponse(
+            lookahead=lookahead,
+            structuredPauses=True,
+            bridgeProtocolRequiredForPauses=2,
+        )
 
-    @router.put("/tts/lookahead/{stream_id}")
+    @router.put(
+        "/tts/lookahead/{stream_id}",
+        responses={
+            400: {"model": ProtocolErrorBody},
+            409: {"model": ProtocolErrorBody},
+            413: {"model": ProtocolErrorBody},
+            426: {"model": ProtocolErrorBody},
+            429: {"model": ProtocolErrorBody},
+        },
+    )
     async def replace_snapshot(stream_id: str, request: Request) -> JSONResponse:
         parsed_stream_id = _parse_stream_id(stream_id)
         if parsed_stream_id is None:
             record_snapshot_status("invalid")
             return _error(400, "invalid", "streamId must be a canonical lowercase UUID")
 
-        raw_body = await request.body()
-        if len(raw_body) > MAX_BODY_BYTES:
+        try:
+            raw_body = await _read_bounded_body(request)
+        except _BodyTooLarge:
             record_snapshot_status("over-limit")
             return _error(
                 413, "over-limit", "request body exceeds the protocol byte limit"

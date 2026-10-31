@@ -41,3 +41,4 @@ std::uint64_t CalculateProportionalAudioOffset(
 bool AdvanceAudioChunkWriteProgress(
     AudioChunkWriteProgress &progress,
     std::uint32_t bytesWritten);
+bool ShouldRetrySynthesisAttempt(bool responseBodyReceived);

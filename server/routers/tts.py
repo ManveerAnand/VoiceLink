@@ -195,11 +195,18 @@ async def synthesize(http_request: Request, request: TTSRequest):
     cached_speech = getattr(context, "cached_speech", None)
     authoritative_synthesis_ran = cached_speech is None
     try:
-        chunks = (
-            [cached_speech]
-            if cached_speech is not None
-            else await asyncio.to_thread(_run_synthesis)
-        )
+        if cached_speech is not None:
+            chunks = [cached_speech]
+        elif service is not None and callable(
+            singleflight := getattr(service, "run_authoritative_singleflight", None)
+        ):
+            chunks = await singleflight(
+                http_request.headers,
+                request,
+                lambda: asyncio.to_thread(_run_synthesis),
+            )
+        else:
+            chunks = await asyncio.to_thread(_run_synthesis)
     except Exception as error:
         chunks = []
         synthesis_error = error

@@ -3,7 +3,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from server.lookahead.cache import PcmCache, SynthesisConfig, synthesis_input_digest
-from server.lookahead.protocol import LookAheadSnapshot
+from server.lookahead.protocol import MAX_CHARACTERS, LookAheadSnapshot
 from server.lookahead.store import ReplaceResult, SnapshotStore
 
 
@@ -83,6 +83,49 @@ def test_pcm_cache_expires_entries_at_ttl() -> None:
 
     assert cache.get("speech", now=12.9) == b"pcm"
     assert cache.get("speech", now=13) is None
+
+
+def test_snapshot_store_expires_unclaimed_stream_before_enforcing_budget() -> None:
+    cancelled: list[UUID] = []
+    store = SnapshotStore(on_cancel_job=cancelled.append)
+    store.configure_budgets(
+        max_active_streams=1,
+        max_global_characters=MAX_CHARACTERS,
+        stream_ttl_seconds=30,
+    )
+    expired_stream, replacement_stream = uuid4(), uuid4()
+    job_id = uuid4()
+
+    assert store.replace(
+        expired_stream, lookahead_snapshot(1), raw_body_bytes=1, now=0
+    ) is ReplaceResult.ACCEPTED
+    assert store.track_pending_job(expired_stream, generation=1, job_id=job_id)
+
+    assert store.replace(
+        replacement_stream, lookahead_snapshot(1), raw_body_bytes=1, now=30
+    ) is ReplaceResult.ACCEPTED
+    assert store.get(expired_stream) is None
+    assert cancelled == [job_id]
+
+
+def test_snapshot_expiry_notifies_job_cancellation_even_when_replay_is_duplicate() -> None:
+    cancelled: list[UUID] = []
+    store = SnapshotStore(on_cancel_job=cancelled.append)
+    store.configure_budgets(
+        max_active_streams=2,
+        max_global_characters=MAX_CHARACTERS * 2,
+        stream_ttl_seconds=30,
+    )
+    expired_stream, replayed_stream = uuid4(), uuid4()
+    job_id = uuid4()
+    expired = lookahead_snapshot(1)
+    replayed = lookahead_snapshot(1)
+    assert store.replace(expired_stream, expired, raw_body_bytes=1, now=0) is ReplaceResult.ACCEPTED
+    assert store.track_pending_job(expired_stream, generation=1, job_id=job_id)
+    assert store.replace(replayed_stream, replayed, raw_body_bytes=1, now=1) is ReplaceResult.ACCEPTED
+
+    assert store.replace(replayed_stream, replayed, raw_body_bytes=1, now=30) is ReplaceResult.DUPLICATE
+    assert cancelled == [job_id]
 
 
 def test_oversized_pcm_does_not_evict_existing_entries() -> None:

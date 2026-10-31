@@ -60,6 +60,7 @@ def _lower_priority() -> None:
 def _worker_main(
     model_settings: dict[str, str],
     jobs: Queue,
+    controls: Queue,
     results: Queue,
     status: Queue,
 ) -> None:
@@ -78,16 +79,37 @@ def _worker_main(
         return
     status.put(("ready", None))
     cancelled: set[UUID] = set()
+
+    def drain_controls() -> bool:
+        while True:
+            try:
+                control = controls.get_nowait()
+            except Empty:
+                return False
+            if isinstance(control, _Stop):
+                return True
+            if isinstance(control, _Cancel):
+                cancelled.add(control.job_id)
+
     try:
         while True:
-            item = jobs.get()
+            if drain_controls():
+                return
+            try:
+                item = jobs.get(timeout=0.1)
+            except Empty:
+                continue
             if isinstance(item, _Stop):
                 return
-            if isinstance(item, _Cancel):
-                cancelled.add(item.job_id)
+            if not isinstance(item, SynthesisJob):
                 continue
-            if not isinstance(item, SynthesisJob) or item.id in cancelled:
+            if item.id in cancelled:
+                cancelled.discard(item.id)
                 continue
+            try:
+                status.put_nowait(("active", item.id))
+            except Full:
+                pass
             started = monotonic()
             try:
                 pcm = b"".join(model.synthesize(item.text, voice=item.voice, speed=item.speed))
@@ -110,6 +132,12 @@ def _worker_main(
                     )
                 except Full:
                     # A full result queue is reaped by the parent job deadline.
+                    pass
+            finally:
+                cancelled.discard(item.id)
+                try:
+                    status.put_nowait(("idle", item.id))
+                except Full:
                     pass
     finally:
         try:
@@ -138,12 +166,15 @@ class SpeculativeWorker:
         self._entrypoint = entrypoint
         self._process = None
         self._jobs = None
+        self._controls = None
         self._results = None
         self._status = None
         self._ready = False
+        self._active_job_ids: set[UUID] = set()
 
     @property
     def ready(self) -> bool:
+        self._drain_status()
         if self._ready and self._process is not None and not self._process.is_alive():
             self._ready = False
         return self._ready
@@ -154,11 +185,12 @@ class SpeculativeWorker:
         self.stop()
         context = get_context("spawn")
         self._jobs = context.Queue(maxsize=self._max_jobs)
+        self._controls = context.Queue(maxsize=self._max_jobs)
         self._results = context.Queue(maxsize=self._max_jobs)
         self._status = context.Queue(maxsize=1)
         self._process = context.Process(
             target=self._entrypoint,
-            args=(self._model_settings, self._jobs, self._results, self._status),
+            args=(self._model_settings, self._jobs, self._controls, self._results, self._status),
             daemon=True,
         )
         self._process.start()
@@ -182,15 +214,19 @@ class SpeculativeWorker:
             return False
 
     def cancel(self, job_id: UUID) -> None:
-        if self._jobs is None or not self.ready:
+        if self._controls is None or not self.ready:
+            return
+        if job_id in self._active_job_ids:
+            self._restart_after_active_cancellation()
             return
         try:
-            self._jobs.put_nowait(_Cancel(job_id))
+            self._controls.put_nowait(_Cancel(job_id))
         except Full:
             # The scheduler has already detached this job; cancellation is best effort.
             return
 
     def drain_results(self) -> list[SpeculativeResult]:
+        self._drain_status()
         if self._results is None:
             return []
         drained: list[SpeculativeResult] = []
@@ -202,18 +238,48 @@ class SpeculativeWorker:
             if isinstance(item, SpeculativeResult):
                 drained.append(item)
 
+    def _drain_status(self) -> None:
+        if self._status is None:
+            return
+        while True:
+            try:
+                state, job_id = self._status.get_nowait()
+            except Empty:
+                return
+            if state == "active" and isinstance(job_id, UUID):
+                self._active_job_ids.add(job_id)
+            elif state == "idle" and isinstance(job_id, UUID):
+                self._active_job_ids.discard(job_id)
+
+    def _restart_after_active_cancellation(self) -> None:
+        """A blocking backend cannot honor active cancellation, so replace only its child."""
+        self.stop()
+        self.start()
+
     def stop(self) -> None:
         process = self._process
         jobs = self._jobs
+        controls = self._controls
+        results = self._results
+        status = self._status
         self._ready = False
         if process is not None:
-            if process.is_alive() and jobs is not None:
+            if process.is_alive() and controls is not None:
                 try:
-                    jobs.put_nowait(_Stop())
+                    controls.put_nowait(_Stop())
                 except Full:
                     pass
             process.join(self._shutdown_timeout)
             if process.is_alive():
                 process.terminate()
                 process.join(self._shutdown_timeout)
-        self._process = self._jobs = self._results = self._status = None
+        for queue in (jobs, controls, results, status):
+            if queue is None:
+                continue
+            try:
+                queue.close()
+                queue.join_thread()
+            except Exception:
+                pass
+        self._active_job_ids.clear()
+        self._process = self._jobs = self._controls = self._results = self._status = None

@@ -1,5 +1,6 @@
 import pytest
 
+import server.lookahead.prosody as prosody
 from server.lookahead.prosody import AudioFormat, ProsodyPolicy, prefix_silence_pcm
 from server.lookahead.protocol import BoundaryKind
 
@@ -131,4 +132,14 @@ def test_audio_format_requires_positive_rate_and_channels_and_signed_16_bit_samp
     with pytest.raises(ValueError):
         AudioFormat(sample_rate=1_000, channels=0)
     with pytest.raises(ValueError):
-        AudioFormat(sample_rate=1_000, channels=1, sample_width=1)
+        AudioFormat(sample_rate=1_000, channels=1, sample_width_bytes=1)
+
+
+def test_audio_format_has_one_public_width_field_and_no_class_aliases() -> None:
+    audio_format = AudioFormat(sample_rate=24_000, channels=1, sample_width_bytes=2)
+
+    assert audio_format.sample_width_bytes == 2
+    assert not hasattr(audio_format, "sample_width")
+    assert not hasattr(audio_format, "bytes_per_sample")
+    assert not hasattr(prosody, "PcmAudioFormat")
+    assert not hasattr(prosody, "PcmFormat")

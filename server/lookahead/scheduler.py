@@ -105,7 +105,7 @@ class LookAheadScheduler:
         self._job_ids_by_key: dict[str, UUID] = {}
         self._waiters_by_key: dict[str, dict[tuple[UUID, int, int], _Waiter]] = {}
         self._waiters_by_association: dict[UUID, _Waiter] = {}
-        self._runway_by_stream: dict[tuple[UUID, int], float] = {}
+        self._runway_by_sequence: dict[tuple[UUID, int, int], float] = {}
         self._failed = False
         self._cancelled_jobs = 0
 
@@ -119,7 +119,7 @@ class LookAheadScheduler:
 
     @property
     def scheduled_runway_seconds(self) -> float:
-        return sum(self._runway_by_stream.values())
+        return sum(self._runway_by_sequence.values())
 
     @property
     def cancelled_jobs(self) -> int:
@@ -129,29 +129,40 @@ class LookAheadScheduler:
         """Schedule only a contiguous future prefix from a Kokoro claim."""
         self.poll()
         self._discard_stale_stream_generations(claim.stream_id, claim.generation)
+        self._prune_consumed_sequences(
+            claim.stream_id, claim.generation, claim.current_sequence
+        )
         if claim.config.route != "kokoro" or not self.ready:
             return
         available = max(0, self.settings.max_queued_jobs - len(self._jobs))
         if available == 0:
             return
-        stream_key = (claim.stream_id, claim.generation)
-        stream_runway = self._runway_by_stream.get(stream_key, 0.0)
+        stream_runway = self._stream_runway(claim.stream_id, claim.generation)
         future = tuple(unit for unit in claim.units if unit.sequence > claim.current_sequence)
-        for unit in self.estimator.select(future, stream_runway):
-            if available == 0 or stream_runway >= self.settings.max_runway_seconds:
+        for unit in future:
+            if (
+                available == 0
+                or stream_runway >= self.estimator.target_runway_seconds
+                or stream_runway >= self.settings.max_runway_seconds
+            ):
                 break
             key = synthesis_input_digest(unit.text, claim.config)
             seconds = self.estimator.seconds_for(unit)
+            runway_key = (claim.stream_id, claim.generation, unit.sequence)
+            if runway_key in self._runway_by_sequence:
+                continue
             if stream_runway + seconds > self.settings.max_runway_seconds:
                 break
             if self.cache.get(key, self._clock()) is not None:
                 self.store.track_result(claim.stream_id, generation=claim.generation, sequence=unit.sequence, cache_key=key)
+                self._runway_by_sequence[runway_key] = seconds
                 stream_runway += seconds
                 continue
             existing_id = self._job_ids_by_key.get(key)
             if existing_id is not None:
-                self._add_waiter(claim, unit, key, seconds, existing_id)
-                stream_runway += seconds
+                if self._add_waiter(claim, unit, key, seconds, existing_id):
+                    self._runway_by_sequence[runway_key] = seconds
+                    stream_runway += seconds
                 continue
             job = SynthesisJob(
                 id=uuid4(), stream_id=claim.stream_id, generation=claim.generation,
@@ -170,13 +181,13 @@ class LookAheadScheduler:
                 break
             self._jobs[job.id] = _QueuedJob(job=job, submitted_at=self._clock())
             self._job_ids_by_key[key] = job.id
-            self._add_waiter(
+            if self._add_waiter(
                 claim, unit, key, seconds, job.id,
                 association_id=association_id, already_tracked=tracked,
-            )
-            stream_runway += seconds
+            ):
+                self._runway_by_sequence[runway_key] = seconds
+                stream_runway += seconds
             available -= 1
-        self._runway_by_stream[stream_key] = stream_runway
 
     def cancel(self, job_id: UUID) -> None:
         """Detach every stream waiting on this job before best-effort IPC cancellation."""
@@ -192,6 +203,7 @@ class LookAheadScheduler:
         self._job_ids_by_key.pop(key, None)
         for waiter in tuple(self._waiters_by_key.pop(key, {}).values()):
             self._complete_waiter(waiter)
+            self._forget_runway(waiter)
         self._cancel_worker(job_id)
 
     def cancel_stream(self, stream_id: UUID) -> None:
@@ -200,9 +212,9 @@ class LookAheadScheduler:
             for waiter in tuple(waiters.values()):
                 if waiter.stream_id == stream_id:
                     self._remove_waiter(waiter)
-        for stream_key in tuple(self._runway_by_stream):
-            if stream_key[0] == stream_id:
-                self._runway_by_stream.pop(stream_key, None)
+        for runway_key in tuple(self._runway_by_sequence):
+            if runway_key[0] == stream_id:
+                self._runway_by_sequence.pop(runway_key, None)
 
     def poll(self) -> None:
         drain = getattr(self.worker, "drain_results", None)
@@ -232,6 +244,8 @@ class LookAheadScheduler:
         if result.cache_key != expected_key:
             failure = "cache-key-mismatch"
         if failure is not None:
+            for waiter in waiters:
+                self._forget_runway(waiter)
             self._failed = True
             self._cancel_worker(result.job_id)
             self._detach_all_jobs()
@@ -251,11 +265,11 @@ class LookAheadScheduler:
         *,
         association_id: UUID | None = None,
         already_tracked: bool = False,
-    ) -> None:
+    ) -> bool:
         waiter_key = (claim.stream_id, claim.generation, unit.sequence)
         waiters = self._waiters_by_key.setdefault(key, {})
         if waiter_key in waiters:
-            return
+            return False
         association_id = association_id or uuid4()
         if not already_tracked:
             self.store.track_pending_job(
@@ -267,24 +281,25 @@ class LookAheadScheduler:
         )
         waiters[waiter_key] = waiter
         self._waiters_by_association[association_id] = waiter
+        return True
 
     def _complete_waiter(self, waiter: _Waiter) -> None:
         self._waiters_by_association.pop(waiter.association_id, None)
         self.store.complete_pending_job(
             waiter.stream_id, generation=waiter.generation, job_id=waiter.association_id
         )
-        stream_key = (waiter.stream_id, waiter.generation)
-        remaining = self._runway_by_stream.get(stream_key, 0.0) - waiter.seconds
-        if remaining > 0:
-            self._runway_by_stream[stream_key] = remaining
-        else:
-            self._runway_by_stream.pop(stream_key, None)
+
+    def _forget_runway(self, waiter: _Waiter) -> None:
+        self._runway_by_sequence.pop(
+            (waiter.stream_id, waiter.generation, waiter.sequence), None
+        )
 
     def _remove_waiter(self, waiter: _Waiter) -> None:
         waiters = self._waiters_by_key.get(waiter.cache_key)
         if waiters is not None:
             waiters.pop((waiter.stream_id, waiter.generation, waiter.sequence), None)
         self._complete_waiter(waiter)
+        self._forget_runway(waiter)
         if waiters:
             return
         self._waiters_by_key.pop(waiter.cache_key, None)
@@ -294,9 +309,9 @@ class LookAheadScheduler:
             self._cancel_worker(worker_job_id)
 
     def _discard_stale_stream_generations(self, stream_id: UUID, generation: int) -> None:
-        for stream_key in tuple(self._runway_by_stream):
-            if stream_key[0] == stream_id and stream_key[1] < generation:
-                self._runway_by_stream.pop(stream_key, None)
+        for runway_key in tuple(self._runway_by_sequence):
+            if runway_key[0] == stream_id and runway_key[1] < generation:
+                self._runway_by_sequence.pop(runway_key, None)
         for key, waiters in tuple(self._waiters_by_key.items()):
             stale = [waiter for waiter in waiters.values() if waiter.stream_id == stream_id and waiter.generation < generation]
             for waiter in stale:
@@ -308,6 +323,32 @@ class LookAheadScheduler:
             if job_id is not None:
                 self._jobs.pop(job_id, None)
                 self._cancel_worker(job_id)
+
+    def _prune_consumed_sequences(
+        self, stream_id: UUID, generation: int, current_sequence: int
+    ) -> None:
+        for waiter in tuple(self._waiters_by_association.values()):
+            if (
+                waiter.stream_id == stream_id
+                and waiter.generation == generation
+                and waiter.sequence <= current_sequence
+            ):
+                self._remove_waiter(waiter)
+        for runway_key in tuple(self._runway_by_sequence):
+            if (
+                runway_key[0] == stream_id
+                and runway_key[1] == generation
+                and runway_key[2] <= current_sequence
+            ):
+                self._runway_by_sequence.pop(runway_key, None)
+
+    def _stream_runway(self, stream_id: UUID, generation: int) -> float:
+        return sum(
+            seconds
+            for (candidate_stream, candidate_generation, _), seconds
+            in self._runway_by_sequence.items()
+            if candidate_stream == stream_id and candidate_generation == generation
+        )
 
     def _cancel_worker(self, job_id: UUID) -> None:
         self._cancelled_jobs = min((1 << 63) - 1, self._cancelled_jobs + 1)

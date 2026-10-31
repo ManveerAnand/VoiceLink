@@ -41,10 +41,18 @@ class SnapshotStore:
         self._lock = RLock()
         self._max_active_streams: int | None = None
         self._max_global_characters: int | None = None
+        self._stream_ttl_seconds: float | None = None
 
-    def configure_budgets(self, *, max_active_streams: int, max_global_characters: int) -> None:
+    def configure_budgets(
+        self,
+        *,
+        max_active_streams: int,
+        max_global_characters: int,
+        stream_ttl_seconds: float | None = None,
+    ) -> None:
         self._max_active_streams = max_active_streams
         self._max_global_characters = max_global_characters
+        self._stream_ttl_seconds = stream_ttl_seconds
 
     def replace(
         self,
@@ -59,26 +67,33 @@ class SnapshotStore:
         # public method keeps the normative protocol signature.
         digest = getattr(snapshot, "_body_digest", digest)
         cancelled_jobs: tuple[UUID, ...] = ()
+        result = ReplaceResult.ACCEPTED
         with self._lock:
+            _, expired_jobs = self._expire_locked(now)
             previous = self._records.get(stream_id)
             if previous is not None:
                 result = self._compare(previous, snapshot, digest)
-                if result is not ReplaceResult.ACCEPTED:
-                    return result
+            if result is ReplaceResult.ACCEPTED:
+                if self._exceeds_budget(stream_id, snapshot):
+                    result = ReplaceResult.BUDGET_EXHAUSTED
+                else:
+                    if previous is not None and snapshot.generation > previous.snapshot.generation:
+                        cancelled_jobs = self._invalidate_generations_before(stream_id, snapshot.generation)
+                    self._records[stream_id] = SnapshotRecord(
+                        snapshot=snapshot,
+                        raw_body_bytes=raw_body_bytes,
+                        body_digest=digest,
+                        accepted_at=now,
+                    )
+        self._notify_cancelled_jobs(expired_jobs + cancelled_jobs)
+        return result
 
-            if self._exceeds_budget(stream_id, snapshot):
-                return ReplaceResult.BUDGET_EXHAUSTED
-
-            if previous is not None and snapshot.generation > previous.snapshot.generation:
-                cancelled_jobs = self._invalidate_generations_before(stream_id, snapshot.generation)
-            self._records[stream_id] = SnapshotRecord(
-                snapshot=snapshot,
-                raw_body_bytes=raw_body_bytes,
-                body_digest=digest,
-                accepted_at=now,
-            )
+    def expire(self, now: float) -> tuple[UUID, ...]:
+        """Remove expired snapshots and their generation-scoped associations."""
+        with self._lock:
+            stream_ids, cancelled_jobs = self._expire_locked(now)
         self._notify_cancelled_jobs(cancelled_jobs)
-        return ReplaceResult.ACCEPTED
+        return stream_ids
 
     def track_pending_job(self, stream_id: UUID, *, generation: int, job_id: UUID) -> bool:
         """Associate speculative work with the currently accepted generation only."""
@@ -150,6 +165,26 @@ class SnapshotStore:
             self._result_keys.pop(stream_id, None)
         return cancelled
 
+    def _expire_locked(self, now: float) -> tuple[tuple[UUID, ...], tuple[UUID, ...]]:
+        ttl = self._stream_ttl_seconds
+        if ttl is None:
+            return (), ()
+        expired_streams = tuple(
+            stream_id
+            for stream_id, record in self._records.items()
+            if now - record.accepted_at >= ttl
+        )
+        cancelled_jobs: list[UUID] = []
+        for stream_id in expired_streams:
+            self._records.pop(stream_id, None)
+            cancelled_jobs.extend(
+                job_id
+                for job_ids in self._pending_jobs.pop(stream_id, {}).values()
+                for job_id in job_ids
+            )
+            self._result_keys.pop(stream_id, None)
+        return expired_streams, tuple(cancelled_jobs)
+
     @staticmethod
     def _require_uuid(job_id: UUID) -> None:
         if not isinstance(job_id, UUID):
@@ -168,12 +203,11 @@ class SnapshotStore:
         previous: SnapshotRecord, snapshot: LookAheadSnapshot, digest: str
     ) -> ReplaceResult:
         old = previous.snapshot
-        if (
-            snapshot.generation < old.generation
-            or snapshot.current_sequence < old.current_sequence
-        ):
+        if snapshot.generation < old.generation:
             return ReplaceResult.STALE
         if snapshot.generation == old.generation:
+            if snapshot.current_sequence < old.current_sequence:
+                return ReplaceResult.STALE
             if snapshot.revision < old.revision:
                 return ReplaceResult.STALE
             if snapshot.revision == old.revision:

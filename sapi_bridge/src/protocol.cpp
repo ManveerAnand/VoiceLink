@@ -145,3 +145,8 @@ bool AdvanceAudioChunkWriteProgress(
     progress.remaining -= bytesWritten;
     return true;
 }
+
+bool ShouldRetrySynthesisAttempt(bool responseBodyReceived)
+{
+    return !responseBodyReceived;
+}

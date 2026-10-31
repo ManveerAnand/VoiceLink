@@ -131,6 +131,13 @@ class LookAheadSnapshot(BaseModel):
     units: list[LookAheadUnit] = Field(min_length=1)
     _body_digest: str = PrivateAttr(default="")
 
+    @field_validator("protocol", mode="before")
+    @classmethod
+    def protocol_must_be_the_strict_integer_one(cls, value: object) -> object:
+        if type(value) is not int or value != PROTOCOL:
+            raise ValueError("protocol must be the integer 1")
+        return value
+
     @field_validator("synthesis_hint", mode="before")
     @classmethod
     def synthesis_hint_must_be_omitted_not_null(cls, value: object) -> object:
@@ -143,6 +150,10 @@ class LookAheadSnapshot(BaseModel):
         for offset, unit in enumerate(self.units):
             if unit.sequence != self.current_sequence + offset:
                 raise ValueError("unit sequences must start at currentSequence and be consecutive")
+            if offset and self.units[offset - 1].boundary_after != unit.boundary_before:
+                raise ValueError(
+                    "adjacent units must share boundaryAfter and boundaryBefore"
+                )
         return self
 
     def scalar_count(self) -> int:
@@ -166,6 +177,14 @@ class LookAheadCapabilities(BaseModel):
     max_characters: int = Field(alias="maxCharacters")
     max_unit_characters: int = Field(alias="maxUnitCharacters")
     max_body_bytes: int = Field(alias="maxBodyBytes")
+
+
+class LookAheadCapabilitiesResponse(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    lookahead: LookAheadCapabilities | None = None
+    structured_pauses: bool = Field(alias="structuredPauses")
+    bridge_protocol_required_for_pauses: int = Field(alias="bridgeProtocolRequiredForPauses")
 
 
 class ProtocolError(BaseModel):

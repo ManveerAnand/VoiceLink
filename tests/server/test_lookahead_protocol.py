@@ -5,9 +5,11 @@ from uuid import uuid4
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from pydantic import ValidationError
 
 from server.config import LookAheadSettings
 from server.lookahead.cache import PcmCache, SynthesisConfig, synthesis_input_digest
+from server.lookahead.correlation import CorrelationRegistry
 from server.lookahead.correlation import BoundClaim
 from server.lookahead.protocol import MAX_BODY_BYTES
 from server.lookahead.protocol import LookAheadSnapshot
@@ -40,6 +42,29 @@ def snapshot(*, generation: int = 3, revision: int = 18, current_sequence: int =
             }
         ],
     }
+
+
+def test_production_correlation_ttl_is_exactly_five_seconds_but_registry_remains_injectable() -> None:
+    assert LookAheadSettings(correlation_ttl_seconds=5).correlation_ttl_seconds == 5
+    with pytest.raises(ValidationError):
+        LookAheadSettings(correlation_ttl_seconds=4)
+    assert CorrelationRegistry(correlation_ttl_seconds=0.01) is not None
+
+
+def test_capability_and_error_contract_models_are_published_in_openapi() -> None:
+    app = FastAPI()
+    app.include_router(
+        create_router(
+            settings=LookAheadSettings(enabled=True),
+            store=SnapshotStore(),
+            worker_ready=lambda: True,
+        )
+    )
+
+    schemas = app.openapi()["components"]["schemas"]
+
+    assert "LookAheadCapabilities" in schemas
+    assert "ProtocolErrorBody" in schemas
 
 
 @pytest.mark.asyncio
@@ -125,20 +150,40 @@ async def test_put_rejects_a_regressing_current_sequence(client: AsyncClient) ->
 
 
 @pytest.mark.asyncio
-async def test_put_rejects_a_higher_generation_with_a_regressing_current_sequence(
-    client: AsyncClient,
-) -> None:
+async def test_put_accepts_a_higher_generation_backward_seek_and_invalidates_old_work() -> None:
     stream_id = uuid4()
-    await client.put(
-        f"/v1/tts/lookahead/{stream_id}", json=snapshot(generation=3, revision=2, current_sequence=2)
+    cancelled_job = uuid4()
+    cancellations: list[object] = []
+    store = SnapshotStore(on_cancel_job=cancellations.append)
+    app = FastAPI()
+    app.include_router(
+        create_router(
+            settings=LookAheadSettings(enabled=True),
+            store=store,
+            worker_ready=lambda: True,
+        )
     )
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://testserver") as client:
+        accepted = await client.put(
+            f"/v1/tts/lookahead/{stream_id}",
+            json=snapshot(generation=3, revision=2, current_sequence=20),
+        )
+        assert accepted.status_code == 202
+        assert store.track_pending_job(stream_id, generation=3, job_id=cancelled_job)
+        assert store.track_result(
+            stream_id, generation=3, sequence=21, cache_key="old-generation-key"
+        )
 
-    response = await client.put(
-        f"/v1/tts/lookahead/{stream_id}", json=snapshot(generation=4, revision=0, current_sequence=1)
-    )
+        response = await client.put(
+            f"/v1/tts/lookahead/{stream_id}",
+            json=snapshot(generation=4, revision=0, current_sequence=1),
+        )
 
-    assert response.status_code == 409
-    assert response.json()["error"]["code"] == "stale"
+    assert response.status_code == 202
+    assert response.json() == {"status": "accepted", "generation": 4, "revision": 0}
+    assert cancellations == [cancelled_job]
+    assert store.result_key(stream_id, generation=3, sequence=21) is None
 
 
 @pytest.mark.asyncio
@@ -213,6 +258,53 @@ async def test_put_enforces_the_body_byte_boundary_before_json_parsing(client: A
 
 
 @pytest.mark.asyncio
+async def test_put_rejects_oversized_content_length_without_consuming_body(
+    client: AsyncClient,
+) -> None:
+    consumed = False
+
+    async def body():
+        nonlocal consumed
+        consumed = True
+        yield b"{}"
+
+    response = await client.put(
+        f"/v1/tts/lookahead/{uuid4()}",
+        content=body(),
+        headers={
+            "content-type": "application/json",
+            "content-length": str(MAX_BODY_BYTES + 1),
+        },
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "over-limit"
+    assert not consumed
+
+
+@pytest.mark.asyncio
+async def test_put_stops_reading_chunked_body_at_one_byte_over_limit(
+    client: AsyncClient,
+) -> None:
+    consumed_chunks: list[int] = []
+
+    async def body():
+        for chunk in (b"x" * MAX_BODY_BYTES, b"y", b"z" * 1_000_000):
+            consumed_chunks.append(len(chunk))
+            yield chunk
+
+    response = await client.put(
+        f"/v1/tts/lookahead/{uuid4()}",
+        content=body(),
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "over-limit"
+    assert consumed_chunks == [MAX_BODY_BYTES, 1]
+
+
+@pytest.mark.asyncio
 async def test_put_treats_byte_different_equivalent_json_as_a_revision_conflict(
     client: AsyncClient,
 ) -> None:
@@ -243,6 +335,20 @@ async def test_put_rejects_an_unsupported_protocol(client: AsyncClient) -> None:
 
     assert response.status_code == 426
     assert response.json()["error"]["code"] == "unsupported-protocol"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_protocol", [True, 1.0])
+async def test_put_rejects_non_integer_protocol_values(
+    client: AsyncClient, invalid_protocol: object
+) -> None:
+    body = snapshot()
+    body["protocol"] = invalid_protocol
+
+    response = await client.put(f"/v1/tts/lookahead/{uuid4()}", json=body)
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid"
 
 
 @pytest.mark.asyncio
@@ -283,6 +389,21 @@ async def test_put_rejects_null_optionals_and_non_consecutive_sequences(client: 
     assert null_response.json()["error"]["code"] == "invalid"
     assert sequence_response.status_code == 400
     assert sequence_response.json()["error"]["code"] == "invalid"
+
+
+@pytest.mark.asyncio
+async def test_put_rejects_mismatched_adjacent_boundaries(client: AsyncClient) -> None:
+    body = snapshot()
+    following = deepcopy(body["units"][0])
+    following["sequence"] = body["currentSequence"] + 1
+    following["boundaryBefore"] = "section"
+    body["units"][0]["boundaryAfter"] = "paragraph"
+    body["units"].append(following)
+
+    response = await client.put(f"/v1/tts/lookahead/{uuid4()}", json=body)
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid"
 
 
 @pytest.mark.asyncio

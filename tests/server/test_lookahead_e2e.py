@@ -173,7 +173,7 @@ def snapshot(
                     "lastInBlock": offset == len(texts) - 1,
                 },
                 "boundaryBefore": "paragraph" if offset else "sentence",
-                "boundaryAfter": "sentence",
+                "boundaryAfter": "paragraph" if offset + 1 < len(texts) else "sentence",
             }
             for offset, text in enumerate(texts)
         ],
@@ -384,6 +384,26 @@ async def test_delete_records_released_correlation_reason() -> None:
 
 
 @pytest.mark.asyncio
+async def test_idle_maintenance_releases_expired_stream_across_store_registry_and_scheduler() -> None:
+    stream = uuid4()
+    engine = uuid4()
+    async with running_stack() as stack:
+        await stack.client.put(
+            f"/v1/tts/lookahead/{stream}", json=snapshot("current", "future")
+        )
+        await post_tts(stack, "current", engine)
+        job = stack.worker.submitted[0]
+
+        stack.clock.advance(30)
+        stack.service.maintain(stack.clock())
+
+        assert stack.store.get(stream) is None
+        assert job.id in stack.worker.cancelled
+        assert stack.scheduler.scheduled_runway_seconds == 0
+        assert stack.service.registry.next_expected_sequence(engine) is None
+
+
+@pytest.mark.asyncio
 async def test_metrics_exclude_expired_cache_entries() -> None:
     async with running_stack() as stack:
         stack.cache.put("opaque-test-key", b"pcm", stack.clock())
@@ -520,7 +540,9 @@ async def test_structural_pause_does_not_grow_runway_and_dead_worker_falls_back(
         runway_before = stack.scheduler.scheduled_runway_seconds
         second = await post_tts(stack, "second", engine)
         assert int(second.headers["X-Audio-Prefix-Bytes"]) == 8_640
-        assert stack.scheduler.scheduled_runway_seconds == runway_before == 0
+        # The future association for "second" counts once until the request consumes it.
+        assert runway_before > 0
+        assert stack.scheduler.scheduled_runway_seconds == 0
 
         fallback_stream = uuid4()
         fallback_engine = uuid4()

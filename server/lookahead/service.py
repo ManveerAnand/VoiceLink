@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections import OrderedDict
+from collections.abc import Awaitable
 from dataclasses import dataclass, field
 import json
 from time import monotonic
@@ -35,6 +37,7 @@ _SAFE_OUTCOMES = {
     CorrelationOutcome.RETRY,
 }
 _MAX_COUNTER = (1 << 63) - 1
+_MAX_SINGLE_FLIGHT = 256
 _CORRELATION_REASONS = frozenset(
     {
         "ambiguous",
@@ -115,6 +118,8 @@ class LookAheadService:
         self._default_voice = default_voice
         self._clock = clock
         self._active: dict[UUID, AuthoritativeContext] = {}
+        self._single_flight: OrderedDict[tuple[UUID, str], asyncio.Task[list[bytes]]] = OrderedDict()
+        self._single_flight_lock = asyncio.Lock()
         self._stream_start_by_request: OrderedDict[UUID, bool] = OrderedDict()
         self._counters = {
             "snapshot_accepted": 0,
@@ -141,6 +146,41 @@ class LookAheadService:
 
     def now(self) -> float:
         return self._clock()
+
+    def maintain(self, now: float | None = None) -> None:
+        """Expire idle look-ahead state even when no authoritative request arrives."""
+        current = self._clock() if now is None else now
+        self._expire(current)
+        self._emit_metrics_if_due(current)
+
+    async def run_authoritative_singleflight(
+        self,
+        headers: Mapping[str, str],
+        request: AuthoritativeRequest,
+        producer: Callable[[], Awaitable[list[bytes]]],
+    ) -> list[bytes]:
+        """Coalesce only overlapping exact retries of one authoritative request."""
+        request_id = self._uuid_header(headers, REQUEST_ID_HEADER)
+        if request_id is None:
+            return await producer()
+        fingerprint = synthesis_input_digest(request.text, self._config_for(request))
+        key = (request_id, fingerprint)
+        async with self._single_flight_lock:
+            task = self._single_flight.get(key)
+            if task is None and len(self._single_flight) < _MAX_SINGLE_FLIGHT:
+                task = asyncio.create_task(producer())
+                self._single_flight[key] = task
+            if task is not None:
+                self._single_flight.move_to_end(key)
+        if task is None:
+            return await producer()
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if task.done():
+                async with self._single_flight_lock:
+                    if self._single_flight.get(key) is task:
+                        self._single_flight.pop(key, None)
 
     def begin_authoritative(
         self,
@@ -311,6 +351,8 @@ class LookAheadService:
         self._increment(f"correlation_reason_{reason.replace('-', '_')}")
 
     def _expire(self, now: float) -> None:
+        expired_streams = set(self.store.expire(now))
+        registry_expired: set[UUID] = set()
         for decision in self.registry.expire(now):
             with self._lock:
                 self._record_decision(decision)
@@ -324,8 +366,20 @@ class LookAheadService:
                             context.claim = None
                             context.outcome = CorrelationOutcome.RELEASED
             if claim is not None:
-                self.store.cancel(claim.stream_id)
-                self.scheduler.cancel_stream(claim.stream_id)
+                registry_expired.add(claim.stream_id)
+
+        for stream_id in registry_expired - expired_streams:
+            self.store.cancel(stream_id)
+        for stream_id in expired_streams | registry_expired:
+            decision = self.registry.release_stream(stream_id)
+            with self._lock:
+                if decision is not None:
+                    self._record_decision(decision)
+                for context in self._active.values():
+                    if context.claim is not None and context.claim.stream_id == stream_id:
+                        context.claim = None
+                        context.outcome = CorrelationOutcome.RELEASED
+            self.scheduler.cancel_stream(stream_id)
 
     def _emit_metrics_if_due(self, now: float) -> None:
         with self._lock:
@@ -410,7 +464,7 @@ class LookAheadService:
         return prefix_silence_pcm(
             unit.boundary_before,
             max(0.0, elapsed) * 1000.0,
-            AudioFormat(sample_rate=24_000, sample_width=2, channels=1),
+            AudioFormat(sample_rate=24_000, sample_width_bytes=2, channels=1),
             stream_start=context.stream_start,
         )
 

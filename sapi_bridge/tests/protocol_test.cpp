@@ -197,6 +197,14 @@ void TestRequestIdReusedAcrossRetries()
     Check(retryHeaders[0] == retryHeaders[1] && retryHeaders[1] == retryHeaders[2],
           "simulated retries reuse one request ID");
 }
+
+void TestRetryStopsOnceAnyResponseBodyAudioWasAccepted()
+{
+    Check(ShouldRetrySynthesisAttempt(false),
+          "pre-body transport failure remains retryable with the same request ID");
+    Check(!ShouldRetrySynthesisAttempt(true),
+          "post-body failure is terminal and cannot replay accepted PCM");
+}
 } // namespace
 
 int main()
@@ -212,6 +220,7 @@ int main()
     TestAudioChunkWriteProgressRejectsNoProgressAndOverReporting();
     TestAudioChunkWriteProgressHandlesMaximumDwordChunk();
     TestRequestIdReusedAcrossRetries();
+    TestRetryStopsOnceAnyResponseBodyAudioWasAccepted();
 
     if (failures == 0)
     {

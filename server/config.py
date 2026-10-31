@@ -17,7 +17,7 @@
 # ============================================================================
 
 from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic import Field, field_validator
 from pathlib import Path
 
 
@@ -109,8 +109,15 @@ class LookAheadSettings(BaseSettings):
     cache_ttl_seconds: int = Field(default=600, ge=1)
     max_queued_jobs: int = Field(default=48, ge=1)
     max_runway_seconds: int = Field(default=60, ge=1)
-    correlation_ttl_seconds: int = Field(default=5, ge=1)
+    correlation_ttl_seconds: int = Field(default=5)
     metrics_log_interval_seconds: float = Field(default=30.0, ge=1.0, le=3600.0)
+
+    @field_validator("correlation_ttl_seconds", mode="before")
+    @classmethod
+    def correlation_ttl_must_be_the_normative_integer_five(cls, value: object) -> int:
+        if type(value) is not int or value != 5:
+            raise ValueError("correlation_ttl_seconds must be the integer 5")
+        return value
 
 
 class Settings(BaseSettings):

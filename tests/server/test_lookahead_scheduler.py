@@ -12,7 +12,14 @@ from server.lookahead.correlation import BoundClaim
 from server.lookahead.protocol import LookAheadSnapshot, LookAheadUnit
 from server.lookahead.scheduler import LookAheadScheduler, RunwayEstimator
 from server.lookahead.store import SnapshotStore
-from server.lookahead.worker import SpeculativeResult, SpeculativeWorker
+from server.lookahead.worker import (
+    SpeculativeResult,
+    SpeculativeWorker,
+    SynthesisJob,
+    _Cancel,
+    _Stop,
+    _worker_main,
+)
 
 
 def config() -> SynthesisConfig:
@@ -66,6 +73,8 @@ class FakeQueue:
     def __init__(self, initial=(), *, capacity: int = 48) -> None:
         self.items = list(initial)
         self.capacity = capacity
+        self.closed = False
+        self.joined_thread = False
 
     def put_nowait(self, item) -> None:
         if len(self.items) >= self.capacity:
@@ -84,6 +93,12 @@ class FakeQueue:
 
     def get_nowait(self):
         return self.get()
+
+    def close(self) -> None:
+        self.closed = True
+
+    def join_thread(self) -> None:
+        self.joined_thread = True
 
 
 class FakeProcess:
@@ -109,7 +124,13 @@ class FakeProcess:
 
 class FakeContext:
     def __init__(self, status=()) -> None:
-        self.queues = [FakeQueue(), FakeQueue(), FakeQueue(status, capacity=1)]
+        self.queues = [
+            FakeQueue(),
+            FakeQueue(),
+            FakeQueue(),
+            FakeQueue(status, capacity=1),
+        ]
+        self.created_queues = list(self.queues)
         self.process: FakeProcess | None = None
 
     def Queue(self, maxsize):
@@ -139,6 +160,38 @@ def test_scheduler_selects_only_in_order_future_units() -> None:
     subject.schedule_claim(claim(uuid4()))
 
     assert [job.sequence for job in worker.submitted] == [11, 12]
+
+
+def test_scheduler_runway_counts_each_future_sequence_once_and_prunes_consumed_units() -> None:
+    worker = FakeWorker()
+    subject = scheduler(worker, max_runway_seconds=60)
+    subject.estimator.target_runway_seconds = 60
+    stream = uuid4()
+    initial = claim(stream, count=4)
+    seconds = subject.estimator.seconds_for(initial.units[1])
+
+    subject.schedule_claim(initial)
+    subject.schedule_claim(initial)
+    assert subject.scheduled_runway_seconds == pytest.approx(3 * seconds)
+
+    advanced = BoundClaim(stream, 1, 11, initial.units, initial.config)
+    subject.schedule_claim(advanced)
+
+    assert subject.scheduled_runway_seconds == pytest.approx(2 * seconds)
+
+
+def test_scheduler_schedules_a_new_tail_after_consuming_a_pending_sequence() -> None:
+    worker = FakeWorker()
+    subject = scheduler(worker)
+    stream = uuid4()
+    initial = claim(stream, count=5)
+
+    subject.schedule_claim(initial)
+    assert [job.sequence for job in worker.submitted] == [11, 12]
+
+    subject.schedule_claim(BoundClaim(stream, 1, 11, initial.units, initial.config))
+
+    assert [job.sequence for job in worker.submitted] == [11, 12, 13]
 
 
 def test_scheduler_deduplicates_exact_synthesis_keys_across_streams() -> None:
@@ -345,6 +398,65 @@ def test_worker_uses_bounded_nonblocking_queue_and_finite_stop(monkeypatch) -> N
     assert context.process is not None
     assert context.process.joined >= 1
     assert context.process.terminated == 1
+    assert all(queue.closed and queue.joined_thread for queue in context.created_queues)
+
+
+def test_worker_control_queue_cancels_before_fifo_synthesis(monkeypatch) -> None:
+    import server.models
+
+    class Model:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def synthesize(self, text: str, *, voice: str, speed: float):
+            self.calls.append(text)
+            yield b"pcm"
+
+        def unload(self) -> None:
+            return None
+
+    model = Model()
+    monkeypatch.setattr(server.models, "load_model", lambda *_args, **_kwargs: model)
+    job = SynthesisJob(uuid4(), uuid4(), 1, 11, "stale", "af_heart", 1.0, "key")
+    jobs = FakeQueue([job, _Stop()])
+    controls = FakeQueue([_Cancel(job.id)])
+
+    _worker_main({"lang_code": "a", "device": "cpu"}, jobs, controls, FakeQueue(), FakeQueue())
+
+    assert model.calls == []
+
+
+def test_worker_restarts_child_when_a_cancelled_job_is_already_active(monkeypatch) -> None:
+    import server.lookahead.worker as worker_module
+
+    class CyclingContext:
+        def __init__(self) -> None:
+            self.queue_index = 0
+            self.processes: list[FakeProcess] = []
+
+        def Queue(self, maxsize):
+            index = self.queue_index % 4
+            self.queue_index += 1
+            return FakeQueue([("ready", None)] if index == 3 else (), capacity=maxsize)
+
+        def Process(self, **kwargs):
+            process = FakeProcess(**kwargs)
+            self.processes.append(process)
+            return process
+
+    context = CyclingContext()
+    monkeypatch.setattr(worker_module, "get_context", lambda method: context)
+    subject = SpeculativeWorker(max_jobs=1, startup_timeout=0, shutdown_timeout=0)
+    assert subject.start()
+    active_job = uuid4()
+    subject._status.items.append(("active", active_job))  # type: ignore[union-attr]
+
+    subject.cancel(active_job)
+
+    assert len(context.processes) == 2
+    assert context.processes[0].terminated == 1
+    assert subject.ready
+    subject.stop()
 
 
 def test_blocked_speculative_worker_does_not_delay_independent_authoritative_lane(monkeypatch) -> None:

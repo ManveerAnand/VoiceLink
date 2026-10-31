@@ -197,12 +197,20 @@ HRESULT TtsHttpClient::StreamSynthesize(
             }
         }
 
+        bool responseBodyReceived = false;
         lastHr = StreamSynthesizeOnce(jsonBody, jsonBodyLen, requestMetadata,
-                                      onChunk, checkAbort, pAudioMetadata, endpoint);
+                                      onChunk, checkAbort, pAudioMetadata,
+                                      &responseBodyReceived, endpoint);
 
         // Success or user abort: stop retrying
         if (SUCCEEDED(lastHr) || lastHr == E_ABORT)
             return (lastHr == E_ABORT) ? S_OK : lastHr;
+
+        if (!ShouldRetrySynthesisAttempt(responseBodyReceived))
+        {
+            VERR(L"Synthesis failed after response-body audio; not retrying to avoid replay");
+            return lastHr;
+        }
 
         VERR(L"StreamSynthesize attempt %d failed: 0x%08lX", attempt + 1, lastHr);
     }
@@ -225,11 +233,14 @@ HRESULT TtsHttpClient::StreamSynthesizeOnce(
     const std::function<HRESULT(const BYTE *data, DWORD size)> &onChunk,
     const std::function<bool()> &checkAbort,
     AudioResponseMetadata *pAudioMetadata,
+    bool *responseBodyReceived,
     const wchar_t *endpoint)
 {
 
     if (pAudioMetadata)
         *pAudioMetadata = {};
+    if (responseBodyReceived)
+        *responseBodyReceived = false;
 
     // -----------------------------------------------------------------------
     // Step 1: Create a POST request to /v1/tts
@@ -437,6 +448,9 @@ HRESULT TtsHttpClient::StreamSynthesizeOnce(
         {
             break;
         }
+
+        if (responseBodyReceived)
+            *responseBodyReceived = true;
 
         // Pass this chunk to SAPI (via the callback)
         HRESULT chunkResult = onChunk(buffer, bytesRead);
