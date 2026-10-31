@@ -165,22 +165,25 @@ class LookAheadService:
             return await producer()
         fingerprint = synthesis_input_digest(request.text, self._config_for(request))
         key = (request_id, fingerprint)
+
+        async def produce_and_cleanup() -> list[bytes]:
+            try:
+                return await producer()
+            finally:
+                async with self._single_flight_lock:
+                    if self._single_flight.get(key) is asyncio.current_task():
+                        self._single_flight.pop(key, None)
+
         async with self._single_flight_lock:
             task = self._single_flight.get(key)
             if task is None and len(self._single_flight) < _MAX_SINGLE_FLIGHT:
-                task = asyncio.create_task(producer())
+                task = asyncio.create_task(produce_and_cleanup())
                 self._single_flight[key] = task
             if task is not None:
                 self._single_flight.move_to_end(key)
         if task is None:
             return await producer()
-        try:
-            return await asyncio.shield(task)
-        finally:
-            if task.done():
-                async with self._single_flight_lock:
-                    if self._single_flight.get(key) is task:
-                        self._single_flight.pop(key, None)
+        return await asyncio.shield(task)
 
     def begin_authoritative(
         self,

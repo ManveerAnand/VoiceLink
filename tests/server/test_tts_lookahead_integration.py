@@ -429,6 +429,57 @@ async def test_overlapping_same_request_id_synthesizes_once_and_mismatched_paylo
 
 
 @pytest.mark.asyncio
+async def test_single_flight_cancelled_waiters_remove_finished_producer_before_later_request() -> None:
+    engine, request_id = uuid4(), uuid4()
+    headers = bridge_headers(engine, request_id)
+    request = tts_router.TTSRequest(text="same", voice="af_heart", speed=1.0, format="pcm")
+    producer_started = asyncio.Event()
+    producer_release = asyncio.Event()
+
+    async def blocked_producer() -> list[bytes]:
+        producer_started.set()
+        await producer_release.wait()
+        return [b"first"]
+
+    async with running_stack() as stack:
+        first = asyncio.create_task(
+            stack.service.run_authoritative_singleflight(headers, request, blocked_producer)
+        )
+        await asyncio.wait_for(producer_started.wait(), timeout=1.0)
+        second = asyncio.create_task(
+            stack.service.run_authoritative_singleflight(headers, request, blocked_producer)
+        )
+        await asyncio.sleep(0)
+        producer_task = next(iter(stack.service._single_flight.values()))
+
+        try:
+            first.cancel()
+            second.cancel()
+            cancelled_waiters = await asyncio.gather(first, second, return_exceptions=True)
+            assert all(isinstance(result, asyncio.CancelledError) for result in cancelled_waiters)
+            assert not producer_task.done()
+
+            producer_release.set()
+            assert await asyncio.wait_for(asyncio.shield(producer_task), timeout=1.0) == [b"first"]
+            assert not stack.service._single_flight
+
+            fresh_calls = 0
+
+            async def fresh_producer() -> list[bytes]:
+                nonlocal fresh_calls
+                fresh_calls += 1
+                return [b"fresh"]
+
+            assert await stack.service.run_authoritative_singleflight(
+                headers, request, fresh_producer
+            ) == [b"fresh"]
+            assert fresh_calls == 1
+        finally:
+            producer_release.set()
+            await asyncio.gather(asyncio.shield(producer_task), return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_later_config_mismatch_suspends_binding_and_uses_legacy_audio() -> None:
     engine = uuid4()
     async with running_stack() as stack:
