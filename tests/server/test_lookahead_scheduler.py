@@ -129,6 +129,7 @@ class FakeContext:
             FakeQueue(),
             FakeQueue(),
             FakeQueue(),
+            FakeQueue(),
             FakeQueue(status, capacity=1),
         ]
         self.created_queues = list(self.queues)
@@ -218,9 +219,9 @@ class ThreadContext:
     def Queue(self, maxsize):
         index = self._queue_index
         self._queue_index += 1
-        if index % 4 == 0:
+        if index % 5 == 0:
             return GatedJobQueue(maxsize, self._jobs_released)
-        if index % 4 == 3:
+        if index % 5 == 4:
             return SignallingStatusQueue(maxsize, self._active_attempted)
         return ThreadQueue(maxsize)
 
@@ -508,7 +509,14 @@ def test_worker_control_queue_cancels_before_fifo_synthesis(monkeypatch) -> None
     jobs = FakeQueue([job, _Stop()])
     controls = FakeQueue([_Cancel(job.id)])
 
-    _worker_main({"lang_code": "a", "device": "cpu"}, jobs, controls, FakeQueue(), FakeQueue())
+    _worker_main(
+        {"lang_code": "a", "device": "cpu"},
+        jobs,
+        controls,
+        FakeQueue(),
+        FakeQueue(),
+        FakeQueue(),
+    )
 
     assert model.calls == []
 
@@ -522,9 +530,9 @@ def test_worker_restarts_child_when_a_cancelled_job_is_already_active(monkeypatc
             self.processes: list[FakeProcess] = []
 
         def Queue(self, maxsize):
-            index = self.queue_index % 4
+            index = self.queue_index % 5
             self.queue_index += 1
-            return FakeQueue([("ready", None)] if index == 3 else (), capacity=maxsize)
+            return FakeQueue([("ready", None)] if index == 4 else (), capacity=maxsize)
 
         def Process(self, **kwargs):
             process = FakeProcess(**kwargs)
@@ -551,14 +559,13 @@ def test_worker_lossless_active_transition_restarts_blocked_child_when_status_is
     import server.models
 
     active_attempted = Event()
-    synthesis_started = Event()
+    synthesis_released = Event()
     terminated: list[Event] = []
     jobs_released = Event()
 
     class Model:
         def synthesize(self, _text: str, *, voice: str, speed: float):
-            synthesis_started.set()
-            terminated[0].wait(2)
+            synthesis_released.wait(2)
             if not terminated[0].is_set():
                 yield b"stale"
 
@@ -582,14 +589,14 @@ def test_worker_lossless_active_transition_restarts_blocked_child_when_status_is
         assert subject._status is not None
         assert subject.submit(job)
         subject._status.put_nowait(("idle", uuid4()))
+        subject._status.put_nowait(("idle", uuid4()))
         jobs_released.set()
         assert active_attempted.wait(1)
 
-        subject._drain_status()
-        assert synthesis_started.wait(1)
         stale_process = subject._process
 
         subject.cancel(job.id)
+        synthesis_released.set()
 
         assert subject._process is not stale_process
         assert stale_process is not None and not stale_process.is_alive()

@@ -11,6 +11,9 @@ from typing import Callable
 from uuid import UUID
 
 
+_STATUS_HANDOFF_TIMEOUT = 0.1
+
+
 @dataclass(frozen=True, slots=True)
 class SynthesisJob:
     """A serializable speculative Kokoro job; it never contains a model object."""
@@ -61,6 +64,7 @@ def _worker_main(
     model_settings: dict[str, str],
     jobs: Queue,
     controls: Queue,
+    permissions: Queue,
     results: Queue,
     status: Queue,
 ) -> None:
@@ -91,6 +95,17 @@ def _worker_main(
             if isinstance(control, _Cancel):
                 cancelled.add(control.job_id)
 
+    def wait_for_permission(job_id: UUID) -> bool:
+        while True:
+            if drain_controls() or job_id in cancelled:
+                return False
+            try:
+                permission = permissions.get(timeout=0.1)
+            except Empty:
+                continue
+            if permission == job_id:
+                return True
+
     try:
         while True:
             if drain_controls():
@@ -107,8 +122,10 @@ def _worker_main(
                 cancelled.discard(item.id)
                 continue
             status.put(("active", item.id))
-            started = monotonic()
             try:
+                if not wait_for_permission(item.id):
+                    continue
+                started = monotonic()
                 pcm = b"".join(model.synthesize(item.text, voice=item.voice, speed=item.speed))
                 elapsed = monotonic() - started
                 if item.id not in cancelled:
@@ -161,6 +178,7 @@ class SpeculativeWorker:
         self._process = None
         self._jobs = None
         self._controls = None
+        self._permissions = None
         self._results = None
         self._status = None
         self._ready = False
@@ -180,11 +198,19 @@ class SpeculativeWorker:
         context = get_context("spawn")
         self._jobs = context.Queue(maxsize=self._max_jobs)
         self._controls = context.Queue(maxsize=self._max_jobs)
+        self._permissions = context.Queue(maxsize=1)
         self._results = context.Queue(maxsize=self._max_jobs)
-        self._status = context.Queue(maxsize=1)
+        self._status = context.Queue(maxsize=2)
         self._process = context.Process(
             target=self._entrypoint,
-            args=(self._model_settings, self._jobs, self._controls, self._results, self._status),
+            args=(
+                self._model_settings,
+                self._jobs,
+                self._controls,
+                self._permissions,
+                self._results,
+                self._status,
+            ),
             daemon=True,
         )
         self._process.start()
@@ -208,11 +234,21 @@ class SpeculativeWorker:
             return False
 
     def cancel(self, job_id: UUID) -> None:
-        if self._controls is None or not self.ready:
+        if self._controls is None:
+            return
+        drained = self._drain_status()
+        if self._ready and self._process is not None and not self._process.is_alive():
+            self._ready = False
+        if not self._ready:
             return
         if job_id in self._active_job_ids:
             self._restart_after_active_cancellation()
             return
+        if drained:
+            self._drain_status(timeout=_STATUS_HANDOFF_TIMEOUT)
+            if job_id in self._active_job_ids:
+                self._restart_after_active_cancellation()
+                return
         try:
             self._controls.put_nowait(_Cancel(job_id))
         except Full:
@@ -232,16 +268,23 @@ class SpeculativeWorker:
             if isinstance(item, SpeculativeResult):
                 drained.append(item)
 
-    def _drain_status(self) -> None:
+    def _drain_status(self, *, timeout: float | None = None) -> int:
         if self._status is None:
-            return
+            return 0
+        drained = 0
         while True:
             try:
-                state, job_id = self._status.get_nowait()
+                if timeout is not None and drained == 0:
+                    state, job_id = self._status.get(timeout=timeout)
+                else:
+                    state, job_id = self._status.get_nowait()
             except Empty:
-                return
+                return drained
+            drained += 1
             if state == "active" and isinstance(job_id, UUID):
                 self._active_job_ids.add(job_id)
+                if self._permissions is not None:
+                    self._permissions.put(job_id)
             elif state == "idle" and isinstance(job_id, UUID):
                 self._active_job_ids.discard(job_id)
 
@@ -254,6 +297,7 @@ class SpeculativeWorker:
         process = self._process
         jobs = self._jobs
         controls = self._controls
+        permissions = self._permissions
         results = self._results
         status = self._status
         self._ready = False
@@ -267,7 +311,7 @@ class SpeculativeWorker:
             if process.is_alive():
                 process.terminate()
                 process.join(self._shutdown_timeout)
-        for queue in (jobs, controls, results, status):
+        for queue in (jobs, controls, permissions, results, status):
             if queue is None:
                 continue
             try:
@@ -276,4 +320,4 @@ class SpeculativeWorker:
             except Exception:
                 pass
         self._active_job_ids.clear()
-        self._process = self._jobs = self._controls = self._results = self._status = None
+        self._process = self._jobs = self._controls = self._permissions = self._results = self._status = None
