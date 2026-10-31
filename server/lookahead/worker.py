@@ -106,10 +106,7 @@ def _worker_main(
             if item.id in cancelled:
                 cancelled.discard(item.id)
                 continue
-            try:
-                status.put_nowait(("active", item.id))
-            except Full:
-                pass
+            status.put(("active", item.id))
             started = monotonic()
             try:
                 pcm = b"".join(model.synthesize(item.text, voice=item.voice, speed=item.speed))
@@ -135,10 +132,7 @@ def _worker_main(
                     pass
             finally:
                 cancelled.discard(item.id)
-                try:
-                    status.put_nowait(("idle", item.id))
-                except Full:
-                    pass
+                status.put(("idle", item.id))
     finally:
         try:
             model.unload()

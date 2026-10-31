@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from threading import Event
+from queue import Full, Queue
+from threading import Event, Thread
 from uuid import UUID, uuid4
 
 import pytest
@@ -141,6 +142,92 @@ class FakeContext:
     def Process(self, **kwargs):
         self.process = FakeProcess(**kwargs)
         return self.process
+
+
+class ThreadQueue(Queue):
+    def close(self) -> None:
+        return None
+
+    def join_thread(self) -> None:
+        return None
+
+
+class SignallingStatusQueue(ThreadQueue):
+    def __init__(self, maxsize: int, active_attempted: Event) -> None:
+        super().__init__(maxsize)
+        self._active_attempted = active_attempted
+
+    def put(self, item, block=True, timeout=None) -> None:
+        if item[0] != "active":
+            super().put(item, block, timeout)
+            return
+        with self.not_full:
+            if not block:
+                if self.maxsize > 0 and self._qsize() >= self.maxsize:
+                    self._active_attempted.set()
+                    raise Full
+            else:
+                while self.maxsize > 0 and self._qsize() >= self.maxsize:
+                    self._active_attempted.set()
+                    self.not_full.wait()
+            self._put(item)
+            self.unfinished_tasks += 1
+            self.not_empty.notify()
+
+
+class GatedJobQueue(ThreadQueue):
+    def __init__(self, maxsize: int, released: Event) -> None:
+        super().__init__(maxsize)
+        self._released = released
+
+    def get(self, block=True, timeout=None):
+        self._released.wait()
+        return super().get(block, timeout)
+
+
+class ThreadProcess:
+    def __init__(self, *, target, args, daemon, terminated: Event) -> None:
+        self._thread = Thread(target=target, args=args, daemon=daemon)
+        self._terminated = terminated
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def is_alive(self) -> bool:
+        return not self._terminated.is_set() and self._thread.is_alive()
+
+    def join(self, timeout) -> None:
+        self._thread.join(timeout)
+
+    def terminate(self) -> None:
+        self._terminated.set()
+
+
+class ThreadContext:
+    def __init__(
+        self,
+        active_attempted: Event,
+        terminated: list[Event],
+        jobs_released: Event,
+    ) -> None:
+        self._active_attempted = active_attempted
+        self._terminated = terminated
+        self._jobs_released = jobs_released
+        self._queue_index = 0
+
+    def Queue(self, maxsize):
+        index = self._queue_index
+        self._queue_index += 1
+        if index % 4 == 0:
+            return GatedJobQueue(maxsize, self._jobs_released)
+        if index % 4 == 3:
+            return SignallingStatusQueue(maxsize, self._active_attempted)
+        return ThreadQueue(maxsize)
+
+    def Process(self, **kwargs):
+        terminated = Event()
+        self._terminated.append(terminated)
+        return ThreadProcess(**kwargs, terminated=terminated)
 
 
 def scheduler(worker: FakeWorker, store: SnapshotStore | None = None, **settings) -> LookAheadScheduler:
@@ -457,6 +544,58 @@ def test_worker_restarts_child_when_a_cancelled_job_is_already_active(monkeypatc
     assert context.processes[0].terminated == 1
     assert subject.ready
     subject.stop()
+
+
+def test_worker_lossless_active_transition_restarts_blocked_child_when_status_is_saturated(monkeypatch) -> None:
+    import server.lookahead.worker as worker_module
+    import server.models
+
+    active_attempted = Event()
+    synthesis_started = Event()
+    terminated: list[Event] = []
+    jobs_released = Event()
+
+    class Model:
+        def synthesize(self, _text: str, *, voice: str, speed: float):
+            synthesis_started.set()
+            terminated[0].wait(2)
+            if not terminated[0].is_set():
+                yield b"stale"
+
+        def unload(self) -> None:
+            return None
+
+    monkeypatch.setattr(server.models, "load_model", lambda *_args, **_kwargs: Model())
+    monkeypatch.setattr(
+        worker_module,
+        "get_context",
+        lambda _method: ThreadContext(active_attempted, terminated, jobs_released),
+    )
+    subject = SpeculativeWorker(
+        max_jobs=1,
+        startup_timeout=1,
+        shutdown_timeout=0.05,
+    )
+    job = SynthesisJob(uuid4(), uuid4(), 1, 11, "stale", "af_heart", 1.0, "key")
+    try:
+        assert subject.start()
+        assert subject._status is not None
+        assert subject.submit(job)
+        subject._status.put_nowait(("idle", uuid4()))
+        jobs_released.set()
+        assert active_attempted.wait(1)
+
+        subject._drain_status()
+        assert synthesis_started.wait(1)
+        stale_process = subject._process
+
+        subject.cancel(job.id)
+
+        assert subject._process is not stale_process
+        assert stale_process is not None and not stale_process.is_alive()
+        assert subject.drain_results() == []
+    finally:
+        subject.stop()
 
 
 def test_blocked_speculative_worker_does_not_delay_independent_authoritative_lane(monkeypatch) -> None:
