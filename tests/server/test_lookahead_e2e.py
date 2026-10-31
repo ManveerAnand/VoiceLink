@@ -1,20 +1,27 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
-import logging
+from io import StringIO
+import json
 from math import ceil
+from queue import Queue
+from threading import Event, Thread
+from time import perf_counter, sleep
 from types import SimpleNamespace
-from typing import AsyncIterator
+from typing import AsyncIterator, Iterator
 from uuid import UUID, uuid4
 
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
-
 from server.config import LookAheadSettings
 from server.lookahead.cache import PcmCache, SynthesisConfig, synthesis_input_digest
-from server.lookahead.correlation import CorrelationRegistry
+from server.lookahead.correlation import (
+    CorrelationDecision,
+    CorrelationOutcome,
+    CorrelationRegistry,
+)
 from server.lookahead.scheduler import LookAheadScheduler
 from server.lookahead.service import LookAheadService
 from server.lookahead.store import SnapshotStore
@@ -38,14 +45,22 @@ class FakeModel:
     is_loaded = True
     model_name = "Kokoro"
 
-    def __init__(self, clock: ManualClock, latency: float = 0.05) -> None:
+    def __init__(
+        self,
+        clock: ManualClock,
+        latency: float = 0.05,
+        wall_delay: float = 0.0,
+    ) -> None:
         self.clock = clock
         self.latency = latency
+        self.wall_delay = wall_delay
         self.calls: list[tuple[str, str | None, float]] = []
 
     def synthesize(self, text: str, voice: str | None = None, speed: float = 1.0):
         self.calls.append((text, voice, speed))
         self.clock.advance(self.latency)
+        if self.wall_delay:
+            sleep(self.wall_delay)
         yield pcm_for(text)
 
 
@@ -56,16 +71,35 @@ class BlockingFakeWorker:
     def __post_init__(self) -> None:
         self.submitted: list[object] = []
         self.cancelled: list[UUID] = []
+        self.started = Event()
+        self.release = Event()
+        self._jobs: Queue[object] = Queue()
+        self._thread = Thread(target=self._block_on_first_job, daemon=True)
+        self._thread.start()
+
+    def _block_on_first_job(self) -> None:
+        self._jobs.get()
+        self.started.set()
+        self.release.wait(5.0)
 
     def submit(self, job: object) -> bool:
+        if not self.ready:
+            return False
         self.submitted.append(job)
-        return self.ready
+        self._jobs.put_nowait(job)
+        return True
 
     def cancel(self, job_id: UUID) -> None:
         self.cancelled.append(job_id)
 
     def drain_results(self) -> list[SpeculativeResult]:
         return []
+
+    def close(self) -> None:
+        self.release.set()
+        if not self.started.is_set():
+            self._jobs.put_nowait(object())
+        self._thread.join(1.0)
 
 
 @dataclass
@@ -77,10 +111,26 @@ class Stack:
     scheduler: LookAheadScheduler
     service: LookAheadService
     cache: PcmCache
+    store: SnapshotStore
 
 
 def pcm_for(text: str) -> bytes:
     return b"pcm<" + text.encode("utf-8") + b">"
+
+
+@contextmanager
+def production_log_output() -> Iterator[StringIO]:
+    from server import main as server_main
+
+    output = StringIO()
+    original_stderr = server_main.sys.stderr
+    server_main.sys.stderr = output
+    server_main.setup_logging()
+    try:
+        yield output
+    finally:
+        server_main.sys.stderr = original_stderr
+        server_main.setup_logging()
 
 
 def bridge_headers(engine: UUID) -> dict[str, str]:
@@ -142,16 +192,18 @@ def config(*, voice: str = "af_heart", speed: float = 1.0) -> SynthesisConfig:
 
 
 @asynccontextmanager
-async def running_stack(*, enabled: bool = True) -> AsyncIterator[Stack]:
+async def running_stack(
+    *, enabled: bool = True, model_wall_delay: float = 0.0
+) -> AsyncIterator[Stack]:
     clock = ManualClock()
-    model = FakeModel(clock)
+    model = FakeModel(clock, wall_delay=model_wall_delay)
     worker = BlockingFakeWorker()
     scheduler_holder: dict[str, LookAheadScheduler] = {}
     store = SnapshotStore(
         on_cancel_job=lambda job_id: scheduler_holder["scheduler"].cancel(job_id)
     )
     cache = PcmCache(max_bytes=1_000_000, ttl_seconds=600)
-    settings = LookAheadSettings(enabled=enabled, metrics_log_interval_seconds=30)
+    settings = LookAheadSettings(enabled=enabled, metrics_log_interval_seconds=1)
     scheduler = LookAheadScheduler(
         worker=worker,
         store=store,
@@ -184,8 +236,9 @@ async def running_stack(*, enabled: bool = True) -> AsyncIterator[Stack]:
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://testserver"
         ) as client:
-            yield Stack(client, clock, model, worker, scheduler, service, cache)
+            yield Stack(client, clock, model, worker, scheduler, service, cache, store)
     finally:
+        worker.close()
         tts_router.set_lookahead_service(None)
         tts_router.set_model(None)
 
@@ -219,34 +272,32 @@ def complete_job(stack: Stack, index: int = 0) -> None:
 
 
 @pytest.mark.asyncio
-async def test_full_fake_model_lifecycle_is_ordered_exact_and_observable(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    caplog.set_level(logging.INFO, logger="server.lookahead.service")
+async def test_full_fake_model_lifecycle_is_ordered_exact_and_observable() -> None:
     secret_current = "PRIVATE-current-7f31"
     secret_next = "PRIVATE-next-9a42"
     stream = uuid4()
     engine = uuid4()
 
-    async with running_stack() as stack:
-        capabilities = await stack.client.get("/v1/capabilities")
-        accepted = await stack.client.put(
-            f"/v1/tts/lookahead/{stream}",
-            json=snapshot(secret_current, secret_next),
-        )
-        current = await post_tts(stack, secret_current, engine)
-        complete_job(stack)
-        stack.clock.advance(31)
-        following = await post_tts(stack, secret_next, engine)
-        duplicate = await stack.client.put(
-            f"/v1/tts/lookahead/{stream}",
-            json=snapshot(secret_current, secret_next),
-        )
-        stale = await stack.client.put(
-            f"/v1/tts/lookahead/{stream}",
-            json=snapshot(secret_current, secret_next, revision=0),
-        )
-        metrics = stack.service.metrics_snapshot()
+    with production_log_output() as output:
+        async with running_stack() as stack:
+            capabilities = await stack.client.get("/v1/capabilities")
+            accepted = await stack.client.put(
+                f"/v1/tts/lookahead/{stream}",
+                json=snapshot(secret_current, secret_next),
+            )
+            current = await post_tts(stack, secret_current, engine)
+            complete_job(stack)
+            stack.clock.advance(1.1)
+            following = await post_tts(stack, secret_next, engine)
+            duplicate = await stack.client.put(
+                f"/v1/tts/lookahead/{stream}",
+                json=snapshot(secret_current, secret_next),
+            )
+            stale = await stack.client.put(
+                f"/v1/tts/lookahead/{stream}",
+                json=snapshot(secret_current, secret_next, revision=0),
+            )
+            metrics = stack.service.metrics_snapshot()
 
     assert capabilities.json()["lookahead"]["protocols"] == [1]
     assert accepted.status_code == 202
@@ -264,6 +315,8 @@ async def test_full_fake_model_lifecycle_is_ordered_exact_and_observable(
     assert metrics["snapshot_stale"] == 1
     assert metrics["correlation_bound"] == 1
     assert metrics["correlation_advanced"] == 1
+    assert metrics["correlation_reason_unique_match"] == 1
+    assert metrics["correlation_reason_exact_next_sequence"] == 1
     assert metrics["cache_hits"] == 1
     assert metrics["cache_misses"] == 1
     assert metrics["prefix_bytes"] == 8_640
@@ -274,13 +327,14 @@ async def test_full_fake_model_lifecycle_is_ordered_exact_and_observable(
     assert metrics["queue_size"] == 0
     assert metrics["runway_seconds"] == 0
     assert all(isinstance(value, (int, float)) for value in metrics.values())
-    logged = "\n".join(record.getMessage() for record in caplog.records)
+    logged = output.getvalue()
     structured = [
-        record.lookahead_metrics
-        for record in caplog.records
-        if hasattr(record, "lookahead_metrics")
+        json.JSONDecoder().raw_decode(line.split("look-ahead metrics ", 1)[1])[0]
+        for line in logged.splitlines()
+        if "look-ahead metrics " in line
     ]
     assert structured
+    assert all(set(payload) == set(metrics) for payload in structured)
     assert all(
         isinstance(value, (int, float))
         for payload in structured
@@ -310,6 +364,23 @@ async def test_seek_generation_cancels_pending_work_and_records_cancellation() -
         assert old_job.id in stack.worker.cancelled
         assert stack.scheduler.queued_jobs == 0
         assert stack.service.metrics_snapshot()["cancellations"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_delete_records_released_correlation_reason() -> None:
+    stream = uuid4()
+    async with running_stack() as stack:
+        await stack.client.put(
+            f"/v1/tts/lookahead/{stream}", json=snapshot("first", "second")
+        )
+        await post_tts(stack, "first", uuid4())
+
+        response = await stack.client.delete(f"/v1/tts/lookahead/{stream}")
+        metrics = stack.service.metrics_snapshot()
+
+    assert response.status_code == 204
+    assert metrics["correlation_released"] == 1
+    assert metrics["correlation_reason_released"] == 1
 
 
 @pytest.mark.asyncio
@@ -365,7 +436,55 @@ async def test_voice_or_rate_mismatch_suspends_and_uses_authoritative_audio(
 
     assert response.content == pcm_for("second")
     assert "X-Audio-Prefix-Bytes" not in response.headers
-    assert stack.service.metrics_snapshot()["correlation_suspended"] == 1
+    metrics = stack.service.metrics_snapshot()
+    assert metrics["correlation_suspended"] == 1
+    assert metrics["correlation_reason_config_mismatch"] == 1
+
+
+@pytest.mark.asyncio
+async def test_suspended_outcome_keeps_synthesis_key_reason_separate() -> None:
+    engine = uuid4()
+    async with running_stack() as stack:
+        await stack.client.put(
+            f"/v1/tts/lookahead/{uuid4()}", json=snapshot("first", "second")
+        )
+        await post_tts(stack, "first", engine)
+        response = await post_tts(stack, "different words", engine)
+        metrics = stack.service.metrics_snapshot()
+
+    assert response.content == pcm_for("different words")
+    assert "X-Audio-Prefix-Bytes" not in response.headers
+    assert metrics["correlation_suspended"] == 1
+    assert metrics["correlation_reason_synthesis_key_mismatch"] == 1
+    assert metrics["correlation_reason_config_mismatch"] == 0
+
+
+@pytest.mark.asyncio
+async def test_unknown_correlation_reason_is_bounded_to_other(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with running_stack() as stack:
+        monkeypatch.setattr(
+            stack.service.registry,
+            "observe_request",
+            lambda _observation: CorrelationDecision(
+                CorrelationOutcome.SUSPENDED, "PRIVATE-unbounded-reason"
+            ),
+        )
+        stack.service.begin_authoritative(
+            {},
+            SimpleNamespace(
+                text="private text",
+                voice="af_heart",
+                speed=1.0,
+                format="pcm_24k_16bit",
+            ),
+            stack.clock(),
+        )
+        metrics = stack.service.metrics_snapshot()
+
+    assert metrics["correlation_reason_other"] == 1
+    assert all("PRIVATE" not in name for name in metrics)
 
 
 @pytest.mark.asyncio
@@ -419,20 +538,83 @@ async def test_structural_pause_does_not_grow_runway_and_dead_worker_falls_back(
     assert ("restart next", "af_heart", 1.0) in stack.model.calls
 
 
-async def authoritative_latencies(*, enabled: bool) -> list[float]:
-    texts = tuple(f"unit {index}" for index in range(24))
+@pytest.mark.asyncio
+async def test_expired_binding_cancels_speculation_and_falls_back_without_prefix() -> (
+    None
+):
+    stream = uuid4()
     engine = uuid4()
-    async with running_stack(enabled=enabled) as stack:
-        if enabled:
-            await stack.client.put(
-                f"/v1/tts/lookahead/{uuid4()}", json=snapshot(*texts)
-            )
-        latencies: list[float] = []
-        for text in texts:
-            started = stack.clock()
-            await post_tts(stack, text, engine)
-            latencies.append(stack.clock() - started)
-        return latencies
+    async with running_stack() as stack:
+        await stack.client.put(
+            f"/v1/tts/lookahead/{stream}", json=snapshot("first", "second")
+        )
+        await post_tts(stack, "first", engine)
+        pending_job = stack.worker.submitted[0]
+        stack.clock.advance(31)
+
+        response = await post_tts(stack, "second", engine)
+        metrics = stack.service.metrics_snapshot()
+
+    assert response.content == pcm_for("second")
+    assert stack.model.calls == [
+        ("first", "af_heart", 1.0),
+        ("second", "af_heart", 1.0),
+    ]
+    assert "X-Audio-Prefix-Bytes" not in response.headers
+    assert "X-Speech-Audio-Length" not in response.headers
+    assert stack.store.get(stream) is None
+    assert pending_job.id in stack.worker.cancelled
+    assert stack.scheduler.queued_jobs == 0
+    assert metrics["correlation_reason_expired"] == 1
+
+
+async def paired_authoritative_latencies() -> tuple[list[float], list[float]]:
+    baseline: list[float] = []
+    isolated: list[float] = []
+    for round_index in range(3):
+        round_baseline, round_isolated = await latency_round(round_index)
+        baseline.extend(round_baseline)
+        isolated.extend(round_isolated)
+    return baseline, isolated
+
+
+async def latency_round(round_index: int) -> tuple[list[float], list[float]]:
+    texts = tuple(f"round {round_index} unit {index}" for index in range(12))
+    engine = uuid4()
+    async with running_stack(model_wall_delay=0.1) as stack:
+        accepted = await stack.client.put(
+            f"/v1/tts/lookahead/{uuid4()}", json=snapshot(*texts)
+        )
+        assert accepted.status_code == 202
+
+        for index in range(2):
+            tts_router.set_lookahead_service(None)
+            await post_tts(stack, f"warmup {index}", uuid4())
+            tts_router.set_lookahead_service(stack.service)
+            await post_tts(stack, f"warmup {index}", uuid4())
+
+        baseline: list[float] = []
+        isolated: list[float] = []
+
+        async def measure(text: str, *, enabled: bool) -> float:
+            tts_router.set_lookahead_service(stack.service if enabled else None)
+            started = perf_counter()
+            await post_tts(stack, text, engine if enabled else uuid4())
+            return perf_counter() - started
+
+        for index, text in enumerate(texts):
+            if index % 2:
+                isolated.append(await measure(text, enabled=True))
+                baseline.append(await measure(text, enabled=False))
+            else:
+                baseline.append(await measure(text, enabled=False))
+                isolated.append(await measure(text, enabled=True))
+            if index == 0:
+                assert stack.worker.started.wait(1.0)
+                assert not stack.worker.release.is_set()
+
+        tts_router.set_lookahead_service(stack.service)
+        return baseline, isolated
 
 
 def p95(values: list[float]) -> float:
@@ -443,7 +625,6 @@ def p95(values: list[float]) -> float:
 async def test_blocked_speculative_worker_adds_at_most_five_percent_p95_latency() -> (
     None
 ):
-    baseline = await authoritative_latencies(enabled=False)
-    isolated = await authoritative_latencies(enabled=True)
+    baseline, isolated = await paired_authoritative_latencies()
 
     assert p95(isolated) <= p95(baseline) * 1.05

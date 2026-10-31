@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass, field
-import logging
+import json
 from time import monotonic
 from threading import RLock
 from typing import Callable, Mapping, Protocol
 from uuid import UUID
+
+from loguru import logger
 
 from server.config import LookAheadSettings
 from server.lookahead.cache import SynthesisConfig, synthesis_input_digest
@@ -33,7 +35,27 @@ _SAFE_OUTCOMES = {
     CorrelationOutcome.RETRY,
 }
 _MAX_COUNTER = (1 << 63) - 1
-logger = logging.getLogger(__name__)
+_CORRELATION_REASONS = frozenset(
+    {
+        "ambiguous",
+        "binding-updated",
+        "concurrent-request",
+        "config-mismatch",
+        "exact-next-sequence",
+        "expired",
+        "generation-suspended",
+        "higher-generation",
+        "old-bridge",
+        "released",
+        "request-id-conflict",
+        "retry",
+        "sequence-gap",
+        "suspended",
+        "synthesis-key-mismatch",
+        "unique-match",
+        "unclaimed",
+    }
+)
 
 
 class AuthoritativeRequest(Protocol):
@@ -105,6 +127,11 @@ class LookAheadService:
             "snapshot_over_limit": 0,
             "snapshot_unsupported_protocol": 0,
             **{f"correlation_{outcome.value}": 0 for outcome in CorrelationOutcome},
+            **{
+                f"correlation_reason_{reason.replace('-', '_')}": 0
+                for reason in _CORRELATION_REASONS
+            },
+            "correlation_reason_other": 0,
             "cache_hits": 0,
             "cache_misses": 0,
             "prefix_bytes": 0,
@@ -135,6 +162,7 @@ class LookAheadService:
             config=config,
             arrived_at=now,
         )
+        self._expire(now)
         decision = self.registry.observe_request(observation)
         try:
             cache_key = synthesis_input_digest(request.text, config)
@@ -147,7 +175,7 @@ class LookAheadService:
                 outcome=decision.outcome,
             )
             with self._lock:
-                self._increment(f"correlation_{decision.outcome.value}")
+                self._record_decision(decision)
                 self._increment(
                     "cache_hits" if cached_speech is not None else "cache_misses"
                 )
@@ -170,7 +198,7 @@ class LookAheadService:
         decisions = self.registry.observe_snapshot(stream_id, record)
         with self._lock:
             for decision in decisions:
-                self._increment(f"correlation_{decision.outcome.value}")
+                self._record_decision(decision)
                 if decision.claim is not None and decision.outcome in _SAFE_OUTCOMES:
                     self.scheduler.schedule_claim(decision.claim)
                 if decision.request_id is None:
@@ -235,8 +263,10 @@ class LookAheadService:
                         self._active.pop(context.request_id, None)
 
     def cancel_stream(self, stream_id: UUID) -> None:
-        self.registry.release_stream(stream_id)
+        decision = self.registry.release_stream(stream_id)
         with self._lock:
+            if decision is not None:
+                self._record_decision(decision)
             for context in self._active.values():
                 if context.claim is not None and context.claim.stream_id == stream_id:
                     context.claim = None
@@ -275,6 +305,28 @@ class LookAheadService:
     def _increment(self, name: str, amount: int = 1) -> None:
         self._counters[name] = min(_MAX_COUNTER, self._counters[name] + amount)
 
+    def _record_decision(self, decision: CorrelationDecision) -> None:
+        self._increment(f"correlation_{decision.outcome.value}")
+        reason = decision.reason if decision.reason in _CORRELATION_REASONS else "other"
+        self._increment(f"correlation_reason_{reason.replace('-', '_')}")
+
+    def _expire(self, now: float) -> None:
+        for decision in self.registry.expire(now):
+            with self._lock:
+                self._record_decision(decision)
+                claim = decision.claim
+                if claim is not None:
+                    for context in self._active.values():
+                        if (
+                            context.claim is not None
+                            and context.claim.stream_id == claim.stream_id
+                        ):
+                            context.claim = None
+                            context.outcome = CorrelationOutcome.RELEASED
+            if claim is not None:
+                self.store.cancel(claim.stream_id)
+                self.scheduler.cancel_stream(claim.stream_id)
+
     def _emit_metrics_if_due(self, now: float) -> None:
         with self._lock:
             if (
@@ -284,10 +336,13 @@ class LookAheadService:
                 return
             self._last_metrics_log_at = now
         try:
-            logger.info(
-                "look-ahead metrics",
-                extra={"lookahead_metrics": self.metrics_snapshot(now=now)},
+            payload = json.dumps(
+                self.metrics_snapshot(now=now),
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
             )
+            logger.info("look-ahead metrics {}", payload)
         except Exception:
             # Instrumentation must never change authoritative synthesis behavior.
             pass

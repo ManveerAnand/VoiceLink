@@ -119,8 +119,8 @@ The speculative lane is deliberately bounded: at most 8 active streams, 48
 queued jobs, 60 seconds of estimated runway per stream, and 256 MiB of PCM cache
 with a 10-minute TTL by default. These limits can be changed with the matching
 `VOICELINK_LOOKAHEAD__...` settings in `server/config.py`. Numeric operational
-metrics are emitted as a fixed-size `lookahead_metrics` structured logging field
-at most once every 30 seconds by default; change the interval with
+metrics are emitted as a fixed-size numeric JSON object in the configured Loguru
+output at most once every 30 seconds by default; change the interval with
 `VOICELINK_LOOKAHEAD__METRICS_LOG_INTERVAL_SECONDS`.
 
 Look-ahead is always optional. Ambiguous readers, stale snapshots, voice or rate
