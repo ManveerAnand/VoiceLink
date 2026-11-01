@@ -1,10 +1,10 @@
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 import logging
 from threading import Event
 from types import SimpleNamespace
-from typing import AsyncIterator
+from typing import AsyncIterator, Iterator
 from uuid import UUID, uuid4
 
 import numpy as np
@@ -106,6 +106,25 @@ class Stack:
 
 def pcm_for(text: str) -> bytes:
     return b"speech<" + text.encode("utf-8") + b">"
+
+
+@contextmanager
+def capture_standard_logs(messages: list[str]) -> Iterator[None]:
+    root_logger = logging.getLogger()
+    original_level = root_logger.level
+
+    class CaptureHandler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            messages.append(self.format(record))
+
+    capture_handler = CaptureHandler()
+    try:
+        root_logger.addHandler(capture_handler)
+        root_logger.setLevel(logging.INFO)
+        yield
+    finally:
+        root_logger.setLevel(original_level)
+        root_logger.removeHandler(capture_handler)
 
 
 def bridge_headers(
@@ -781,6 +800,20 @@ async def test_tts_finishes_each_started_authoritative_call_exactly_once(
     assert (recorder.finishes[0] is None) is fails
 
 
+def test_stdlib_info_capture() -> None:
+    root_logger = logging.getLogger()
+    original_level = root_logger.level
+    original_handlers = list(root_logger.handlers)
+    messages: list[str] = []
+
+    with capture_standard_logs(messages):
+        logging.getLogger("test-stdlib-info-capture").info("info probe")
+
+    assert messages == ["info probe"]
+    assert root_logger.level == original_level
+    assert root_logger.handlers == original_handlers
+
+
 @pytest.mark.asyncio
 async def test_protocol_worker_cache_and_tts_logs_never_contain_raw_secret() -> None:
     secret = "SECRET-7f31-book-sentence-never-log"
@@ -796,20 +829,14 @@ async def test_protocol_worker_cache_and_tts_logs_never_contain_raw_secret() -> 
     messages: list[str] = []
     standard_messages: list[str] = []
 
-    class CaptureHandler(logging.Handler):
-        def emit(self, record: logging.LogRecord) -> None:
-            standard_messages.append(self.format(record))
-
-    standard_handler = CaptureHandler()
-    logging.getLogger().addHandler(standard_handler)
     sink = logger.add(messages.append, level="DEBUG", format="{message}")
     try:
-        async with running_stack(model=model) as stack:
-            await put_snapshot(stack, snapshot(secret, "future secret-free unit"))
-            response = await post_tts(stack, secret, headers=bridge_headers(uuid4()))
-            assert response.status_code == 200
+        with capture_standard_logs(standard_messages):
+            async with running_stack(model=model) as stack:
+                await put_snapshot(stack, snapshot(secret, "future secret-free unit"))
+                response = await post_tts(stack, secret, headers=bridge_headers(uuid4()))
+                assert response.status_code == 200
     finally:
         logger.remove(sink)
-        logging.getLogger().removeHandler(standard_handler)
 
     assert secret not in "".join(messages + standard_messages)
