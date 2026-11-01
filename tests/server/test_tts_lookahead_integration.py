@@ -442,6 +442,25 @@ async def test_single_flight_cancelled_waiters_remove_finished_producer_before_l
         return [b"first"]
 
     async with running_stack() as stack:
+        class LockObserver:
+            def __init__(self, lock: asyncio.Lock) -> None:
+                self._lock = lock
+                self._entries = 0
+                self.second_lookup_complete = asyncio.Event()
+
+            async def __aenter__(self) -> object:
+                result = await self._lock.__aenter__()
+                self._entries += 1
+                return result
+
+            async def __aexit__(self, *args: object) -> bool:
+                result = await self._lock.__aexit__(*args)
+                if self._entries == 2:
+                    self.second_lookup_complete.set()
+                return result
+
+        lock_observer = LockObserver(stack.service._single_flight_lock)
+        stack.service._single_flight_lock = lock_observer  # type: ignore[assignment]
         first = asyncio.create_task(
             stack.service.run_authoritative_singleflight(headers, request, blocked_producer)
         )
@@ -449,8 +468,9 @@ async def test_single_flight_cancelled_waiters_remove_finished_producer_before_l
         second = asyncio.create_task(
             stack.service.run_authoritative_singleflight(headers, request, blocked_producer)
         )
-        await asyncio.sleep(0)
+        await asyncio.wait_for(lock_observer.second_lookup_complete.wait(), timeout=1.0)
         producer_task = next(iter(stack.service._single_flight.values()))
+        assert not second.done()
 
         try:
             first.cancel()
@@ -477,6 +497,37 @@ async def test_single_flight_cancelled_waiters_remove_finished_producer_before_l
         finally:
             producer_release.set()
             await asyncio.gather(asyncio.shield(producer_task), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_single_flight_cancelled_waiter_removes_failed_producer() -> None:
+    engine, request_id = uuid4(), uuid4()
+    headers = bridge_headers(engine, request_id)
+    request = tts_router.TTSRequest(text="same", voice="af_heart", speed=1.0, format="pcm")
+    producer_started = asyncio.Event()
+    producer_release = asyncio.Event()
+
+    async def failing_producer() -> list[bytes]:
+        producer_started.set()
+        await producer_release.wait()
+        raise RuntimeError("deterministic producer failure")
+
+    async with running_stack() as stack:
+        waiter = asyncio.create_task(
+            stack.service.run_authoritative_singleflight(headers, request, failing_producer)
+        )
+        await asyncio.wait_for(producer_started.wait(), timeout=1.0)
+        producer_task = next(iter(stack.service._single_flight.values()))
+
+        waiter.cancel()
+        cancelled = await asyncio.gather(waiter, return_exceptions=True)
+        assert isinstance(cancelled[0], asyncio.CancelledError)
+        assert not producer_task.done()
+
+        producer_release.set()
+        with pytest.raises(RuntimeError, match="deterministic producer failure"):
+            await asyncio.wait_for(asyncio.shield(producer_task), timeout=1.0)
+        assert not stack.service._single_flight
 
 
 @pytest.mark.asyncio
