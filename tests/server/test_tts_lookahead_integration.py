@@ -2,7 +2,8 @@ import asyncio
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 import logging
-from threading import Event
+from queue import Queue
+from threading import Event, Thread
 from types import SimpleNamespace
 from typing import AsyncIterator, Iterator
 from uuid import UUID, uuid4
@@ -19,7 +20,12 @@ from server.lookahead.correlation import CorrelationRegistry
 from server.lookahead.scheduler import LookAheadScheduler
 from server.lookahead.service import AudioEnvelope, LookAheadService
 from server.lookahead.store import SnapshotStore
-from server.lookahead.worker import SpeculativeResult
+from server.lookahead.worker import (
+    SpeculativeResult,
+    SynthesisJob,
+    _Stop,
+    _worker_main,
+)
 from server.models.kokoro_model import KokoroModel
 from server.routers import tts as tts_router
 from server.routers.lookahead import create_router
@@ -817,6 +823,7 @@ def test_stdlib_info_capture() -> None:
 @pytest.mark.asyncio
 async def test_protocol_worker_cache_and_tts_logs_never_contain_raw_secret() -> None:
     secret = "SECRET-7f31-book-sentence-never-log"
+    future_secret = "FUTURE-SECRET-a94c-prefetch-never-log"
     clock = ManualClock()
     model = KokoroModel()
     model._loaded = True
@@ -833,10 +840,65 @@ async def test_protocol_worker_cache_and_tts_logs_never_contain_raw_secret() -> 
     try:
         with capture_standard_logs(standard_messages):
             async with running_stack(model=model) as stack:
-                await put_snapshot(stack, snapshot(secret, "future secret-free unit"))
+                await put_snapshot(stack, snapshot(secret, future_secret))
                 response = await post_tts(stack, secret, headers=bridge_headers(uuid4()))
                 assert response.status_code == 200
     finally:
         logger.remove(sink)
 
-    assert secret not in "".join(messages + standard_messages)
+    combined = "".join(messages + standard_messages)
+    assert secret not in combined
+    assert future_secret not in combined
+
+
+def test_worker_main_logging_boundary_never_contains_future_text(monkeypatch) -> None:
+    import server.models
+
+    future_secret = "FUTURE-SECRET-5d12-real-worker-never-log"
+    model = KokoroModel()
+    model._loaded = True
+
+    def fake_pipeline(text: str, *, voice: str, speed: float):
+        yield text, "phonemes", np.zeros(4, dtype=np.float32)
+
+    model._pipeline = fake_pipeline
+    monkeypatch.setattr(server.models, "load_model", lambda *_args, **_kwargs: model)
+    jobs: Queue = Queue(maxsize=2)
+    controls: Queue = Queue(maxsize=2)
+    permissions: Queue = Queue(maxsize=1)
+    results: Queue = Queue(maxsize=2)
+    status: Queue = Queue(maxsize=2)
+    job = SynthesisJob(
+        uuid4(), uuid4(), 1, 11, future_secret, "af_heart", 1.0, "future-key"
+    )
+    messages: list[str] = []
+    standard_messages: list[str] = []
+    worker_thread = Thread(
+        target=_worker_main,
+        args=(
+            {"lang_code": "a", "device": "cpu"},
+            jobs,
+            controls,
+            permissions,
+            results,
+            status,
+        ),
+    )
+    sink = logger.add(messages.append, level="DEBUG", format="{message}")
+    try:
+        with capture_standard_logs(standard_messages):
+            worker_thread.start()
+            assert status.get(timeout=1.0) == ("ready", None)
+            jobs.put(job)
+            assert status.get(timeout=1.0) == ("active", job.id)
+            permissions.put(job.id)
+            result = results.get(timeout=1.0)
+            assert isinstance(result, SpeculativeResult)
+            assert result.job_id == job.id
+    finally:
+        controls.put(_Stop())
+        worker_thread.join(1.0)
+        logger.remove(sink)
+
+    assert not worker_thread.is_alive()
+    assert future_secret not in "".join(messages + standard_messages)

@@ -108,6 +108,7 @@ class LookAheadScheduler:
         self._runway_by_sequence: dict[tuple[UUID, int, int], float] = {}
         self._failed = False
         self._cancelled_jobs = 0
+        self._worker_epoch = int(getattr(worker, "epoch", 0))
 
     @property
     def ready(self) -> bool:
@@ -167,7 +168,7 @@ class LookAheadScheduler:
             job = SynthesisJob(
                 id=uuid4(), stream_id=claim.stream_id, generation=claim.generation,
                 sequence=unit.sequence, text=unit.text, voice=claim.config.voice,
-                speed=claim.config.speed, cache_key=key,
+                speed=claim.config.speed, cache_key=key, epoch=self._worker_epoch,
             )
             association_id = uuid4()
             tracked = self.store.track_pending_job(
@@ -199,12 +200,7 @@ class LookAheadScheduler:
         if queued is None:
             self._cancel_worker(job_id)
             return
-        key = queued.job.cache_key
-        self._job_ids_by_key.pop(key, None)
-        for waiter in tuple(self._waiters_by_key.pop(key, {}).values()):
-            self._complete_waiter(waiter)
-            self._forget_runway(waiter)
-        self._cancel_worker(job_id)
+        self._discard_job(queued, cancel_worker=True)
 
     def cancel_stream(self, stream_id: UUID) -> None:
         """Drop every stream association, including cached-only runway accounting."""
@@ -217,6 +213,7 @@ class LookAheadScheduler:
                 self._runway_by_sequence.pop(runway_key, None)
 
     def poll(self) -> None:
+        self._synchronize_worker_epoch()
         drain = getattr(self.worker, "drain_results", None)
         if callable(drain):
             for result in drain():
@@ -224,12 +221,28 @@ class LookAheadScheduler:
         now = self._clock()
         for queued in tuple(self._jobs.values()):
             if now - queued.submitted_at >= self._job_timeout_seconds:
-                self.handle_result(SpeculativeResult(queued.job.id, queued.job.cache_key, b"", 0.0, 0.0, failure="timeout"))
+                self.handle_result(
+                    SpeculativeResult(
+                        queued.job.id,
+                        queued.job.cache_key,
+                        b"",
+                        0.0,
+                        0.0,
+                        failure="timeout",
+                        epoch=queued.job.epoch,
+                    )
+                )
         if (not getattr(self.worker, "ready", False) or self._failed) and self._jobs:
             self._detach_all_jobs()
 
     def handle_result(self, result: SpeculativeResult) -> None:
         """Insert valid canonical PCM, then complete every still-valid exact-key waiter."""
+        self._synchronize_worker_epoch()
+        if result.epoch != self._worker_epoch:
+            return
+        queued = self._jobs.get(result.job_id)
+        if queued is not None and result.epoch != queued.job.epoch:
+            return
         queued = self._jobs.pop(result.job_id, None)
         if queued is None:
             if result.failure is None:
@@ -353,7 +366,26 @@ class LookAheadScheduler:
     def _cancel_worker(self, job_id: UUID) -> None:
         self._cancelled_jobs = min((1 << 63) - 1, self._cancelled_jobs + 1)
         self.worker.cancel(job_id)
+        self._synchronize_worker_epoch()
 
-    def _detach_all_jobs(self) -> None:
-        for job_id in tuple(self._jobs):
-            self.cancel(job_id)
+    def _synchronize_worker_epoch(self) -> None:
+        epoch = int(getattr(self.worker, "epoch", 0))
+        if epoch == self._worker_epoch:
+            return
+        self._worker_epoch = epoch
+        self._detach_all_jobs(cancel_worker=False)
+
+    def _discard_job(self, queued: _QueuedJob, *, cancel_worker: bool) -> None:
+        job_id = queued.job.id
+        key = queued.job.cache_key
+        self._jobs.pop(job_id, None)
+        self._job_ids_by_key.pop(key, None)
+        for waiter in tuple(self._waiters_by_key.pop(key, {}).values()):
+            self._complete_waiter(waiter)
+            self._forget_runway(waiter)
+        if cancel_worker:
+            self._cancel_worker(job_id)
+
+    def _detach_all_jobs(self, *, cancel_worker: bool = True) -> None:
+        for queued in tuple(self._jobs.values()):
+            self._discard_job(queued, cancel_worker=cancel_worker)

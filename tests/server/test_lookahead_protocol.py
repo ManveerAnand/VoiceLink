@@ -1,5 +1,7 @@
+import asyncio
 from copy import deepcopy
 import json
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -14,6 +16,7 @@ from server.lookahead.correlation import BoundClaim
 from server.lookahead.protocol import MAX_BODY_BYTES
 from server.lookahead.protocol import LookAheadSnapshot
 from server.lookahead.scheduler import LookAheadScheduler
+from server.lookahead.service import LookAheadService
 from server.lookahead.store import SnapshotStore
 from server.routers.lookahead import create_router
 
@@ -361,6 +364,106 @@ async def test_put_rejects_when_the_active_stream_budget_is_exhausted(
     assert first.status_code == 202
     assert second.status_code == 429
     assert second.json()["error"]["code"] == "budget-exhausted"
+
+
+@pytest.mark.asyncio
+async def test_disabled_lifespan_expires_idle_snapshot_and_recovers_budget(
+    monkeypatch,
+) -> None:
+    import server.main as main
+
+    now = [100.0]
+    settings = LookAheadSettings(
+        enabled=False, max_active_streams=1, stream_ttl_seconds=1
+    )
+
+    class DisabledWorker:
+        ready = False
+
+        def __init__(self) -> None:
+            self.started = False
+            self.stopped = False
+
+        def start(self) -> bool:
+            self.started = True
+            return False
+
+        def submit(self, _job) -> bool:
+            return False
+
+        def cancel(self, _job_id) -> None:
+            return None
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    worker = DisabledWorker()
+    store = SnapshotStore()
+    scheduler = LookAheadScheduler(
+        worker=worker,
+        store=store,
+        cache=PcmCache(max_bytes=100_000, ttl_seconds=100),
+        settings=settings,
+        clock=lambda: now[0],
+    )
+    service = LookAheadService(
+        settings=settings,
+        store=store,
+        scheduler=scheduler,
+        registry=CorrelationRegistry(clock=lambda: now[0]),
+        clock=lambda: now[0],
+    )
+    maintained = asyncio.Event()
+    real_maintain = service.maintain
+
+    def observe_maintenance() -> None:
+        real_maintain()
+        maintained.set()
+
+    monkeypatch.setattr(service, "maintain", observe_maintenance)
+    monkeypatch.setattr(main.settings, "lookahead", settings)
+    monkeypatch.setattr(main, "lookahead_worker", worker)
+    monkeypatch.setattr(main, "lookahead_store", store)
+    monkeypatch.setattr(main, "lookahead_scheduler", scheduler)
+    monkeypatch.setattr(main, "lookahead_service", service)
+    monkeypatch.setattr(main, "setup_logging", lambda: None)
+    monkeypatch.setattr(main, "set_model", lambda _model: None)
+    monkeypatch.setattr(
+        main, "load_model", lambda *_args, **_kwargs: SimpleNamespace(unload=lambda: None)
+    )
+
+    api = FastAPI()
+    api.include_router(
+        create_router(settings=settings, store=store, service=service)
+    )
+    first_stream = uuid4()
+    blocked_stream = uuid4()
+
+    async with main.lifespan(api):
+        async with AsyncClient(
+            transport=ASGITransport(app=api), base_url="http://testserver"
+        ) as lifespan_client:
+            first = await lifespan_client.put(
+                f"/v1/tts/lookahead/{first_stream}", json=snapshot()
+            )
+            blocked = await lifespan_client.put(
+                f"/v1/tts/lookahead/{blocked_stream}", json=snapshot()
+            )
+            assert first.status_code == 202
+            assert blocked.status_code == 429
+
+            maintained.clear()
+            now[0] += 2.0
+            await asyncio.wait_for(maintained.wait(), timeout=1.0)
+
+            assert store.get(first_stream) is None
+            recovered = await lifespan_client.put(
+                f"/v1/tts/lookahead/{blocked_stream}", json=snapshot()
+            )
+            assert recovered.status_code == 202
+
+    assert not worker.started
+    assert worker.stopped
 
 
 @pytest.mark.asyncio

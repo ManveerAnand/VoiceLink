@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, replace
 from queue import Full, Queue
 from threading import Event, Thread
+from time import monotonic, sleep
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
 
 from server.config import LookAheadSettings
 from server.lookahead.cache import PcmCache, SynthesisConfig, synthesis_input_digest
-from server.lookahead.correlation import BoundClaim
+from server.lookahead.correlation import BoundClaim, CorrelationRegistry
 from server.lookahead.protocol import LookAheadSnapshot, LookAheadUnit
 from server.lookahead.scheduler import LookAheadScheduler, RunwayEstimator
+from server.lookahead.service import LookAheadService
 from server.lookahead.store import SnapshotStore
 from server.lookahead.worker import (
     SpeculativeResult,
@@ -76,6 +80,7 @@ class FakeQueue:
         self.capacity = capacity
         self.closed = False
         self.joined_thread = False
+        self.join_cancelled = False
 
     def put_nowait(self, item) -> None:
         if len(self.items) >= self.capacity:
@@ -97,6 +102,9 @@ class FakeQueue:
 
     def close(self) -> None:
         self.closed = True
+
+    def cancel_join_thread(self) -> None:
+        self.join_cancelled = True
 
     def join_thread(self) -> None:
         self.joined_thread = True
@@ -145,6 +153,58 @@ class FakeContext:
         return self.process
 
 
+class BlockingRestartProcess(FakeProcess):
+    def __init__(
+        self,
+        *,
+        restart_started: Event,
+        restart_release: Event,
+        block_on_join: bool,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._restart_started = restart_started
+        self._restart_release = restart_release
+        self._block_on_join = block_on_join
+
+    def join(self, timeout) -> None:
+        if self._block_on_join and self.alive:
+            self._restart_started.set()
+            self._restart_release.wait(2.0)
+        super().join(timeout)
+
+
+class BlockingRestartContext:
+    def __init__(self, restart_started: Event, restart_release: Event) -> None:
+        self.restart_started = restart_started
+        self.restart_release = restart_release
+        self.queue_index = 0
+        self.processes: list[BlockingRestartProcess] = []
+        self.created_queues: list[FakeQueue] = []
+        self.replacement_created = Event()
+
+    def Queue(self, maxsize):
+        index = self.queue_index % 5
+        self.queue_index += 1
+        queue = FakeQueue(
+            [("ready", None)] if index == 4 else (), capacity=maxsize
+        )
+        self.created_queues.append(queue)
+        return queue
+
+    def Process(self, **kwargs):
+        process = BlockingRestartProcess(
+            **kwargs,
+            restart_started=self.restart_started,
+            restart_release=self.restart_release,
+            block_on_join=not self.processes,
+        )
+        self.processes.append(process)
+        if len(self.processes) > 1:
+            self.replacement_created.set()
+        return process
+
+
 class ThreadQueue(Queue):
     def close(self) -> None:
         return None
@@ -154,11 +214,19 @@ class ThreadQueue(Queue):
 
 
 class SignallingStatusQueue(ThreadQueue):
-    def __init__(self, maxsize: int, active_attempted: Event) -> None:
+    def __init__(
+        self,
+        maxsize: int,
+        active_attempted: Event,
+        idle_published: Event | None = None,
+    ) -> None:
         super().__init__(maxsize)
         self._active_attempted = active_attempted
+        self._idle_published = idle_published
 
     def put(self, item, block=True, timeout=None) -> None:
+        if item[0] == "idle" and self._idle_published is not None:
+            self._idle_published.set()
         if item[0] != "active":
             super().put(item, block, timeout)
             return
@@ -210,10 +278,12 @@ class ThreadContext:
         active_attempted: Event,
         terminated: list[Event],
         jobs_released: Event,
+        idle_published: Event | None = None,
     ) -> None:
         self._active_attempted = active_attempted
         self._terminated = terminated
         self._jobs_released = jobs_released
+        self._idle_published = idle_published
         self._queue_index = 0
 
     def Queue(self, maxsize):
@@ -222,7 +292,9 @@ class ThreadContext:
         if index % 5 == 0:
             return GatedJobQueue(maxsize, self._jobs_released)
         if index % 5 == 4:
-            return SignallingStatusQueue(maxsize, self._active_attempted)
+            return SignallingStatusQueue(
+                maxsize, self._active_attempted, self._idle_published
+            )
         return ThreadQueue(maxsize)
 
     def Process(self, **kwargs):
@@ -239,6 +311,15 @@ def scheduler(worker: FakeWorker, store: SnapshotStore | None = None, **settings
         settings=LookAheadSettings(enabled=True, **settings),
         clock=lambda: 10.0,
     )
+
+
+def wait_for_condition(condition, *, description: str, timeout: float = 1.0) -> None:
+    deadline = monotonic() + timeout
+    while monotonic() < deadline:
+        if condition():
+            return
+        sleep(0.01)
+    pytest.fail(f"timed out waiting for {description}")
 
 
 def test_scheduler_selects_only_in_order_future_units() -> None:
@@ -486,7 +567,10 @@ def test_worker_uses_bounded_nonblocking_queue_and_finite_stop(monkeypatch) -> N
     assert context.process is not None
     assert context.process.joined >= 1
     assert context.process.terminated == 1
-    assert all(queue.closed and queue.joined_thread for queue in context.created_queues)
+    assert all(
+        queue.closed and queue.join_cancelled and not queue.joined_thread
+        for queue in context.created_queues
+    )
 
 
 def test_worker_control_queue_cancels_before_fifo_synthesis(monkeypatch) -> None:
@@ -548,10 +632,211 @@ def test_worker_restarts_child_when_a_cancelled_job_is_already_active(monkeypatc
 
     subject.cancel(active_job)
 
+    wait_for_condition(
+        lambda: len(context.processes) == 2 and subject.ready,
+        description="replacement child readiness",
+    )
     assert len(context.processes) == 2
     assert context.processes[0].terminated == 1
     assert subject.ready
     subject.stop()
+
+
+def test_active_restart_invalidates_every_old_epoch_job_and_stale_result(
+    monkeypatch,
+) -> None:
+    import server.lookahead.worker as worker_module
+
+    restart_started = Event()
+    restart_release = Event()
+    restart_release.set()
+    context = BlockingRestartContext(restart_started, restart_release)
+    monkeypatch.setattr(worker_module, "get_context", lambda _method: context)
+    worker = SpeculativeWorker(max_jobs=8, startup_timeout=0, shutdown_timeout=0)
+    assert worker.start()
+    subject = scheduler(worker, max_queued_jobs=8, max_runway_seconds=60)
+    subject.estimator.target_runway_seconds = 60
+    subject.schedule_claim(claim(uuid4(), count=5))
+    queued = [entry.job for entry in subject._jobs.values()]
+    assert len(queued) >= 2
+    assert worker._status is not None
+    worker._status.items.append(("active", queued[0].id))
+    old_epoch = getattr(worker, "epoch", 0)
+
+    try:
+        subject.cancel(queued[0].id)
+
+        assert subject.queued_jobs == 0
+        assert subject.scheduled_runway_seconds == 0
+        assert subject._job_ids_by_key == {}
+        assert subject._waiters_by_key == {}
+        assert subject._waiters_by_association == {}
+        restarted_epoch = getattr(worker, "epoch", 0)
+        assert restarted_epoch != old_epoch
+
+        worker.cancel(queued[1].id)
+        worker.cancel(queued[1].id)
+        assert getattr(worker, "epoch", 0) == restarted_epoch
+
+        subject.handle_result(
+            SpeculativeResult(
+                queued[1].id,
+                queued[1].cache_key,
+                b"stale-pcm",
+                0.1,
+                1.0,
+                epoch=old_epoch,
+            )
+        )
+        assert subject.cache.get(queued[1].cache_key, 10.0) is None
+
+        wait_for_condition(
+            lambda: len(context.processes) == 2 and worker.ready,
+            description="one coalesced replacement worker",
+        )
+        assert len(context.processes) == 2
+    finally:
+        worker.stop()
+
+    manager_thread = getattr(worker, "_manager_thread", None)
+    assert manager_thread is None or not manager_thread.is_alive()
+    assert all(queue.closed for queue in context.created_queues)
+    assert all(not process.is_alive() for process in context.processes)
+
+
+def test_begin_authoritative_returns_while_real_worker_restart_is_blocked(
+    monkeypatch,
+) -> None:
+    import server.lookahead.worker as worker_module
+
+    restart_started = Event()
+    restart_release = Event()
+    context = BlockingRestartContext(restart_started, restart_release)
+    monkeypatch.setattr(worker_module, "get_context", lambda _method: context)
+    worker = SpeculativeWorker(max_jobs=8, startup_timeout=0, shutdown_timeout=0)
+    assert worker.start()
+
+    now = 10.0
+    settings = LookAheadSettings(
+        enabled=True, max_queued_jobs=8, max_runway_seconds=60
+    )
+    store = SnapshotStore()
+    store.configure_budgets(
+        max_active_streams=8,
+        max_global_characters=12_000,
+        stream_ttl_seconds=30,
+    )
+    subject = LookAheadScheduler(
+        worker=worker,
+        store=store,
+        cache=PcmCache(max_bytes=100_000, ttl_seconds=100),
+        settings=settings,
+        clock=lambda: now,
+    )
+    subject.estimator.target_runway_seconds = 60
+    service = LookAheadService(
+        settings=settings,
+        store=store,
+        scheduler=subject,
+        registry=CorrelationRegistry(clock=lambda: now),
+        model_version="kokoro",
+        clock=lambda: now,
+    )
+    stream_id = uuid4()
+    window = units(5)
+    snapshot = LookAheadSnapshot.model_validate(
+        {
+            "protocol": 1,
+            "generation": 1,
+            "revision": 1,
+            "currentSequence": window[0].sequence,
+            "source": {"rate": 1.0, "lang": "en-GB"},
+            "synthesisHint": {
+                "route": "kokoro",
+                "voice": "af_heart",
+                "speed": 1.0,
+                "format": "pcm_24k_16bit",
+            },
+            "units": [
+                unit.model_dump(by_alias=True, exclude_none=True) for unit in window
+            ],
+        }
+    )
+    store.replace(stream_id, snapshot, raw_body_bytes=100, now=now)
+    record = store.get(stream_id)
+    assert record is not None
+    service.observe_snapshot(stream_id, record)
+    engine_id = uuid4()
+
+    def headers(request_id: UUID) -> dict[str, str]:
+        return {
+            "X-VoiceLink-Bridge-Protocol": "2",
+            "X-VoiceLink-Engine-Instance": str(engine_id),
+            "X-VoiceLink-Request-Id": str(request_id),
+        }
+
+    def request(text: str):
+        return SimpleNamespace(
+            text=text, voice="af_heart", speed=1.0, format="pcm_24k_16bit"
+        )
+
+    first = service.begin_authoritative(
+        headers(uuid4()), request(window[0].text), now
+    )
+    service.finish_authoritative(first, b"current-pcm", 0.0, now)
+    queued = [entry.job for entry in subject._jobs.values()]
+    assert len(queued) >= 2
+    assert worker._status is not None
+    worker._status.items.append(("active", queued[0].id))
+    old_epoch = getattr(worker, "epoch", 0)
+    request_returned = Event()
+
+    def invoke_authoritative_request() -> None:
+        async def invoke() -> None:
+            service.begin_authoritative(
+                headers(uuid4()), request(window[1].text), now
+            )
+            await asyncio.sleep(0)
+            request_returned.set()
+
+        asyncio.run(invoke())
+
+    request_thread = Thread(target=invoke_authoritative_request)
+    request_thread.start()
+    try:
+        assert restart_started.wait(1.0), "active cancellation did not begin restart"
+        assert request_returned.wait(1.0), (
+            "begin_authoritative blocked its event-loop thread on worker restart"
+        )
+        assert subject.queued_jobs == 0
+        assert subject.scheduled_runway_seconds == 0
+        restarted_epoch = getattr(worker, "epoch", 0)
+        assert restarted_epoch != old_epoch
+
+        worker.cancel(queued[1].id)
+        worker.cancel(queued[1].id)
+        assert getattr(worker, "epoch", 0) == restarted_epoch
+
+        subject.handle_result(
+            SpeculativeResult(
+                queued[1].id,
+                queued[1].cache_key,
+                b"stale-pcm",
+                0.1,
+                1.0,
+                epoch=old_epoch,
+            )
+        )
+        assert subject.cache.get(queued[1].cache_key, now) is None
+    finally:
+        restart_release.set()
+        request_thread.join(2.0)
+        worker.stop()
+
+    assert not request_thread.is_alive()
+    manager_thread = getattr(worker, "_manager_thread", None)
+    assert manager_thread is None or not manager_thread.is_alive()
+    assert all(queue.closed for queue in context.created_queues)
 
 
 def test_worker_lossless_active_transition_restarts_blocked_child_when_status_is_saturated(monkeypatch) -> None:
@@ -559,12 +844,15 @@ def test_worker_lossless_active_transition_restarts_blocked_child_when_status_is
     import server.models
 
     active_attempted = Event()
+    idle_published = Event()
+    synthesis_started = Event()
     synthesis_released = Event()
     terminated: list[Event] = []
     jobs_released = Event()
 
     class Model:
         def synthesize(self, _text: str, *, voice: str, speed: float):
+            synthesis_started.set()
             synthesis_released.wait(2)
             if not terminated[0].is_set():
                 yield b"stale"
@@ -576,7 +864,9 @@ def test_worker_lossless_active_transition_restarts_blocked_child_when_status_is
     monkeypatch.setattr(
         worker_module,
         "get_context",
-        lambda _method: ThreadContext(active_attempted, terminated, jobs_released),
+        lambda _method: ThreadContext(
+            active_attempted, terminated, jobs_released, idle_published
+        ),
     )
     subject = SpeculativeWorker(
         max_jobs=1,
@@ -598,8 +888,12 @@ def test_worker_lossless_active_transition_restarts_blocked_child_when_status_is
         subject.cancel(job.id)
         synthesis_released.set()
 
-        assert subject._process is not stale_process
-        assert stale_process is not None and not stale_process.is_alive()
+        wait_for_condition(
+            lambda: (subject.drain_results() == [] and idle_published.is_set()),
+            description="lossless pre-synthesis cancellation handoff",
+        )
+        assert subject._process is stale_process
+        assert not synthesis_started.is_set()
         assert subject.drain_results() == []
     finally:
         subject.stop()

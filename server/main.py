@@ -182,13 +182,14 @@ async def lifespan(app: FastAPI):
         if not lookahead_worker.start():
             logger.warning("Look-ahead unavailable: isolated Kokoro worker did not become ready")
 
-        async def poll_lookahead_maintenance() -> None:
-            while True:
-                lookahead_service.maintain()
+    async def poll_lookahead_maintenance() -> None:
+        while True:
+            lookahead_service.maintain()
+            if settings.lookahead.enabled:
                 lookahead_scheduler.poll()
-                await asyncio.sleep(0.05)
+            await asyncio.sleep(0.05)
 
-        poll_task = asyncio.create_task(poll_lookahead_maintenance())
+    poll_task = asyncio.create_task(poll_lookahead_maintenance())
 
     # --- SERVE REQUESTS ---
     try:
