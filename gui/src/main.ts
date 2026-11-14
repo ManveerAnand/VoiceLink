@@ -206,7 +206,17 @@ class SpotlightTour {
         // Allow clicking through to the highlighted target
       }
     });
+
+    window.addEventListener("resize", this.onResize);
+    window.addEventListener("keydown", this.onKeyDown);
   }
+
+  private onResize = () => this.showStep(this.currentIndex);
+
+  // Escape always closes the tour, even if the tooltip is somehow unreachable
+  private onKeyDown = (e: KeyboardEvent) => {
+    if (e.key === "Escape") this.end();
+  };
 
   private showStep(index: number) {
     if (!this.overlay || !this.highlight || !this.tooltip) return;
@@ -284,6 +294,14 @@ class SpotlightTour {
         this.tooltip.style.top = `${targetRect.top - gap - 160}px`;
         break;
     }
+
+    // Clamp inside the window so Next/Skip stay reachable at any window size
+    const margin = 12;
+    const t = this.tooltip.getBoundingClientRect();
+    const left = Math.max(margin, Math.min(t.left, window.innerWidth - t.width - margin));
+    const top = Math.max(margin, Math.min(t.top, window.innerHeight - t.height - margin));
+    this.tooltip.style.left = `${left}px`;
+    this.tooltip.style.top = `${top}px`;
   }
 
   next() {
@@ -293,6 +311,8 @@ class SpotlightTour {
   end() {
     localStorage.setItem("tourCompleted", "true");
     this.active = false;
+    window.removeEventListener("resize", this.onResize);
+    window.removeEventListener("keydown", this.onKeyDown);
     if (this.overlay) {
       this.overlay.remove();
       this.overlay = null;
