@@ -222,7 +222,8 @@ fn data_env(cfg: &AppConfig) -> Vec<(String, String)> {
 }
 
 /// Holds the server process handle so we can stop it later
-struct ServerProcess(Option<std::process::Child>);
+/// (and when it was spawned, so the watchdog can tell "still loading" from "dead")
+struct ServerProcess(Option<std::process::Child>, Option<std::time::Instant>);
 
 /// Whether we intentionally started the server (vs found it running externally)
 struct ServerManagedByUs(bool);
@@ -1674,6 +1675,7 @@ async fn start_server(app: AppHandle) -> Result<(), String> {
         let state = app.state::<Mutex<ServerProcess>>();
         let mut proc = state.lock().map_err(|e| e.to_string())?;
         proc.0 = Some(child);
+        proc.1 = Some(std::time::Instant::now());
 
         // Mark that we manage the server (enables watchdog auto-restart)
         let managed = app.state::<Mutex<ServerManagedByUs>>();
@@ -1864,6 +1866,9 @@ fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
 
 const WATCHDOG_INTERVAL_SECS: u64 = 15;
 const MAX_CONSECUTIVE_RESTARTS: u32 = 5;
+/// How long a freshly spawned server may take to load its model before a failed
+/// health check counts as a crash (first run downloads and loads Kokoro).
+const SERVER_LOAD_GRACE_SECS: u64 = 120;
 
 async fn server_watchdog(app: AppHandle) {
     let mut consecutive_restarts: u32 = 0;
@@ -1901,6 +1906,17 @@ async fn server_watchdog(app: AppHandle) {
                 eprintln!("[watchdog] Server recovered after {} restart(s)", consecutive_restarts);
                 consecutive_restarts = 0;
             }
+            continue;
+        }
+
+        // A child that is still alive and recently spawned is loading the model,
+        // not crashed: don't count it and don't spawn a second one.
+        let loading_secs = app.state::<Mutex<ServerProcess>>().lock().ok().and_then(|mut p| {
+            let alive = matches!(p.0.as_mut().map(|c| c.try_wait()), Some(Ok(None)));
+            p.1.filter(|_| alive).map(|t| t.elapsed().as_secs())
+        });
+        if let Some(secs) = loading_secs.filter(|s| *s < SERVER_LOAD_GRACE_SECS) {
+            eprintln!("[watchdog] Server still loading ({}s)...", secs);
             continue;
         }
 
@@ -1943,11 +1959,21 @@ async fn server_watchdog(app: AppHandle) {
             continue;
         }
 
+        // A child that outlived the grace period without answering is hung and
+        // may still hold the port: stop it before spawning a new one.
+        if let Ok(mut proc) = app.state::<Mutex<ServerProcess>>().lock() {
+            if let Some(ref mut old) = proc.0 {
+                let _ = old.kill();
+                let _ = old.wait();
+            }
+        }
+
         match spawn_server(&cfg) {
             Ok(child) => {
                 // Update the stored process handle
                 if let Ok(mut proc) = app.state::<Mutex<ServerProcess>>().lock() {
                     proc.0 = Some(child);
+                    proc.1 = Some(std::time::Instant::now());
                 }
                 eprintln!("[watchdog] Server process spawned. Waiting for it to become healthy...");
                 // Give it time to start before next health check
@@ -1968,7 +1994,7 @@ async fn server_watchdog(app: AppHandle) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .manage(Mutex::new(ServerProcess(None)))
+        .manage(Mutex::new(ServerProcess(None, None)))
         .manage(Mutex::new(ServerManagedByUs(false)))
         .manage(Mutex::new(AppConfig::load()))
         .manage(Mutex::new(DownloadPid(None)))
