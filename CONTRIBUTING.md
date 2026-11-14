@@ -19,9 +19,9 @@ These are the same steps CI runs (`.github/workflows/ci.yml`):
 
 ```sh
 # SAPI bridge (C++), 64-bit and 32-bit
-cmake -B sapi_bridge/build -S sapi_bridge -G "Visual Studio 17 2022" -A x64
+cmake -B sapi_bridge/build -S sapi_bridge -A x64
 cmake --build sapi_bridge/build --config Release
-cmake -B sapi_bridge/build32 -S sapi_bridge -G "Visual Studio 17 2022" -A Win32
+cmake -B sapi_bridge/build32 -S sapi_bridge -A Win32
 cmake --build sapi_bridge/build32 --config Release
 
 # GUI (Tauri: Node 20 + Rust stable)
