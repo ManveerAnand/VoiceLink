@@ -81,6 +81,12 @@ interface SetupPaths {
 
 let currentVoices: VoiceInfo[] = [];
 let registeredVoiceIds: Set<string> = new Set();
+let voicesLoaded = false;
+let favoriteIds: string[] = [];
+let removedIds: string[] = [];
+let defaultVoice: { id: string | null; name: string } = { id: null, name: "" };
+let testPicker: VoicePicker | null = null;
+let narratePicker: VoicePicker | null = null;
 let cachedGpuInfo: GpuInfo | null = null;
 let qwen3DownloadPaused = false;
 let qwen3Downloading = false;
@@ -536,6 +542,8 @@ async function checkServerStatus() {
       if (voicesEl) voicesEl.textContent = formatUptime(result.health.uptime_seconds);
       updateServerToggle(toggleBtn, true);
       updateServerLogHint(false);
+      // The server may have started after the first voice load
+      if (!voicesLoaded && setupComplete) loadVoices();
     } else if (result.running) {
       indicator?.classList.remove("offline");
       indicator?.classList.add("online");
@@ -604,6 +612,19 @@ async function loadVoices() {
   const container = document.getElementById("voices-list");
   if (!container) return;
 
+  // Favorites / removed list / default voice live in config + registry, not on the server
+  try {
+    const [prefs, def] = await Promise.all([
+      invoke<{ favorites: string[]; removed: string[] }>("get_voice_prefs"),
+      invoke<{ id: string | null; name: string }>("get_default_voice"),
+    ]);
+    favoriteIds = prefs.favorites;
+    removedIds = prefs.removed;
+    defaultVoice = def;
+  } catch (e) {
+    console.error("Load voice prefs failed:", e);
+  }
+
   try {
     const [voices, regIds] = await Promise.all([
       invoke<VoiceInfo[]>("get_voices"),
@@ -611,12 +632,21 @@ async function loadVoices() {
     ]);
     currentVoices = voices;
     registeredVoiceIds = new Set(regIds);
+    voicesLoaded = true;
     renderVoices(container);
-    populateTestVoiceSelect();
   } catch (e) {
     container.innerHTML = `<p class="placeholder error">Could not load voices. Is the server running?</p>`;
     console.error("Load voices failed:", e);
   }
+  refreshVoiceViews();
+}
+
+/** Re-draw everything that shows voices outside the Voice Manager grid */
+function refreshVoiceViews() {
+  testPicker?.setVoices(currentVoices.filter((v) => registeredVoiceIds.has(v.id)));
+  narratePicker?.setVoices(currentVoices.filter((v) => v.id.startsWith("qwen3_")));
+  renderFavorites();
+  updateRestoreCard();
 }
 
 function renderVoices(container: HTMLElement) {
@@ -643,11 +673,14 @@ function renderVoices(container: HTMLElement) {
         sourceBadge = `<span class="badge badge-muted">Kokoro</span>`;
       }
 
+      const isFav = favoriteIds.includes(v.id);
+
       return `
     <div class="voice-card card ${isEnabled ? "" : "voice-disabled"}" data-voice-id="${v.id}">
       <div class="voice-header">
         <span class="voice-name">${escapeHtml(displayVoiceName(v.name))}</span>
         <div class="voice-header-right">
+          <button class="voice-star ${isFav ? "on" : ""}" data-id="${v.id}" aria-pressed="${isFav}" aria-label="${isFav ? "Remove from favorites" : "Add to favorites"}" title="${isFav ? "Remove from favorites" : "Add to favorites"}">${isFav ? "★" : "☆"}</button>
           ${sourceBadge}
           <span class="voice-badge ${v.gender.toLowerCase()}">${v.gender}</span>
           <label class="switch voice-toggle" title="${isEnabled ? "Disable in SAPI" : "Enable in SAPI"}">
@@ -665,6 +698,7 @@ function renderVoices(container: HTMLElement) {
       <div class="voice-actions">
         <button class="btn btn-sm btn-secondary btn-rename" data-id="${v.id}">Rename</button>
         <button class="btn btn-sm btn-primary btn-test" data-id="${v.id}">Test</button>
+        <button class="btn btn-sm btn-secondary btn-delete" data-id="${v.id}">Delete</button>
       </div>
     </div>
   `;
@@ -678,6 +712,14 @@ function renderVoices(container: HTMLElement) {
 
   container.querySelectorAll<HTMLButtonElement>(".btn-test").forEach((btn) => {
     btn.addEventListener("click", () => handleTestVoice(btn.dataset.id!));
+  });
+
+  container.querySelectorAll<HTMLButtonElement>(".btn-delete").forEach((btn) => {
+    btn.addEventListener("click", () => handleDeleteVoice(btn.dataset.id!));
+  });
+
+  container.querySelectorAll<HTMLButtonElement>(".voice-star").forEach((btn) => {
+    btn.addEventListener("click", () => handleToggleFavorite(btn.dataset.id!));
   });
 
   // Wire up toggle switches
@@ -713,7 +755,7 @@ async function handleToggleVoice(voiceId: string, enabled: boolean) {
     }
     const container = document.getElementById("voices-list");
     if (container) renderVoices(container);
-    populateTestVoiceSelect();
+    refreshVoiceViews();
     // Refresh dashboard SAPI status
     checkSapiStatus();
   } catch (e) {
@@ -755,30 +797,325 @@ async function playVoicePreview(voiceId: string, text: string) {
   playPcmAudio(new Uint8Array(pcmBytes));
 }
 
-function populateTestVoiceSelect() {
-  const select = document.getElementById("test-voice") as HTMLSelectElement | null;
-  if (!select) return;
+async function handleDeleteVoice(voiceId: string) {
+  const voice = currentVoices.find((v) => v.id === voiceId);
+  if (!voice) return;
+  const name = displayVoiceName(voice.name);
+  const isClone = voiceId.startsWith("qwen3_custom_");
 
-  // Only show registered (enabled) voices in Quick Test dropdown
-  const enabledVoices = currentVoices.filter((v) => registeredVoiceIds.has(v.id));
-  select.innerHTML = enabledVoices
-    .map((v) => `<option value="${v.id}">${escapeHtml(displayVoiceName(v.name))}</option>`)
-    .join("");
+  const ok = await showModal(
+    `Delete ${name}?`,
+    isClone
+      ? `${name} will be deleted for good, including its reference audio. This can't be undone.`
+      : `${name} will be removed from VoiceLink and from every app (Edge, Balabolka...). You can restore it later in Settings.`,
+    false,
+    "Delete voice"
+  );
+  if (ok === null) return;
+
+  try {
+    // Unregisters from SAPI first (UAC prompt if needed); nothing is lost if that is cancelled
+    await invoke("delete_voice", { voiceId });
+    if (isClone) await invoke("qwen3_delete_clone", { voiceId });
+  } catch (e) {
+    await showModal("Error", `Delete failed: ${e}`, true);
+  }
+  await loadVoices();
+  checkSapiStatus();
+}
+
+async function handleToggleFavorite(voiceId: string) {
+  const favorite = !favoriteIds.includes(voiceId);
+  try {
+    await invoke("set_favorite_voice", { voiceId, favorite });
+    favoriteIds = favorite ? [...favoriteIds, voiceId] : favoriteIds.filter((id) => id !== voiceId);
+    const container = document.getElementById("voices-list");
+    if (container) renderVoices(container);
+    refreshVoiceViews();
+  } catch (e) {
+    await showModal("Error", `Could not update favorites: ${e}`, true);
+  }
 }
 
 // ============================================================================
-// Quick Test (Dashboard)
+// Favorite voices (Dashboard)
+// ============================================================================
+
+function renderFavorites() {
+  const box = document.getElementById("favorite-chips");
+  const line = document.getElementById("default-voice-line");
+  if (!box) return;
+
+  const favs = currentVoices.filter((v) => favoriteIds.includes(v.id));
+  box.innerHTML = favs.length
+    ? favs
+        .map((v) => {
+          const name = escapeHtml(displayVoiceName(v.name));
+          const on = registeredVoiceIds.has(v.id);
+          return `<div class="fav-chip ${v.id === defaultVoice.id ? "is-default" : ""} ${on ? "" : "is-off"}">
+            <button class="fav-name" data-id="${v.id}" title="${on ? `Make ${name} the Windows default voice` : "Turn this voice on in Voice Manager first"}">★ ${name}</button>
+            <button class="fav-play" data-id="${v.id}" aria-label="Play a sample of ${name}" title="Play a sample">▶</button>
+          </div>`;
+        })
+        .join("")
+    : `<span class="fav-empty">${currentVoices.length ? "Star voices in Voice Manager to pin them here." : "Voices appear here once the server is running."}</span>`;
+
+  if (line) line.textContent = `Default: ${defaultVoice.name ? displayVoiceName(defaultVoice.name) : "Windows default"}`;
+
+  box.querySelectorAll<HTMLButtonElement>(".fav-name").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      try {
+        await invoke("set_default_voice", { voiceId: btn.dataset.id });
+        defaultVoice = await invoke("get_default_voice");
+        renderFavorites();
+      } catch (e) {
+        await showModal("Error", `${e}`, true);
+      }
+    });
+  });
+  box.querySelectorAll<HTMLButtonElement>(".fav-play").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      try {
+        await playVoicePreview(btn.dataset.id!, "Hello! This is a sample of my voice.");
+      } catch (e) {
+        await showModal("Error", `Preview failed: ${e}`, true);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  });
+}
+
+// ============================================================================
+// Restore removed voices (Settings)
+// ============================================================================
+
+function updateRestoreCard() {
+  const label = document.getElementById("restore-voices-label");
+  const btn = document.getElementById("btn-restore-voices") as HTMLButtonElement | null;
+  if (label) label.textContent = removedIds.length ? `${removedIds.length} removed voice${removedIds.length === 1 ? "" : "s"}` : "No removed voices";
+  if (btn) btn.disabled = removedIds.length === 0;
+}
+
+async function handleRestoreVoices() {
+  const btn = document.getElementById("btn-restore-voices") as HTMLButtonElement | null;
+  const status = document.getElementById("restore-voices-status");
+  const ids = [...removedIds];
+  if (!btn || !status || ids.length === 0) return;
+
+  const say = (msg: string) => {
+    status.textContent = msg;
+    status.classList.remove("hidden");
+  };
+  btn.disabled = true;
+  try {
+    // Kokoro voicepacks come back from Hugging Face; built-in Qwen3 voices have no file to fetch
+    const kokoro = ids.filter((id) => !id.startsWith("qwen3_"));
+    if (kokoro.length) {
+      say("Downloading voice files...");
+      const paths = await invoke<SetupPaths>("get_setup_paths");
+      const script = `from huggingface_hub import hf_hub_download
+for v in ${JSON.stringify(kokoro)}:
+    print('Downloading ' + v + '...', flush=True)
+    hf_hub_download('hexgrad/Kokoro-82M', 'voices/' + v + '.pt')
+`;
+      await invoke("setup_run_command", {
+        program: paths.python_exe,
+        args: ["-c", script],
+        stepName: "voice-restore",
+        env: { VOICELINK_DATA_DIR: paths.data_dir },
+      });
+    }
+    await invoke("unremove_voices", { voiceIds: ids });
+    removedIds = [];
+
+    say("Registering voices (you may see a permission prompt)...");
+    let failed = 0;
+    for (const id of ids) {
+      try {
+        await invoke("toggle_voice", { voiceId: id, enabled: true });
+      } catch (_) {
+        failed++;
+      }
+    }
+    say(failed ? `Restored ${ids.length} voices. ${failed} could not be turned on; switch them on in Voice Manager.` : `Restored ${ids.length} voice${ids.length === 1 ? "" : "s"}.`);
+    await loadVoices();
+    checkSapiStatus();
+  } catch (e) {
+    say(`Restore failed: ${String(e).split("stderr:").pop()!.trim()}`);
+  }
+  updateRestoreCard();
+}
+
+// ============================================================================
+// Voice picker: one dropdown used by Quick Test and Narrate
+// ============================================================================
+
+interface VoicePicker {
+  setVoices(voices: VoiceInfo[]): void;
+  readonly value: string;
+}
+
+/**
+ * Custom combobox (focus stays on the button, arrow keys move the highlighted
+ * option via aria-activedescendant). Listeners are added once here; setVoices
+ * only re-draws the list contents.
+ */
+function createVoicePicker(host: HTMLElement, label: string): VoicePicker {
+  const uid = host.id;
+  host.innerHTML = `
+    <button type="button" class="vp-trigger" role="combobox" aria-haspopup="listbox" aria-expanded="false" aria-controls="${uid}-list" aria-label="${label}">
+      <span class="vp-current"></span>
+      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>
+    </button>
+    <div id="${uid}-list" class="vp-list hidden" role="listbox" aria-label="${label}"></div>`;
+  const trigger = host.querySelector<HTMLButtonElement>(".vp-trigger")!;
+  const current = host.querySelector<HTMLElement>(".vp-current")!;
+  const list = host.querySelector<HTMLElement>(".vp-list")!;
+
+  let voices: VoiceInfo[] = [];
+  let flat: VoiceInfo[] = []; // options in display order (a favorite appears twice)
+  let value = "";
+  let active = -1;
+
+  const isOpen = () => !list.classList.contains("hidden");
+
+  function renderList() {
+    flat = [];
+    const sections: [string, VoiceInfo[]][] = [
+      ["★ Favorites", voices.filter((v) => favoriteIds.includes(v.id))],
+      ["Kokoro", voices.filter((v) => v.model !== "qwen3")],
+      ["Qwen3", voices.filter((v) => v.model === "qwen3")],
+    ];
+    list.innerHTML =
+      sections
+        .filter(([, vs]) => vs.length)
+        .map(([title, vs], g) => `
+          <div role="group" aria-labelledby="${uid}-g${g}">
+            <div class="vp-group-label" id="${uid}-g${g}">${title}</div>
+            ${vs.map((v) => {
+              flat.push(v);
+              const i = flat.length - 1;
+              return `<div class="vp-option" role="option" id="${uid}-o${i}" data-i="${i}" aria-selected="${v.id === value}">
+                <span class="vp-name">${escapeHtml(displayVoiceName(v.name))}</span>
+                <span class="voice-tag">${escapeHtml(v.language)}</span>
+                <span class="voice-badge ${v.gender.toLowerCase()}">${escapeHtml(v.gender)}</span>
+                ${v.tags.includes("qwen3-cloned") ? `<span class="badge badge-warning">cloned</span>` : ""}
+              </div>`;
+            }).join("")}
+          </div>`)
+        .join("") || `<div class="vp-empty">No voices available</div>`;
+  }
+
+  function setActive(i: number) {
+    if (!flat.length) return;
+    active = Math.max(0, Math.min(flat.length - 1, i));
+    list.querySelectorAll(".vp-option.active").forEach((o) => o.classList.remove("active"));
+    const opt = list.querySelector<HTMLElement>(`#${uid}-o${active}`);
+    opt?.classList.add("active");
+    opt?.scrollIntoView({ block: "nearest" });
+    trigger.setAttribute("aria-activedescendant", `${uid}-o${active}`);
+  }
+
+  function open() {
+    if (isOpen()) return;
+    list.classList.remove("hidden");
+    trigger.setAttribute("aria-expanded", "true");
+    setActive(Math.max(0, flat.findIndex((v) => v.id === value)));
+  }
+
+  function close() {
+    list.classList.add("hidden");
+    trigger.setAttribute("aria-expanded", "false");
+    trigger.removeAttribute("aria-activedescendant");
+  }
+
+  function choose(i: number) {
+    if (flat[i]) {
+      value = flat[i].id;
+      current.textContent = displayVoiceName(flat[i].name);
+      renderList();
+    }
+    close();
+  }
+
+  trigger.addEventListener("click", () => (isOpen() ? close() : open()));
+  trigger.addEventListener("keydown", (e) => {
+    if (!isOpen()) {
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        open();
+      }
+      return;
+    }
+    switch (e.key) {
+      case "ArrowDown": setActive(active + 1); break;
+      case "ArrowUp": setActive(active - 1); break;
+      case "Home": setActive(0); break;
+      case "End": setActive(flat.length - 1); break;
+      case "Enter":
+      case " ": choose(active); break;
+      case "Escape": close(); break;
+      default: return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+  });
+  // Keep focus on the button while clicking options
+  list.addEventListener("mousedown", (e) => e.preventDefault());
+  list.addEventListener("click", (e) => {
+    const opt = (e.target as HTMLElement).closest<HTMLElement>(".vp-option");
+    if (opt) choose(Number(opt.dataset.i));
+  });
+  list.addEventListener("mouseover", (e) => {
+    const opt = (e.target as HTMLElement).closest<HTMLElement>(".vp-option");
+    if (opt) setActive(Number(opt.dataset.i));
+  });
+  // Outside click / Tab away closes (one document listener per picker, added here only)
+  document.addEventListener("pointerdown", (e) => {
+    if (!host.contains(e.target as Node)) close();
+  });
+  host.addEventListener("focusout", (e) => {
+    if (!host.contains(e.relatedTarget as Node)) close();
+  });
+
+  return {
+    setVoices(vs) {
+      voices = vs;
+      if (!vs.some((v) => v.id === value)) value = vs[0]?.id ?? "";
+      current.textContent = vs.length ? displayVoiceName(vs.find((v) => v.id === value)!.name) : "No voices";
+      renderList();
+      if (isOpen()) setActive(active);
+    },
+    get value() {
+      return value;
+    },
+  };
+}
+
+// ============================================================================
+// Quick Test (Voice Manager)
 // ============================================================================
 
 function setupQuickTest() {
+  const testHost = document.getElementById("test-voice");
+  if (testHost) testPicker = createVoicePicker(testHost, "Voice");
+  const narrateHost = document.getElementById("narrate-voice");
+  if (narrateHost) narratePicker = createVoicePicker(narrateHost, "Voice");
+
+  document.getElementById("btn-manage-voices")?.addEventListener("click", () => {
+    document.querySelector<HTMLElement>('.nav-item[data-page="voices"]')?.click();
+  });
+  document.getElementById("btn-restore-voices")?.addEventListener("click", handleRestoreVoices);
+
   const btn = document.getElementById("btn-preview");
   btn?.addEventListener("click", async () => {
     const textEl = document.getElementById("test-text") as HTMLTextAreaElement;
-    const selectEl = document.getElementById("test-voice") as HTMLSelectElement;
-    if (!textEl || !selectEl) return;
+    if (!textEl || !testPicker) return;
 
     const text = textEl.value.trim();
-    const voiceId = selectEl.value;
+    const voiceId = testPicker.value;
     if (!text || !voiceId) return;
 
     btn.setAttribute("disabled", "true");
@@ -799,7 +1136,8 @@ function setupQuickTest() {
 // Custom Modal (replaces browser prompt/alert)
 // ============================================================================
 
-function showModal(title: string, defaultValue: string, alertOnly = false): Promise<string | null> {
+// confirmLabel turns it into a Cancel / <confirmLabel> question: resolves "" on confirm, null on cancel
+function showModal(title: string, defaultValue: string, alertOnly = false, confirmLabel?: string): Promise<string | null> {
   return new Promise((resolve) => {
     const overlay = document.getElementById("modal-overlay")!;
     const titleEl = document.getElementById("modal-title")!;
@@ -819,12 +1157,17 @@ function showModal(title: string, defaultValue: string, alertOnly = false): Prom
       input.parentElement!.insertBefore(msgEl, input);
     }
 
-    if (alertOnly) {
+    const messageOnly = alertOnly || !!confirmLabel;
+    okBtn.classList.toggle("btn-danger", !!confirmLabel);
+    okBtn.classList.toggle("btn-primary", !confirmLabel);
+
+    if (messageOnly) {
       input.style.display = "none";
       msgEl.style.display = "";
       msgEl.textContent = defaultValue;
-      okBtn.textContent = "OK";
-      cancelBtn.style.display = "none";
+      okBtn.textContent = confirmLabel ?? "OK";
+      cancelBtn.style.display = confirmLabel ? "" : "none";
+      setTimeout(() => (confirmLabel ? cancelBtn : okBtn).focus(), 50);
     } else {
       input.style.display = "";
       msgEl.style.display = "none";
@@ -838,12 +1181,12 @@ function showModal(title: string, defaultValue: string, alertOnly = false): Prom
       overlay.classList.add("hidden");
       okBtn.removeEventListener("click", onOk);
       cancelBtn.removeEventListener("click", onCancel);
-      input.removeEventListener("keydown", onKey);
+      overlay.removeEventListener("keydown", onKey);
     }
 
     function onOk() {
       cleanup();
-      resolve(alertOnly ? "" : input.value.trim());
+      resolve(messageOnly ? "" : input.value.trim());
     }
 
     function onCancel() {
@@ -851,14 +1194,16 @@ function showModal(title: string, defaultValue: string, alertOnly = false): Prom
       resolve(null);
     }
 
+    // On the overlay so Escape also works when a button has focus; Enter on a
+    // focused button is that button's own click
     function onKey(e: KeyboardEvent) {
-      if (e.key === "Enter") onOk();
+      if (e.key === "Enter" && e.target === input) onOk();
       if (e.key === "Escape") onCancel();
     }
 
     okBtn.addEventListener("click", onOk);
     cancelBtn.addEventListener("click", onCancel);
-    input.addEventListener("keydown", onKey);
+    overlay.addEventListener("keydown", onKey);
   });
 }
 
@@ -2129,7 +2474,7 @@ async function loadQwen3Voices() {
 // Narrate Page
 // ============================================================================
 
-let narrateInitialized = false;
+let narrateWired = false;
 let narratePcmData: Uint8Array | null = null;
 let narrateAudioCtx: AudioContext | null = null;
 let narrateSource: AudioBufferSourceNode | null = null;
@@ -2139,8 +2484,12 @@ let narrateOffset = 0;
 let narratePlaying = false;
 let narrateRafId = 0;
 
+/** Runs on every visit to the Narrate page: refresh the voice list, wire listeners once */
 function setupNarratePage() {
-  const voiceSelect = document.getElementById("narrate-voice") as HTMLSelectElement | null;
+  narratePicker?.setVoices(currentVoices.filter((v) => v.id.startsWith("qwen3_")));
+  if (narrateWired) return;
+  narrateWired = true;
+
   const textArea = document.getElementById("narrate-text") as HTMLTextAreaElement | null;
   const fileInput = document.getElementById("narrate-file") as HTMLInputElement | null;
   const speedSlider = document.getElementById("narrate-speed") as HTMLInputElement | null;
@@ -2148,16 +2497,7 @@ function setupNarratePage() {
   const charCount = document.getElementById("narrate-char-count");
   const generateBtn = document.getElementById("btn-narrate-generate") as HTMLButtonElement | null;
 
-  if (!voiceSelect || !textArea) return;
-
-  // Populate voice selector with Qwen3 voices
-  const qwen3Voices = currentVoices.filter((v) => v.id.startsWith("qwen3_"));
-  voiceSelect.innerHTML = qwen3Voices
-    .map((v) => `<option value="${v.id}">${escapeHtml(displayVoiceName(v.name))}</option>`)
-    .join("");
-
-  if (narrateInitialized) return;
-  narrateInitialized = true;
+  if (!textArea) return;
 
   // Speed slider
   speedSlider?.addEventListener("input", () => {
@@ -2188,7 +2528,8 @@ function setupNarratePage() {
     const text = textArea.value.trim();
     if (!text) return;
 
-    const voiceId = voiceSelect.value;
+    const voiceId = narratePicker?.value ?? "";
+    if (!voiceId) return;
     const language = (document.getElementById("narrate-language") as HTMLSelectElement)?.value || "auto";
     const speed = parseFloat(speedSlider?.value || "1.0");
 
