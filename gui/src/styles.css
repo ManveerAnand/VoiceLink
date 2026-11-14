@@ -111,6 +111,10 @@ body {
   flex-shrink: 0;
 }
 
+.nav-item .badge {
+  margin-left: auto;
+}
+
 /* ---- Main Content ---- */
 #content {
   flex: 1;
