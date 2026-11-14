@@ -465,57 +465,61 @@ function setupNavigation() {
 // Server Status
 // ============================================================================
 
-/** Set while a Start/Stop click is running, so the 5 s status poll doesn't re-enable the button */
-let serverBusy: "starting" | "stopping" | null = null;
+type ServerPhase = "offline" | "loading" | "stopping" | "ready";
 
-/** Update the Start/Stop button label and styling based on server state */
-function updateServerToggle(btn: HTMLButtonElement | null, running: boolean) {
-  if (!btn) return;
-  btn.disabled = serverBusy !== null;
-  if (serverBusy) {
-    btn.textContent = serverBusy === "starting" ? "Starting… (loading model)" : "Stopping…";
-  } else if (running) {
-    btn.textContent = "Stop Server";
+/** What the Rust side reports ("server-state" event, get_server_state): the tray and Dashboard share it */
+interface ServerStateEvent {
+  state: ServerPhase;
+  device?: string;
+}
+
+let serverPhase: ServerPhase = "offline";
+let serverDevice = "";
+
+/** The only place that sets the Dashboard's server status text, dot and Start/Stop button */
+function applyServerState(ev: ServerStateEvent) {
+  serverPhase = ev.state;
+  serverDevice = ev.device ?? "";
+  const indicator = document.getElementById("server-indicator");
+  const statusEl = document.getElementById("server-status");
+  const btn = document.getElementById("btn-server-toggle") as HTMLButtonElement | null;
+  const ready = serverPhase === "ready";
+  const busy = serverPhase === "loading" || serverPhase === "stopping";
+
+  indicator?.classList.toggle("online", ready);
+  indicator?.classList.toggle("offline", !ready);
+  if (statusEl) {
+    statusEl.textContent = { offline: "Offline", loading: "Loading model…", stopping: "Stopping…", ready: "Running" }[serverPhase];
+  }
+  if (btn) {
+    btn.disabled = busy;
+    btn.textContent = { offline: "Start Server", loading: "Starting… (loading model)", stopping: "Stopping…", ready: "Stop Server" }[serverPhase];
+    btn.classList.toggle("btn-danger", ready);
+    btn.classList.toggle("btn-success", !ready);
+  }
+  updateServerLogHint(serverPhase === "offline");
+  if (ready) {
+    checkServerStatus();
   } else {
-    btn.textContent = "Start Server";
+    for (const id of ["server-model", "server-device", "server-voices"]) {
+      const el = document.getElementById(id);
+      if (el) el.textContent = "—";
+    }
   }
-  btn.classList.toggle("btn-danger", running);
-  btn.classList.toggle("btn-success", !running);
 }
 
-/** The model takes ~30 s to load and the server only answers after that: wait for it */
-async function waitForServerReady() {
-  for (let i = 0; i < 60; i++) {
-    const status = await invoke<ServerStatus>("get_server_status");
-    if (status.running) return;
-    await new Promise((r) => setTimeout(r, 2000));
-  }
-  throw new Error("The server did not start within 2 minutes. Use 'Show log file' below the status to see why.");
-}
-
-/** Wire up the Start/Stop Server button on the dashboard */
+/** Wire up the Start/Stop Server button on the dashboard; the new state arrives as a "server-state" event */
 function setupServerToggle() {
   const btn = document.getElementById("btn-server-toggle") as HTMLButtonElement | null;
   btn?.addEventListener("click", async () => {
-    if (!btn || serverBusy) return;
-    const isRunning = btn.classList.contains("btn-danger");
-    serverBusy = isRunning ? "stopping" : "starting";
-    updateServerToggle(btn, isRunning);
-    let failure: string | null = null;
+    if (serverPhase === "loading" || serverPhase === "stopping") return;
+    const stopping = serverPhase === "ready";
     try {
-      if (isRunning) {
-        await invoke("stop_server");
-      } else {
-        await invoke("start_server");
-        await waitForServerReady();
-      }
+      await invoke(stopping ? "stop_server" : "start_server");
     } catch (e) {
       console.error("Server toggle failed:", e);
-      failure = errorText(e);
+      await showModal(stopping ? "Could not stop the server" : "Could not start the server", errorText(e), true);
     }
-    serverBusy = null;
-    await checkServerStatus();
-    if (failure) await showModal(isRunning ? "Could not stop the server" : "Could not start the server", failure, true);
   });
 }
 
@@ -541,50 +545,22 @@ async function updateServerLogHint(serverDown: boolean) {
   }
 }
 
+/** Model, device and uptime details while the server is running (the state itself comes from "server-state") */
 async function checkServerStatus() {
-  const indicator = document.getElementById("server-indicator");
-  const statusEl = document.getElementById("server-status");
+  if (serverPhase !== "ready") return;
   const modelEl = document.getElementById("server-model");
   const deviceEl = document.getElementById("server-device");
   const voicesEl = document.getElementById("server-voices");
 
-  const toggleBtn = document.getElementById("btn-server-toggle") as HTMLButtonElement | null;
-
   try {
     const result: ServerStatus = await invoke("get_server_status");
-
-    if (result.running && result.health) {
-      indicator?.classList.remove("offline");
-      indicator?.classList.add("online");
-      if (statusEl) statusEl.textContent = "Running";
-      if (modelEl) modelEl.textContent = result.health.model ?? "—";
-      if (deviceEl) deviceEl.textContent = result.health.gpu_name ?? (result.health.gpu_available ? "GPU" : "CPU");
-      if (voicesEl) voicesEl.textContent = formatUptime(result.health.uptime_seconds);
-      updateServerToggle(toggleBtn, true);
-      updateServerLogHint(false);
-      // The server may have started after the first voice load
-      if (!voicesLoaded && setupComplete) loadVoices();
-    } else if (result.running) {
-      indicator?.classList.remove("offline");
-      indicator?.classList.add("online");
-      if (statusEl) statusEl.textContent = "Running (no health data)";
-      updateServerToggle(toggleBtn, true);
-      updateServerLogHint(false);
-    } else {
-      indicator?.classList.remove("online");
-      indicator?.classList.add("offline");
-      if (statusEl) statusEl.textContent = serverBusy === "starting" ? "Loading model…" : "Offline";
-      if (modelEl) modelEl.textContent = "—";
-      if (deviceEl) deviceEl.textContent = "—";
-      if (voicesEl) voicesEl.textContent = "—";
-      updateServerToggle(toggleBtn, false);
-      updateServerLogHint(serverBusy === null);
-    }
+    const health = result.running ? result.health : null;
+    if (modelEl) modelEl.textContent = health?.model ?? "—";
+    if (deviceEl) deviceEl.textContent = health?.gpu_name ?? (health?.gpu_available ? "GPU" : serverDevice || "CPU");
+    if (voicesEl) voicesEl.textContent = health ? formatUptime(health.uptime_seconds) : "—";
+    // The server may have started after the first voice load
+    if (health && !voicesLoaded && setupComplete) loadVoices();
   } catch (e) {
-    indicator?.classList.remove("online");
-    indicator?.classList.add("offline");
-    if (statusEl) statusEl.textContent = "Error";
-    updateServerToggle(toggleBtn, false);
     console.error("Status check failed:", e);
   }
 }
@@ -619,7 +595,14 @@ async function checkSapiStatus() {
 }
 
 function startStatusPolling() {
-  checkServerStatus();
+  let gotEvent = false;
+  listen<ServerStateEvent>("server-state", (e) => {
+    gotEvent = true;
+    applyServerState(e.payload);
+  });
+  invoke<ServerStateEvent>("get_server_state")
+    .then((ev) => { if (!gotEvent) applyServerState(ev); })
+    .catch(console.error);
   checkSapiStatus();
   window.setInterval(checkServerStatus, 5000);
 }
@@ -2056,13 +2039,104 @@ function updateQwen3DownloadButton(btn: HTMLButtonElement | null, settings: AppS
   }
 }
 
+// ---- Qwen3 download progress card: one implementation for Settings and the Voice Studio intro ----
+
+const Q3_STEPS: Record<string, string[]> = {
+  standard: ["Tokenizer", "Base", "CustomVoice"],
+  full: ["Tokenizer", "Base", "CustomVoice", "VoiceDesign"],
+};
+
+const q3 = {
+  state: "downloading" as "downloading" | "paused" | "done" | "error",
+  steps: Q3_STEPS.standard,
+  done: 0, // models finished
+  pct: 0,
+  text: "",
+  totalMb: 0,
+  samples: [] as { t: number; mb: number }[], // recent (time, MB downloaded) points for speed and ETA
+};
+let q3Timer: number | undefined;
+
+function qwen3ProgressBoxes(): HTMLElement[] {
+  return ["progress-qwen3", "progress-qwen3-studio"]
+    .map((id) => document.getElementById(id))
+    .filter((e): e is HTMLElement => !!e);
+}
+
+/** Reset the card and show it (call when a download starts or resumes) */
+function startQwen3Progress(tier: string) {
+  Object.assign(q3, { state: "downloading", steps: Q3_STEPS[tier] ?? Q3_STEPS.standard, done: 0, pct: 0, text: "", totalMb: 0, samples: [] });
+  const markup = `
+    <div class="q3-head">
+      <div class="q3-eq" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+      <span class="q3-state"></span>
+      <span class="q3-meta"></span>
+    </div>
+    <ol class="q3-steps">${q3.steps.map((n) => `<li>${n}</li>`).join("")}</ol>
+    <div class="q3-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100"><div class="q3-fill"></div></div>
+    <div class="q3-text"></div>`;
+  qwen3ProgressBoxes().forEach((b) => {
+    b.innerHTML = markup;
+    b.classList.add("q3");
+    b.classList.remove("hidden");
+  });
+  window.clearInterval(q3Timer);
+  q3Timer = window.setInterval(renderQwen3Progress, 1000); // keeps the ETA counting down between updates
+  renderQwen3Progress();
+}
+
+function stopQwen3Progress(state: typeof q3.state) {
+  q3.state = state;
+  window.clearInterval(q3Timer);
+  renderQwen3Progress();
+}
+
+/** Record a progress point; the speed is measured over about the last 5 s */
+function addQwen3Sample(mb: number, totalMb: number) {
+  const t = Date.now();
+  q3.totalMb = totalMb;
+  q3.samples.push({ t, mb });
+  // The progress script reports per file, so keep the newest point that is at least 5 s old as the baseline
+  while (q3.samples.length > 2 && q3.samples[1].t <= t - 5000) q3.samples.shift();
+}
+
+/** "18.4 MB/s · about 4 min left", or "" until there are two points to compare */
+function qwen3SpeedText(): string {
+  const [first, last] = [q3.samples[0], q3.samples[q3.samples.length - 1]];
+  if (!first || first === last) return "";
+  const secs = (last.t - first.t) / 1000;
+  if (secs < 1 || last.mb <= first.mb) return "";
+  const speed = (last.mb - first.mb) / secs;
+  const left = (q3.totalMb - last.mb) / speed - (Date.now() - last.t) / 1000;
+  const mins = Math.round(left / 60);
+  const eta = left < 20 ? "almost there" : left < 90 ? "about 1 min left"
+    : mins < 60 ? `about ${mins} min left` : `about ${Math.floor(mins / 60)} h ${mins % 60} min left`;
+  return `${speed.toFixed(1)} MB/s · ${eta}`;
+}
+
+function renderQwen3Progress() {
+  const label = { downloading: "Downloading", paused: "Paused", done: "Voice Studio is ready", error: "Download stopped" }[q3.state];
+  const meta = q3.state === "downloading" ? qwen3SpeedText() : "";
+  for (const box of qwen3ProgressBoxes()) {
+    box.dataset.state = q3.state;
+    box.querySelector(".q3-state")!.textContent = label;
+    box.querySelector(".q3-meta")!.textContent = meta;
+    box.querySelector(".q3-text")!.textContent = q3.text;
+    const bar = box.querySelector<HTMLElement>(".q3-bar")!;
+    bar.setAttribute("aria-valuenow", String(q3.pct));
+    box.querySelector<HTMLElement>(".q3-fill")!.style.width = `${q3.pct}%`;
+    box.querySelectorAll("li").forEach((li, i) => {
+      li.classList.toggle("done", q3.state === "done" || i < q3.done);
+      li.classList.toggle("current", q3.state !== "done" && i === q3.done);
+    });
+  }
+}
+
 async function downloadQwen3Models() {
   // Settings card + Voice Studio intro card show the same state
   const btns = qwen3Els("btn-download-qwen3", "btn-studio-install");
-  const fills = qwen3Els("fill-qwen3", "fill-qwen3-studio");
-  const texts = qwen3Els("text-qwen3", "text-qwen3-studio");
-  const setText = (t: string) => texts.forEach((e) => (e.textContent = t));
-  const setFill = (pct: string) => fills.forEach((e) => (e.style.width = pct));
+  const setText = (t: string) => { q3.text = t; renderQwen3Progress(); };
+  const setFill = (pct: number) => { q3.pct = pct; renderQwen3Progress(); };
   const setBtns = (label: string, warn: boolean) => btns.forEach((b) => {
     b.disabled = false;
     b.textContent = label;
@@ -2073,7 +2147,8 @@ async function downloadQwen3Models() {
   // Show downloading state; the same button now pauses (HF keeps partial files)
   qwen3Downloading = true;
   setBtns("Pause Download", true);
-  qwen3Els("progress-qwen3", "progress-qwen3-studio").forEach((p) => p.classList.remove("hidden"));
+  const stepTier = await invoke<AppSettings>("get_settings").then((s) => s.qwen3_model_tier).catch(() => "standard");
+  startQwen3Progress(stepTier);
 
   // Listen for real-time progress from the download script
   const unlisten = await listen<{ step: string; line?: string }>("setup-progress", (event) => {
@@ -2087,7 +2162,10 @@ async function downloadQwen3Models() {
       const match = line.match(/PROGRESS:\s*(\d+)%\s*(\d+)\/(\d+)\s*MB\s*--\s*(.*)/);
       if (match) {
         const [, pct, doneMb, totalMb, fileName] = match;
-        setFill(`${pct}%`);
+        if (Number(totalMb) > 0) {
+          setFill(Number(pct));
+          addQwen3Sample(Number(doneMb), Number(totalMb));
+        }
         const shortFile = fileName.length > 40 ? fileName.substring(0, 37) + "..." : fileName;
         setText(Number(totalMb) > 0
           ? `${pct}% · ${formatBytes(Number(doneMb) * 1048576)} of ${formatBytes(Number(totalMb) * 1048576)} · ${shortFile}`
@@ -2097,6 +2175,7 @@ async function downloadQwen3Models() {
       // e.g. "SIZE: 3200 MB total across 3 models"
       const match = line.match(/SIZE:\s*(\d+)\s*MB/);
       if (match) {
+        q3.totalMb = Number(match[1]);
         setText(`Total download: ~${formatBytes(Number(match[1]) * 1048576)}`);
       }
     } else if (line.startsWith("DOWNLOAD:")) {
@@ -2104,12 +2183,14 @@ async function downloadQwen3Models() {
       const match = line.match(/\[(\d+)\/(\d+)\]\s*(.*)/);
       if (match) {
         const shortName = match[3].split("/").pop() ?? match[3];
-        setText(`Downloading ${shortName} (${match[1]}/${match[2]})...`);
+        q3.done = Number(match[1]) - 1; // models before this one are finished
+        setText(`Downloading ${match[1]} of ${match[2]} · ${shortName}`);
       }
     } else if (line.startsWith("OK:") && line.includes("->")) {
       const parts = line.match(/OK:\s*(.*?)\s*->/);
       if (parts) {
         const shortName = parts[1].split("/").pop() ?? parts[1];
+        q3.done = Math.min(q3.done + 1, q3.steps.length);
         setText(`Downloaded ${shortName}`);
       }
     }
@@ -2124,7 +2205,7 @@ async function downloadQwen3Models() {
 
     // Step 1: Ensure huggingface_hub is installed (quick, no-op if present)
     setText("Checking dependencies...");
-    setFill("5%");
+    setFill(5);
 
     try {
       await invoke("setup_run_command", {
@@ -2144,7 +2225,7 @@ async function downloadQwen3Models() {
     // Step 2: Download models using the robust downloader script.
     if (qwen3DownloadPaused) throw new Error("Paused");
     setText("Starting model download...");
-    setFill("10%");
+    setFill(10);
 
     const scriptPath = paths.server_dir.replace(/[/\\]$/, "") + "\\download_qwen3.py";
     const result = await invoke<string>("setup_run_command", {
@@ -2161,18 +2242,22 @@ async function downloadQwen3Models() {
     if (isDone || isPartial) {
       await invoke("save_settings", { qwen3Installed: true });
 
-      setFill("100%");
-      setText(isDone ? "All models downloaded!" : "Downloaded (some models had issues)");
+      setFill(100);
+      q3.text = isDone ? "All models downloaded" : "Downloaded (some models had issues)";
+      stopQwen3Progress("done");
+      btns.forEach((b) => { b.disabled = true; b.textContent = "Installed"; });
 
       const newSettings = await invoke<AppSettings>("get_settings");
       const statusBadge = document.getElementById("qwen3-status-badge");
       updateQwen3StatusBadge(statusBadge, newSettings);
       updateQwen3DownloadButton(btns[0] ?? null, newSettings);
-      updateStudioView(newSettings);
 
       if (newSettings.qwen3_enabled && newSettings.qwen3_installed) {
         document.getElementById("nav-narrate")?.classList.remove("hidden");
       }
+      // Let the success state show for a moment, then swap the intro card for the tools
+      await new Promise((r) => setTimeout(r, 1800));
+      updateStudioView(newSettings);
     } else {
       throw new Error("Download completed but could not verify success");
     }
@@ -2182,13 +2267,15 @@ async function downloadQwen3Models() {
 
     if (qwen3DownloadPaused) {
       // User paused — show resume button
-      setText("Paused. Progress is saved — resume anytime.");
+      setText("Progress is saved — resume anytime.");
+      stopQwen3Progress("paused");
       setBtns("Resume Download", false);
     } else {
       // Actual error
       const shortErr = extractDownloadError(errStr);
       setText(`Failed: ${shortErr}`);
-      setFill("0%");
+      setFill(0);
+      stopQwen3Progress("error");
       setBtns("Retry Download", false);
     }
   } finally {

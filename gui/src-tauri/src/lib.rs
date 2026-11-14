@@ -1995,6 +1995,7 @@ async fn start_server(app: AppHandle) -> Result<(), String> {
     // look at our child and at who holds the port): a second copy would load a
     // second model onto the GPU.
     if server_loading_secs(&app).is_some() || !server_port_free() {
+        probe_server(&app).await; // so the tray and Dashboard show what is already there
         return Ok(());
     }
 
@@ -2086,6 +2087,7 @@ fn kill_stray_servers(python_dir: &std::path::Path) {
 /// Stop the inference server, including copies this app run didn't start
 #[tauri::command]
 async fn stop_server(app: AppHandle) -> Result<(), String> {
+    set_server_state(&app, ServerState::Stopping);
     // Clear managed flag first so watchdog doesn't restart
     {
         let managed = app.state::<Mutex<ServerManagedByUs>>();
@@ -2121,6 +2123,9 @@ async fn stop_server(app: AppHandle) -> Result<(), String> {
         free = wait_server_port_free(7).await;
     }
     if !free {
+        // Leave "stopping" and show what is really there
+        set_server_state(&app, ServerState::Offline);
+        probe_server(&app).await;
         return Err("The server could not be stopped: port 7860 is still in use by another program. \
                     Close it (Task Manager > python.exe) or restart your PC."
             .to_string());
@@ -2306,7 +2311,7 @@ async fn probe_server(app: &AppHandle) -> bool {
         Some(r) => r.json::<ServerHealth>().await.ok(),
         None => None,
     };
-    set_server_state(app, match health {
+    change_server_state(app, match health {
         Some(h) if h.status != "ok" => ServerState::Loading,
         Some(h) if h.gpu_available => {
             let gpu = h.gpu_name.unwrap_or_default();
@@ -2316,7 +2321,7 @@ async fn probe_server(app: &AppHandle) -> bool {
         None if alive => ServerState::Ready("CPU".into()),
         None if server_loading_secs(app).is_some() => ServerState::Loading,
         None => ServerState::Offline,
-    });
+    }, true);
     alive
 }
 
@@ -2331,6 +2336,10 @@ async fn server_watchdog(app: AppHandle) {
 
         // Always probe (the tray shows it), even when we don't manage the server
         let server_alive = probe_server(&app).await;
+        // Look again soon while the model loads so the Dashboard flips to Running promptly
+        if app.try_state::<TrayUi>().map_or(false, |ui| ui.state.lock().unwrap().server == ServerState::Loading) {
+            wait = 2;
+        }
 
         // Check if we're supposed to be managing the server
         let is_managed = {
@@ -2414,6 +2423,7 @@ async fn server_watchdog(app: AppHandle) {
                     proc.0 = Some(child);
                     proc.1 = Some(std::time::Instant::now());
                 }
+                set_server_state(&app, ServerState::Loading);
                 eprintln!("[watchdog] Server process spawned. Waiting for it to become healthy...");
                 // Give it time to start before next health check
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -2443,7 +2453,19 @@ const SETUP_STEP_NAMES: [&str; 5] = [
 enum SetupState { Done, Running, Paused, Failed }
 
 #[derive(Clone, PartialEq)]
-enum ServerState { Offline, Loading, Ready(String) }
+enum ServerState { Offline, Loading, Stopping, Ready(String) }
+
+impl ServerState {
+    /// What the frontend gets in the "server-state" event and from get_server_state
+    fn payload(&self) -> serde_json::Value {
+        match self {
+            ServerState::Offline => serde_json::json!({ "state": "offline" }),
+            ServerState::Loading => serde_json::json!({ "state": "loading" }),
+            ServerState::Stopping => serde_json::json!({ "state": "stopping" }),
+            ServerState::Ready(dev) => serde_json::json!({ "state": "ready", "device": dev }),
+        }
+    }
+}
 
 #[derive(Clone)]
 struct TrayState {
@@ -2486,6 +2508,7 @@ fn refresh_tray(app: &AppHandle) {
         (SetupState::Failed, _) => format!("VoiceLink setup failed — step {n} of 5: {name}"),
         (SetupState::Done, ServerState::Offline) => "Server offline".into(),
         (SetupState::Done, ServerState::Loading) => "Server loading…".into(),
+        (SetupState::Done, ServerState::Stopping) => "Server stopping…".into(),
         (SetupState::Done, ServerState::Ready(dev)) => format!("Ready · {dev}"),
     };
 
@@ -2499,9 +2522,10 @@ fn refresh_tray(app: &AppHandle) {
     // The last step (starting the server) can't be paused
     let _ = ui.toggle.set_enabled(!(st.setup == SetupState::Running && st.step == 4));
     let offline = st.server == ServerState::Offline;
+    let stopping = st.server == ServerState::Stopping;
     let _ = ui.start.set_enabled(offline);
-    let _ = ui.stop.set_enabled(!offline);
-    let _ = ui.restart.set_enabled(!offline);
+    let _ = ui.stop.set_enabled(!offline && !stopping);
+    let _ = ui.restart.set_enabled(!offline && !stopping);
 
     if let Some(tray) = app.tray_by_id("voicelink-tray") {
         let _ = tray.set_tooltip(Some(if in_setup { status } else { format!("VoiceLink — {status}") }));
@@ -2520,15 +2544,32 @@ fn refresh_tray(app: &AppHandle) {
     }
 }
 
-fn set_server_state(app: &AppHandle, server: ServerState) {
+/// The one place the server state changes: updates the tray and tells the window.
+/// A health probe (`from_probe`) never overrides "stopping": its answer is stale
+/// until stop_server finishes.
+fn change_server_state(app: &AppHandle, server: ServerState, from_probe: bool) {
+    let payload = server.payload();
     if let Some(ui) = app.try_state::<TrayUi>() {
         let mut st = ui.state.lock().unwrap();
-        if st.server == server {
+        if st.server == server || (from_probe && st.server == ServerState::Stopping) {
             return;
         }
         st.server = server;
     }
     refresh_tray(app);
+    let _ = app.emit("server-state", payload);
+}
+
+fn set_server_state(app: &AppHandle, server: ServerState) {
+    change_server_state(app, server, false);
+}
+
+/// Current server state, for the Dashboard when it opens (later changes arrive as "server-state")
+#[tauri::command]
+fn get_server_state(app: AppHandle) -> serde_json::Value {
+    app.try_state::<TrayUi>()
+        .map_or(ServerState::Offline, |ui| ui.state.lock().unwrap().server.clone())
+        .payload()
 }
 
 /// Called by the frontend while setup runs. phase: "step" (a step started),
@@ -2606,6 +2647,7 @@ pub fn run() {
         .manage(SetupPaused(std::sync::atomic::AtomicBool::new(false)))
         .invoke_handler(tauri::generate_handler![
             get_server_status,
+            get_server_state,
             get_sapi_status,
             check_gpu,
             get_voices,
