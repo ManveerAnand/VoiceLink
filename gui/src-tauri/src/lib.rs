@@ -190,6 +190,37 @@ pub struct SetupStatus {
     pub data_dir: String,
 }
 
+/// Version of the Python package list installed by setup. Bump it whenever the
+/// list changes so existing installs run the packages step once more.
+const DEPS_VERSION: &str = "2";
+
+fn marker_matches(path: &std::path::Path, expected: &str) -> bool {
+    std::fs::read_to_string(path).map_or(false, |s| s.trim() == expected)
+}
+
+fn hf_home(cfg: &AppConfig) -> PathBuf {
+    cfg.data_dir().join("models").join("hf")
+}
+
+/// Environment for every Python child process, so models, the pip cache and
+/// temp files (pip unpacks multi-GB wheels) stay in the data dir instead of C:.
+fn data_env(cfg: &AppConfig) -> Vec<(String, String)> {
+    let d = cfg.data_dir();
+    let dirs = [
+        ("HF_HOME", hf_home(cfg)),
+        ("PIP_CACHE_DIR", d.join("cache").join("pip")),
+        ("TMP", d.join("tmp")),
+        ("TEMP", d.join("tmp")),
+        ("VOICELINK_DATA_DIR", d.clone()),
+    ];
+    dirs.into_iter()
+        .map(|(k, p)| {
+            let _ = std::fs::create_dir_all(&p);
+            (k.to_string(), p.to_string_lossy().to_string())
+        })
+        .collect()
+}
+
 /// Holds the server process handle so we can stop it later
 struct ServerProcess(Option<std::process::Child>);
 
@@ -1027,17 +1058,20 @@ async fn get_setup_status(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<
 
         let python_ok = cfg.python_exe().exists();
 
-        let embedded_deps = cfg.python_dir()
-            .join("Lib").join("site-packages").join("fastapi").exists();
-        let deps_marker = cfg.data_dir().join(".deps_installed");
-        let deps_ok = embedded_deps || deps_marker.exists();
+        // Written by setup_mark_deps_installed only after every pip step finished,
+        // so an install interrupted half way is not treated as complete.
+        let deps_ok = marker_matches(&cfg.data_dir().join(".deps_installed"), DEPS_VERSION);
 
-        let server_ok = cfg.server_dir().join("main.py").exists();
+        // server/ is only current if it was copied by this app version
+        let server_ok = cfg.server_dir().join("main.py").exists()
+            && marker_matches(&cfg.data_dir().join(".server_version"), env!("CARGO_PKG_VERSION"));
 
         // Check for the .voices_ready marker written by the voicepack download
-        // script. This file only exists after ALL voicepacks + model have been
-        // successfully downloaded from HuggingFace to the local HF cache.
-        let model_ok = cfg.data_dir().join(".voices_ready").exists();
+        // script. It only exists after ALL voicepacks + model have been
+        // downloaded, and the Kokoro folder must be in our own HF_HOME (older
+        // installs kept it in the user profile cache, so they download again).
+        let model_ok = cfg.data_dir().join(".voices_ready").exists()
+            && hf_home(&cfg).join("hub").join("models--hexgrad--Kokoro-82M").exists();
 
         (python_ok, deps_ok, server_ok, model_ok, cfg.data_dir.clone())
     }; // MutexGuard dropped here — safe to do async IO now
@@ -1262,6 +1296,10 @@ async fn setup_run_command(
         .stderr(std::process::Stdio::piped())
         .creation_flags(0x08000000); // CREATE_NO_WINDOW
 
+    // Keep pip/HF/temp files in the data dir (never on C:)
+    let cfg = app.state::<Mutex<AppConfig>>().lock().map_err(|e| e.to_string())?.clone();
+    cmd.envs(data_env(&cfg));
+
     // Inject optional environment variables (e.g. VOICELINK_DATA_DIR)
     if let Some(ref envs) = env {
         for (k, v) in envs {
@@ -1460,11 +1498,10 @@ fn set_data_dir(config: tauri::State<'_, Mutex<AppConfig>>, new_dir: String) -> 
     cfg.save()
 }
 
-/// Copy the server/ directory into the data dir.
+/// Copy the server/ directory into the data dir and record the app version.
 /// Resolves source automatically: bundled resource (production) or repo path (dev).
-#[tauri::command]
-fn setup_install_server(app: AppHandle, config: tauri::State<'_, Mutex<AppConfig>>) -> Result<(), String> {
-    let cfg = config.lock().map_err(|e| e.to_string())?;
+/// Copy-over only: files that no longer exist upstream are left in place.
+fn install_server_files(app: &AppHandle, cfg: &AppConfig) -> Result<(), String> {
     let dest = cfg.server_dir();
 
     // Try 1: Bundled resource path (production install)
@@ -1511,7 +1548,40 @@ fn setup_install_server(app: AppHandle, config: tauri::State<'_, Mutex<AppConfig
         Ok(())
     }
 
-    copy_dir_recursive(&source, &dest)
+    copy_dir_recursive(&source, &dest)?;
+    std::fs::write(cfg.data_dir().join(".server_version"), env!("CARGO_PKG_VERSION"))
+        .map_err(|e| format!("Failed to write server version: {}", e))
+}
+
+#[tauri::command]
+fn setup_install_server(app: AppHandle, config: tauri::State<'_, Mutex<AppConfig>>) -> Result<(), String> {
+    let cfg = config.lock().map_err(|e| e.to_string())?.clone();
+    install_server_files(&app, &cfg)?;
+
+    // A server we started is still running the old files. Stop it (and clear the
+    // managed flag so the watchdog leaves it alone); the setup flow ends with
+    // start_server, which brings it back with the new code.
+    let was_managed = app.state::<Mutex<ServerManagedByUs>>().lock()
+        .map(|mut m| std::mem::replace(&mut m.0, false))
+        .unwrap_or(false);
+    if was_managed {
+        if let Ok(mut proc) = app.state::<Mutex<ServerProcess>>().lock() {
+            if let Some(ref mut child) = proc.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            proc.0 = None;
+        }
+    }
+    Ok(())
+}
+
+/// Record that every Python package of DEPS_VERSION is installed
+#[tauri::command]
+fn setup_mark_deps_installed(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<(), String> {
+    let cfg = config.lock().map_err(|e| e.to_string())?;
+    std::fs::write(cfg.data_dir().join(".deps_installed"), DEPS_VERSION)
+        .map_err(|e| format!("Failed to write deps marker: {}", e))
 }
 
 /// Get the paths used by the setup system
@@ -1525,6 +1595,55 @@ fn get_setup_paths(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<serde_j
         "server_dir": cfg.server_dir(),
         "model_dir": cfg.model_dir(),
     }))
+}
+
+/// Spawn the server as a detached background process (shared by start_server
+/// and the watchdog). Its output is appended to <data>\logs\server.log.
+fn spawn_server(cfg: &AppConfig) -> Result<std::process::Child, String> {
+    use std::io::Write;
+
+    // DETACHED_PROCESS (0x08) + CREATE_NO_WINDOW (0x08000000) ensures
+    // no console window flashes on screen when the server starts.
+    // PYTHONPATH must include the data dir so embedded Python can find
+    // the "server" package (embedded Python's ._pth restricts sys.path).
+    //
+    // We use a Python bootstrap snippet instead of `-m server.main` so we can
+    // monkey-patch subprocess.Popen to always pass CREATE_NO_WINDOW. This
+    // prevents spaCy, HuggingFace, and other libraries from flashing CMD
+    // windows when they download models on first run.
+    let bootstrap = r#"
+import subprocess, sys
+_orig = subprocess.Popen.__init__
+def _patched(self, *a, **kw):
+    if sys.platform == 'win32' and 'creationflags' not in kw:
+        kw['creationflags'] = 0x08000000
+    _orig(self, *a, **kw)
+subprocess.Popen.__init__ = _patched
+import runpy; runpy.run_module('server.main', run_name='__main__', alter_sys=True)
+"#;
+
+    // shortcut: server.log only grows, no rotation; add it if logs get big.
+    let log_dir = cfg.data_dir().join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("server.log"))
+        .map_err(|e| format!("Failed to open server.log: {}", e))?;
+    let _ = writeln!(&log, "--- server start ---");
+    let log_err = log.try_clone().map_err(|e| e.to_string())?;
+
+    std::process::Command::new(cfg.python_exe())
+        .args(["-c", bootstrap.trim()])
+        .current_dir(cfg.data_dir())
+        .env("PYTHONPATH", cfg.data_dir())
+        .env("PYTHONUNBUFFERED", "1") // so the log is current when the server dies
+        .envs(data_env(cfg))
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(log_err))
+        .creation_flags(0x00000008 | 0x08000000) // DETACHED_PROCESS | CREATE_NO_WINDOW
+        .spawn()
+        .map_err(|e| format!("Failed to start server: {}", e))
 }
 
 /// Start the inference server using the bundled Python
@@ -1548,35 +1667,7 @@ async fn start_server(app: AppHandle) -> Result<(), String> {
         return Ok(()); // Already running
     }
 
-    // Start server as a detached background process
-    // DETACHED_PROCESS (0x08) + CREATE_NO_WINDOW (0x08000000) ensures
-    // no console window flashes on screen when the server starts.
-    // PYTHONPATH must include the data dir so embedded Python can find
-    // the "server" package (embedded Python's ._pth restricts sys.path).
-    //
-    // We use a Python bootstrap snippet instead of `-m server.main` so we can
-    // monkey-patch subprocess.Popen to always pass CREATE_NO_WINDOW. This
-    // prevents spaCy, HuggingFace, and other libraries from flashing CMD
-    // windows when they download models on first run.
-    let bootstrap = r#"
-import subprocess, sys
-_orig = subprocess.Popen.__init__
-def _patched(self, *a, **kw):
-    if sys.platform == 'win32' and 'creationflags' not in kw:
-        kw['creationflags'] = 0x08000000
-    _orig(self, *a, **kw)
-subprocess.Popen.__init__ = _patched
-import runpy; runpy.run_module('server.main', run_name='__main__', alter_sys=True)
-"#;
-    let child = std::process::Command::new(python.to_string_lossy().to_string())
-        .args(["-c", bootstrap.trim()])
-        .current_dir(cfg.data_dir())
-        .env("PYTHONPATH", cfg.data_dir())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .creation_flags(0x00000008 | 0x08000000) // DETACHED_PROCESS | CREATE_NO_WINDOW
-        .spawn()
-        .map_err(|e| format!("Failed to start server: {}", e))?;
+    let child = spawn_server(&cfg)?;
 
     // Store the child process handle (drop the lock before await)
     {
@@ -1594,6 +1685,17 @@ import runpy; runpy.run_module('server.main', run_name='__main__', alter_sys=Tru
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     Ok(())
+}
+
+/// Last few lines of server.log plus its path, shown on the Dashboard when the server is down
+#[tauri::command]
+fn get_server_log_tail(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<serde_json::Value, String> {
+    let path = config.lock().map_err(|e| e.to_string())?.data_dir().join("logs").join("server.log");
+    let bytes = std::fs::read(&path).unwrap_or_default();
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).rev().take(5).collect();
+    lines.reverse();
+    Ok(serde_json::json!({ "path": path, "lines": lines }))
 }
 
 /// Stop the inference server
@@ -1811,7 +1913,8 @@ async fn server_watchdog(app: AppHandle) {
                  User must restart manually.",
                 MAX_CONSECUTIVE_RESTARTS
             );
-            // Disable managed flag to stop retrying
+            // Clear the managed flag: the watchdog stays idle from here on until
+            // start_server (a manual start) sets it again.
             if let Ok(mut m) = app.state::<Mutex<ServerManagedByUs>>().lock() {
                 m.0 = false;
             }
@@ -1840,25 +1943,7 @@ async fn server_watchdog(app: AppHandle) {
             continue;
         }
 
-        let bootstrap = r#"
-import subprocess, sys
-_orig = subprocess.Popen.__init__
-def _patched(self, *a, **kw):
-    if sys.platform == 'win32' and 'creationflags' not in kw:
-        kw['creationflags'] = 0x08000000
-    _orig(self, *a, **kw)
-subprocess.Popen.__init__ = _patched
-import runpy; runpy.run_module('server.main', run_name='__main__', alter_sys=True)
-"#;
-        match std::process::Command::new(python.to_string_lossy().to_string())
-            .args(["-c", bootstrap.trim()])
-            .current_dir(cfg.data_dir())
-            .env("PYTHONPATH", cfg.data_dir())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .creation_flags(0x00000008 | 0x08000000)
-            .spawn()
-        {
+        match spawn_server(&cfg) {
             Ok(child) => {
                 // Update the stored process handle
                 if let Ok(mut proc) = app.state::<Mutex<ServerProcess>>().lock() {
@@ -1914,7 +1999,9 @@ pub fn run() {
             setup_enable_pip,
             setup_run_command,
             setup_install_server,
+            setup_mark_deps_installed,
             start_server,
+            get_server_log_tail,
             stop_server,
             get_autostart,
             set_autostart,
@@ -1922,6 +2009,18 @@ pub fn run() {
             save_settings,
         ])
         .setup(|app| {
+            // After an app update the bundled server code is newer than the copy in
+            // the data dir: refresh it before anything starts the server.
+            let cfg = app.state::<Mutex<AppConfig>>().lock().unwrap().clone();
+            if cfg.python_exe().exists()
+                && cfg.server_dir().join("main.py").exists()
+                && !marker_matches(&cfg.data_dir().join(".server_version"), env!("CARGO_PKG_VERSION"))
+            {
+                if let Err(e) = install_server_files(app.handle(), &cfg) {
+                    eprintln!("[setup] Failed to update server files: {}", e);
+                }
+            }
+
             // Build tray menu
             let show = MenuItemBuilder::new("Open VoiceLink").id("show").build(app)?;
             let quit = MenuItemBuilder::new("Quit").id("quit").build(app)?;

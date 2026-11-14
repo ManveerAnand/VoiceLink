@@ -3,6 +3,7 @@
 // ============================================================================
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 
 // ============================================================================
 // Types (mirrors Rust structs)
@@ -451,6 +452,28 @@ function setupServerToggle() {
   });
 }
 
+/** While the server is down, show the tail of server.log so a crash leaves a trace */
+async function updateServerLogHint(serverDown: boolean) {
+  const el = document.getElementById("server-log-hint");
+  if (!el) return;
+  try {
+    const log = serverDown ? await invoke<{ path: string; lines: string[] }>("get_server_log_tail") : null;
+    if (!log || log.lines.length === 0) {
+      el.classList.add("hidden");
+      return;
+    }
+    el.textContent = `Last server log lines:\n${log.lines.join("\n")}\n`;
+    const btn = document.createElement("button");
+    btn.className = "btn btn-secondary btn-sm";
+    btn.textContent = "Show log file";
+    btn.addEventListener("click", () => revealItemInDir(log.path).catch(console.error));
+    el.appendChild(btn);
+    el.classList.remove("hidden");
+  } catch (e) {
+    el.classList.add("hidden");
+  }
+}
+
 async function checkServerStatus() {
   const indicator = document.getElementById("server-indicator");
   const statusEl = document.getElementById("server-status");
@@ -471,11 +494,13 @@ async function checkServerStatus() {
       if (deviceEl) deviceEl.textContent = result.health.gpu_name ?? (result.health.gpu_available ? "GPU" : "CPU");
       if (voicesEl) voicesEl.textContent = formatUptime(result.health.uptime_seconds);
       updateServerToggle(toggleBtn, true);
+      updateServerLogHint(false);
     } else if (result.running) {
       indicator?.classList.remove("offline");
       indicator?.classList.add("online");
       if (statusEl) statusEl.textContent = "Running (no health data)";
       updateServerToggle(toggleBtn, true);
+      updateServerLogHint(false);
     } else {
       indicator?.classList.remove("online");
       indicator?.classList.add("offline");
@@ -484,6 +509,7 @@ async function checkServerStatus() {
       if (deviceEl) deviceEl.textContent = "—";
       if (voicesEl) voicesEl.textContent = "—";
       updateServerToggle(toggleBtn, false);
+      updateServerLogHint(true);
     }
   } catch (e) {
     indicator?.classList.remove("online");
@@ -909,6 +935,19 @@ function setOverallStatus(msg: string, type: "info" | "success" | "error" = "inf
   el.className = `setup-status-msg status-${type}`;
 }
 
+function setDataDirLocked(locked: boolean) {
+  const input = document.getElementById("setup-data-dir") as HTMLInputElement | null;
+  if (input) input.readOnly = locked;
+  document.getElementById("btn-save-path")?.classList.toggle("hidden", locked);
+  const hint = document.getElementById("setup-path-hint");
+  if (hint) {
+    hint.dataset.editableText ??= hint.textContent ?? "";
+    hint.textContent = locked
+      ? "Installed here. Moving the install will be available in Settings."
+      : hint.dataset.editableText;
+  }
+}
+
 async function refreshSetupStatus() {
   const banner = document.getElementById("external-server-banner");
   const stepsContainer = document.getElementById("setup-steps-container");
@@ -923,6 +962,8 @@ async function refreshSetupStatus() {
 
     const dataDirInput = document.getElementById("setup-data-dir") as HTMLInputElement;
     if (dataDirInput) dataDirInput.value = status.data_dir;
+    // Choosing the folder only makes sense before anything is installed in it
+    setDataDirLocked(status.python_installed || setupRunning);
 
     const allDone = status.python_installed && status.deps_installed && status.server_installed && status.model_downloaded;
     const externalServer = status.server_running && !allDone;
@@ -961,6 +1002,7 @@ async function refreshSetupStatus() {
 async function runSetup() {
   if (setupRunning) return;
   setupRunning = true;
+  setDataDirLocked(true);
 
   const btn = document.getElementById("btn-run-setup") as HTMLButtonElement;
   if (btn) {
@@ -1064,6 +1106,10 @@ async function runSetup() {
         stepName: "deps",
       });
 
+      // Only now is the package step really complete (an interrupted install
+      // must not count as done)
+      await invoke("setup_mark_deps_installed");
+
       stopElapsedTimer();
       setStepIcon("deps", "done");
       showStepProgress("deps", false);
@@ -1159,6 +1205,8 @@ async function runSetup() {
   } finally {
     stopElapsedTimer();
     setupRunning = false;
+    // If setup failed before Python was installed, the folder can be changed again
+    invoke<SetupStatus>("get_setup_status").then((s) => setDataDirLocked(s.python_installed)).catch(() => {});
   }
 }
 
