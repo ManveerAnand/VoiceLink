@@ -111,6 +111,9 @@ class TTSModel(ABC):
         """
         ...
 
+    def release_cache(self) -> None:
+        """Give back memory only needed while synthesizing (GPU cache). Called after each request."""
+
     def single_chunk(self, text: str) -> bool:
         """True if synthesize(text) yields exactly one chunk (so its length is known up front)."""
         return False

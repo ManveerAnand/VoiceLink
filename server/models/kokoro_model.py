@@ -167,6 +167,67 @@ def _split_first_sentence(text: str) -> str:
     return text
 
 
+def _build_kmodel(device: str):
+    """
+    Build Kokoro's acoustic model directly on `device`, without the memory spike.
+
+    KModel() creates every weight with random values, then torch.load()s the
+    312 MB checkpoint and copies it over. That commits ~1 GB of RAM which Windows
+    never gets back. Here the module is built on the meta device (no memory),
+    and the checkpoint is memory-mapped and loaded straight onto `device`.
+    Raises if anything looks unexpected; the caller then uses Kokoro's own loader.
+    """
+    import io
+    import itertools
+
+    import torch
+    from huggingface_hub import hf_hub_download
+    from kokoro import KModel
+
+    repo = "hexgrad/Kokoro-82M"  # KPipeline's default
+    config = hf_hub_download(repo, "config.json")
+    weights = hf_hub_download(repo, KModel.MODEL_NAMES[repo])
+
+    # KModel always torch.load()s `model`; hand it an empty checkpoint.
+    empty = io.BytesIO()
+    torch.save({}, empty)
+    empty.seek(0)
+    with torch.device("meta"):
+        model = KModel(repo_id=repo, config=config, model=empty)
+
+    # Same as KModel: the keys carry a "module." prefix, loaded non-strictly.
+    for part, state in torch.load(weights, map_location=device, mmap=True, weights_only=True).items():
+        state = {k.removeprefix("module."): v for k, v in state.items()}
+        getattr(model, part).load_state_dict(state, strict=False, assign=True)
+
+    # What the checkpoint lacks keeps its default value in Kokoro's loader. Rebuild
+    # those defaults here: InstanceNorm's affine weight/bias and the Albert
+    # embeddings' index buffers and the STFT's Hann window. Anything else we don't
+    # know about makes the smoke forward below fail.
+    for mod in model.modules():
+        window = vars(mod).get("window")
+        if isinstance(window, torch.Tensor) and window.is_meta:
+            mod.window = torch.hann_window(window.shape[0], periodic=True, dtype=torch.float32)
+        for name, t in list(itertools.chain(mod.named_parameters(recurse=False), mod.named_buffers(recurse=False))):
+            if not t.is_meta:
+                continue
+            if name == "position_ids":
+                buffer = torch.arange(t.shape[-1], device=device).expand(t.shape)
+            elif name == "token_type_ids":
+                buffer = torch.zeros(t.shape, dtype=t.dtype, device=device)
+            elif isinstance(mod, torch.nn.modules.instancenorm._InstanceNorm) and name in ("weight", "bias"):
+                fill = torch.ones if name == "weight" else torch.zeros
+                setattr(mod, name, torch.nn.Parameter(fill(t.shape, dtype=t.dtype, device=device)))
+                continue
+            else:
+                raise RuntimeError(f"unexpected unloaded tensor {type(mod).__name__}.{name}")
+            mod.register_buffer(name, buffer, persistent=False)
+
+    model = model.to(device).eval()
+    model("həlˈO", torch.zeros(1, 256, device=device))  # a broken build fails here, not on a user's request
+    return model
+
+
 class KokoroModel(TTSModel):
     """
     Kokoro TTS backend.
@@ -184,6 +245,7 @@ class KokoroModel(TTSModel):
         self._device = device
         self._pipeline = None
         self._loaded = False
+        self._on_cuda = False
         # Kokoro isn't documented as thread-safe and streaming requests overlap.
         # Held per generated chunk (not per request) so concurrent requests
         # interleave instead of one waiting for another's whole text.
@@ -197,11 +259,22 @@ class KokoroModel(TTSModel):
 
         logger.info(f"Loading Kokoro model (lang={self._lang_code})...")
 
+        import torch
         from kokoro import KPipeline
 
         # Kokoro auto-selects CUDA when device is None
         device = None if self._device == "auto" else self._device
-        self._pipeline = KPipeline(lang_code=self._lang_code, device=device)
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        elif device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA requested but not available")
+        try:
+            kmodel = _build_kmodel(device)
+            self._pipeline = KPipeline(lang_code=self._lang_code, model=kmodel, repo_id="hexgrad/Kokoro-82M")
+        except Exception as e:
+            logger.warning(f"Lean Kokoro load failed ({e}); using Kokoro's own loader (uses ~1 GB more RAM).")
+            self._pipeline = KPipeline(lang_code=self._lang_code, device=device)
+        self._on_cuda = device == "cuda"
         self._loaded = True
 
         logger.info("Kokoro model loaded successfully.")
@@ -303,6 +376,13 @@ class KokoroModel(TTSModel):
             yield pcm_bytes
 
         logger.debug(f"Synthesis complete: {chunk_index} chunks yielded.")
+
+    def release_cache(self) -> None:
+        """Hand the GPU memory PyTorch cached for the last request back to the driver."""
+        if self._on_cuda:
+            import torch
+
+            torch.cuda.empty_cache()
 
     def single_chunk(self, text: str) -> bool:
         split = _split_first_sentence(text)

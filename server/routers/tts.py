@@ -201,6 +201,8 @@ async def synthesize(request: TTSRequest):
             # Headers are already sent, so all we can do is end the stream.
             logger.exception(f"Synthesis failed mid-stream, ending the stream: {e}")
         finally:
+            # Outside the model's per-chunk lock; PyTorch's allocator is thread-safe.
+            _model.release_cache()
             elapsed = time.perf_counter() - t0
             audio_seconds = total_bytes / (24000 * 2)  # 24kHz * 2 bytes/sample
             state = "complete" if finished else "stopped early (client left or error)"
