@@ -89,7 +89,26 @@ let qwen3Downloading = false;
 // Setup-incomplete gray-out state
 // ============================================================================
 
+let setupComplete = false;
+
+// Setup lives in the sidebar only until everything is installed; the Settings
+// "Repair / re-run setup" link brings it back. Stay visible while it is open.
+function syncSetupNav() {
+  const onSetup = document.getElementById("page-setup")?.classList.contains("active");
+  document.getElementById("nav-setup-item")?.classList.toggle("hidden", setupComplete && !onSetup);
+}
+
+function wireRepairSetupLink() {
+  document.getElementById("btn-repair-setup")?.addEventListener("click", () => {
+    const nav = document.getElementById("nav-setup-item");
+    nav?.classList.remove("hidden");
+    nav?.click();
+  });
+}
+
 function applySetupIncompleteState(isComplete: boolean) {
+  setupComplete = isComplete;
+  syncSetupNav();
   const dashboard = document.getElementById("page-dashboard");
   const voices = document.getElementById("page-voices");
   const dashBanner = document.getElementById("dashboard-setup-banner");
@@ -208,7 +227,17 @@ class SpotlightTour {
         // Allow clicking through to the highlighted target
       }
     });
+
+    window.addEventListener("resize", this.onResize);
+    window.addEventListener("keydown", this.onKeyDown);
   }
+
+  private onResize = () => this.showStep(this.currentIndex);
+
+  // Escape always closes the tour, even if the tooltip is somehow unreachable
+  private onKeyDown = (e: KeyboardEvent) => {
+    if (e.key === "Escape") this.end();
+  };
 
   private showStep(index: number) {
     if (!this.overlay || !this.highlight || !this.tooltip) return;
@@ -286,6 +315,14 @@ class SpotlightTour {
         this.tooltip.style.top = `${targetRect.top - gap - 160}px`;
         break;
     }
+
+    // Clamp inside the window so Next/Skip stay reachable at any window size
+    const margin = 12;
+    const t = this.tooltip.getBoundingClientRect();
+    const left = Math.max(margin, Math.min(t.left, window.innerWidth - t.width - margin));
+    const top = Math.max(margin, Math.min(t.top, window.innerHeight - t.height - margin));
+    this.tooltip.style.left = `${left}px`;
+    this.tooltip.style.top = `${top}px`;
   }
 
   next() {
@@ -295,6 +332,8 @@ class SpotlightTour {
   end() {
     localStorage.setItem("tourCompleted", "true");
     this.active = false;
+    window.removeEventListener("resize", this.onResize);
+    window.removeEventListener("keydown", this.onKeyDown);
     if (this.overlay) {
       this.overlay.remove();
       this.overlay = null;
@@ -392,6 +431,7 @@ function setupNavigation() {
       document.querySelectorAll<HTMLElement>(".page").forEach((p) => {
         p.classList.toggle("active", p.id === `page-${page}`);
       });
+      syncSetupNav();
 
       if (page === "voices") loadVoices();
       if (page === "setup") refreshSetupStatus();
@@ -606,7 +646,7 @@ function renderVoices(container: HTMLElement) {
       return `
     <div class="voice-card card ${isEnabled ? "" : "voice-disabled"}" data-voice-id="${v.id}">
       <div class="voice-header">
-        <span class="voice-name">${escapeHtml(v.name)}</span>
+        <span class="voice-name">${escapeHtml(displayVoiceName(v.name))}</span>
         <div class="voice-header-right">
           ${sourceBadge}
           <span class="voice-badge ${v.gender.toLowerCase()}">${v.gender}</span>
@@ -722,7 +762,7 @@ function populateTestVoiceSelect() {
   // Only show registered (enabled) voices in Quick Test dropdown
   const enabledVoices = currentVoices.filter((v) => registeredVoiceIds.has(v.id));
   select.innerHTML = enabledVoices
-    .map((v) => `<option value="${v.id}">${escapeHtml(v.name)}</option>`)
+    .map((v) => `<option value="${v.id}">${escapeHtml(displayVoiceName(v.name))}</option>`)
     .join("");
 }
 
@@ -2113,7 +2153,7 @@ function setupNarratePage() {
   // Populate voice selector with Qwen3 voices
   const qwen3Voices = currentVoices.filter((v) => v.id.startsWith("qwen3_"));
   voiceSelect.innerHTML = qwen3Voices
-    .map((v) => `<option value="${v.id}">${escapeHtml(v.name)}</option>`)
+    .map((v) => `<option value="${v.id}">${escapeHtml(displayVoiceName(v.name))}</option>`)
     .join("");
 
   if (narrateInitialized) return;
@@ -2451,6 +2491,12 @@ function playPcmAudio(pcmData: Uint8Array) {
 // Utilities
 // ============================================================================
 
+// The registry name other apps see ends in " (Kokoro)" / " (Qwen3)"; the model
+// is already shown as a badge in our own UI, so drop the suffix here.
+function displayVoiceName(name: string): string {
+  return name.replace(/\s*\((Kokoro|Qwen3)\)$/, "");
+}
+
 function escapeHtml(str: string): string {
   const div = document.createElement("div");
   div.textContent = str;
@@ -2478,6 +2524,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   setupSetupWizard();
   setupSettings();
   wireGotoSetupButtons();
+  wireRepairSetupLink();
   wireLogViewers();
   startStatusPolling();
 

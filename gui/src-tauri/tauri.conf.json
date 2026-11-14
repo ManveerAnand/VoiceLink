@@ -14,8 +14,10 @@
     "windows": [
       {
         "title": "VoiceLink",
-        "width": 900,
-        "height": 650,
+        "width": 1000,
+        "height": 680,
+        "minWidth": 820,
+        "minHeight": 560,
         "center": true,
         "resizable": true,
         "decorations": true,
