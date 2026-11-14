@@ -12,7 +12,10 @@ permissions:
   contents: read
   issues: read
 
-engine: gemini
+engine:
+  id: gemini
+  # "auto" routes to bigger models that return 503 on the free tier; flash-lite has the most free capacity
+  model: gemini-3.5-flash-lite
 
 safe-outputs:
   add-labels:
