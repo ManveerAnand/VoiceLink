@@ -2088,10 +2088,10 @@ fn kill_stray_servers(python_dir: &std::path::Path) {
         .status();
 }
 
-/// Stop the inference server, including copies this app run didn't start
-#[tauri::command]
-async fn stop_server(app: AppHandle) -> Result<(), String> {
-    set_server_state(&app, ServerState::Stopping);
+/// Ask the server to exit, kill the child we spawned and wait for port 7860 to
+/// free up, including copies this app run didn't start. Returns whether the port
+/// is free. Touches no tray/UI state, so it is safe to run while the app exits.
+async fn halt_server(app: &AppHandle) -> Result<bool, String> {
     // Clear managed flag first so watchdog doesn't restart
     {
         let managed = app.state::<Mutex<ServerManagedByUs>>();
@@ -2126,7 +2126,14 @@ async fn stop_server(app: AppHandle) -> Result<(), String> {
         kill_stray_servers(&python_dir);
         free = wait_server_port_free(7).await;
     }
-    if !free {
+    Ok(free)
+}
+
+/// Stop the inference server, including copies this app run didn't start
+#[tauri::command]
+async fn stop_server(app: AppHandle) -> Result<(), String> {
+    set_server_state(&app, ServerState::Stopping);
+    if !halt_server(&app).await? {
         // Leave "stopping" and show what is really there
         set_server_state(&app, ServerState::Offline);
         probe_server(&app).await;
@@ -2136,6 +2143,27 @@ async fn stop_server(app: AppHandle) -> Result<(), String> {
     }
     set_server_state(&app, ServerState::Offline);
     Ok(())
+}
+
+/// Runs when the app exits (tray Quit, Windows logoff/shutdown): stop the
+/// setup/Qwen3 download and the server we started, so nothing is left running
+/// with no parent. A server this app didn't start is left alone. Bounded so
+/// Quit can't hang.
+fn shutdown_app(app: &AppHandle) {
+    // The window would otherwise stay up while we wait
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.hide();
+    }
+    // Partial files stay on disk; the next Download / Resume continues from them
+    let _ = cancel_qwen3_download(app.clone());
+
+    let managed = app.state::<Mutex<ServerManagedByUs>>().lock().map(|m| m.0).unwrap_or(false);
+    if managed {
+        let _ = tauri::async_runtime::block_on(tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            halt_server(app),
+        ));
+    }
 }
 
 // ============================================================================
@@ -2695,6 +2723,22 @@ pub fn run() {
             get_settings,
             save_settings,
         ])
+        // X / Alt+F4 hide to the tray; only tray > Quit (or logoff/shutdown) exits,
+        // so the server keeps serving SAPI voices to other apps
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+                // Tell the user once per run where the app went
+                static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !TOLD.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    let _ = window.app_handle().notification().builder()
+                        .title("VoiceLink is still running")
+                        .body("It stays in the tray so your voices keep working. Right-click the tray icon to quit.")
+                        .show();
+                }
+            }
+        })
         .setup(|app| {
             // After an app update the bundled server code is newer than the copy in
             // the data dir: refresh it before anything starts the server.
@@ -2771,9 +2815,7 @@ pub fn run() {
                         let _ = std::fs::create_dir_all(&dir);
                         let _ = app.opener().open_path(dir.to_string_lossy(), None::<&str>);
                     }
-                    "quit" => {
-                        app.exit(0);
-                    }
+                    "quit" => app.exit(0), // shutdown_app runs from RunEvent::Exit
                     _ => {}
                 });
                 tray.on_tray_icon_event(|tray, event| {
@@ -2802,8 +2844,13 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running VoiceLink");
+        .build(tauri::generate_context!())
+        .expect("error while building VoiceLink")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                shutdown_app(app);
+            }
+        });
 }
 
 #[cfg(test)]
