@@ -83,6 +83,7 @@ let currentVoices: VoiceInfo[] = [];
 let registeredVoiceIds: Set<string> = new Set();
 let cachedGpuInfo: GpuInfo | null = null;
 let qwen3DownloadPaused = false;
+let qwen3Downloading = false;
 
 // ============================================================================
 // Setup-incomplete gray-out state
@@ -907,6 +908,7 @@ print('DONE', flush=True)
 type StepName = "python" | "deps" | "server" | "model" | "start";
 
 let setupRunning = false;
+let setupPaused = false;
 let stepStartTime: number | null = null;
 let elapsedTimerId: number | null = null;
 
@@ -915,6 +917,15 @@ function formatElapsed(ms: number): string {
   const m = Math.floor(s / 60);
   const sec = s % 60;
   return m > 0 ? `${m}m ${sec}s` : `${sec}s`;
+}
+
+/** 652 MB, 13.3 GB; one decimal below 100 MB so small files still show progress */
+function formatBytes(bytes: number): string {
+  const mb = bytes / 1024 / 1024;
+  if (mb < 1) return `${Math.round(bytes / 1024)} KB`;
+  if (mb < 100) return `${mb.toFixed(1)} MB`;
+  if (mb < 1024) return `${Math.round(mb)} MB`;
+  return `${(mb / 1024).toFixed(1)} GB`;
 }
 
 function startElapsedTimer(step: StepName) {
@@ -966,6 +977,34 @@ function setStepProgress(step: StepName, percent: number, text?: string) {
   if (fill) fill.style.width = `${Math.min(100, percent)}%`;
   if (txt && text) txt.textContent = text;
   else if (txt) txt.textContent = `${percent}%`;
+}
+
+function setStepText(step: StepName, text: string) {
+  const txt = document.getElementById(`text-${step}`);
+  if (txt) txt.textContent = text;
+}
+
+// pip pauses and retries on its own; these flags make it ride out a flaky connection
+const PIP_NET_ARGS = ["--retries", "10", "--timeout", "30", "--resume-retries", "10"];
+// Failures worth waiting out. Anything else (bad package, disk full) fails right away.
+const NETWORK_ERROR = /connect|timed out|timeout|resolve|getaddrinfo|network|retries exceeded|ssl|reset|aborted|remote end|unreachable|offline/i;
+
+/** setup_run_command that retries dropped connections (8 tries, 5 to 60 s apart) */
+async function runNetworkCommand(step: StepName, args: Record<string, unknown>): Promise<string> {
+  const maxAttempts = 8;
+  for (let attempt = 1; ; attempt++) {
+    if (setupPaused) throw "Paused";
+    try {
+      return await invoke<string>("setup_run_command", { ...args, stepName: step });
+    } catch (e) {
+      if (setupPaused || attempt >= maxAttempts || !NETWORK_ERROR.test(String(e).split("stderr:").pop()!)) throw e;
+      const wait = Math.min(60, 5 * 2 ** (attempt - 1));
+      for (let s = wait; s > 0 && !setupPaused; s--) {
+        setStepText(step, `Connection problem — retrying in ${s}s (attempt ${attempt + 1}/${maxAttempts})`);
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
+  }
 }
 
 function setOverallStatus(msg: string, type: "info" | "success" | "error" = "info") {
@@ -1027,7 +1066,7 @@ async function refreshSetupStatus() {
         btn.textContent = "Start Server";
         btn.disabled = false;
       } else {
-        btn.innerHTML = `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" /></svg> Run Setup`;
+        btn.innerHTML = `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" /></svg> ${setupPaused ? "Resume Setup" : "Run Setup"}`;
         btn.disabled = false;
       }
     }
@@ -1042,6 +1081,7 @@ async function refreshSetupStatus() {
 async function runSetup() {
   if (setupRunning) return;
   setupRunning = true;
+  setupPaused = false;
   setDataDirLocked(true);
 
   const btn = document.getElementById("btn-run-setup") as HTMLButtonElement;
@@ -1049,8 +1089,19 @@ async function runSetup() {
     btn.disabled = true;
     btn.textContent = "Setting up...";
   }
+  const pauseBtn = document.getElementById("btn-pause-setup") as HTMLButtonElement | null;
+  pauseBtn?.classList.remove("hidden");
+  if (pauseBtn) pauseBtn.disabled = false;
+
+  // Clear text left over from a failed or paused run (e.g. "3.6 / 10.7 MB")
+  for (const s of ["python", "deps", "server", "model", "start"] as StepName[]) {
+    setStepProgress(s, 0, "Starting...");
+  }
+  setOverallStatus("Starting setup...");
+  const useGpu = (document.getElementById("setup-use-gpu") as HTMLInputElement | null)?.checked ?? true;
 
   try {
+    await invoke("resume_setup");
     const status: SetupStatus = await invoke("get_setup_status");
     const paths: SetupPaths = await invoke("get_setup_paths");
 
@@ -1085,10 +1136,9 @@ async function runSetup() {
         stepName: "python",
       });
 
-      await invoke("setup_run_command", {
+      await runNetworkCommand("python", {
         program: paths.python_exe,
         args: [getPipDest, "--no-warn-script-location"],
-        stepName: "python",
       });
 
       setStepIcon("python", "done");
@@ -1106,10 +1156,10 @@ async function runSetup() {
       startElapsedTimer("deps");
 
       // Install main deps
-      await invoke("setup_run_command", {
+      await runNetworkCommand("deps", {
         program: paths.python_exe,
         args: [
-          "-m", "pip", "install", "--no-warn-script-location",
+          "-m", "pip", "install", "--no-warn-script-location", ...PIP_NET_ARGS,
           "fastapi>=0.115.0",
           "uvicorn[standard]>=0.34.0",
           "python-multipart>=0.0.9",
@@ -1119,31 +1169,29 @@ async function runSetup() {
           "numpy>=1.26.0,<2.0",
           "loguru>=0.7.0",
         ],
-        stepName: "deps",
       });
 
       // pip's default torch on Windows is CPU-only; install the CUDA build first
       // so kokoro reuses it. cu126 still supports older cards (GTX 10xx).
-      const gpu = await invoke<GpuInfo>("check_gpu").catch(() => null);
+      // Unchecked: kokoro pulls the (much smaller) CPU build instead.
+      const gpu = useGpu ? await invoke<GpuInfo>("check_gpu").catch(() => null) : null;
       if (gpu?.available) {
         setStepProgress("deps", 40, "Installing PyTorch for your GPU (large download)...");
-        await invoke("setup_run_command", {
+        await runNetworkCommand("deps", {
           program: paths.python_exe,
           args: [
-            "-m", "pip", "install", "--no-warn-script-location",
+            "-m", "pip", "install", "--no-warn-script-location", ...PIP_NET_ARGS,
             "torch", "--index-url", "https://download.pytorch.org/whl/cu126",
           ],
-          stepName: "deps",
         });
       }
 
       setStepProgress("deps", 60, "Installing Kokoro...");
 
       // Install kokoro separately (it's a bigger install)
-      await invoke("setup_run_command", {
+      await runNetworkCommand("deps", {
         program: paths.python_exe,
-        args: ["-m", "pip", "install", "--no-warn-script-location", "kokoro>=0.3"],
-        stepName: "deps",
+        args: ["-m", "pip", "install", "--no-warn-script-location", ...PIP_NET_ARGS, "kokoro>=0.3"],
       });
 
       // Only now is the package step really complete (an interrupted install
@@ -1181,10 +1229,9 @@ async function runSetup() {
 
       // Run a Python script that downloads the model and all 11 voicepacks
       // via huggingface_hub. This ensures every voice works on first use.
-      await invoke("setup_run_command", {
+      await runNetworkCommand("model", {
         program: paths.python_exe,
         args: ["-c", VOICEPACK_DOWNLOAD_SCRIPT],
-        stepName: "model",
         env: { VOICELINK_DATA_DIR: paths.data_dir },
       });
 
@@ -1195,7 +1242,8 @@ async function runSetup() {
       setStepIcon("model", "done");
     }
 
-    // Step 5: Start the server
+    // Step 5: Start the server (nothing left to pause)
+    pauseBtn?.classList.add("hidden");
     setStepIcon("start", "running");
     showStepProgress("start", true);
     setStepProgress("start", 50, "Starting server...");
@@ -1237,14 +1285,21 @@ async function runSetup() {
     }
   } catch (e) {
     console.error("Setup failed:", e);
-    setOverallStatus(`Setup failed: ${e}`, "error");
-    if (btn) {
-      btn.textContent = "Retry Setup";
-      btn.disabled = false;
+    if (setupPaused) {
+      setOverallStatus("Paused — progress is saved. Click Resume Setup to continue.");
+      if (btn) btn.disabled = false;
+    } else {
+      setOverallStatus(`Setup failed: ${e}`, "error");
+      if (btn) {
+        btn.textContent = "Retry Setup";
+        btn.disabled = false;
+      }
     }
   } finally {
     stopElapsedTimer();
     setupRunning = false;
+    pauseBtn?.classList.add("hidden");
+    if (setupPaused) refreshSetupStatus(); // running steps go back to pending, button says Resume
     // If setup failed before Python was installed, the folder can be changed again
     invoke<SetupStatus>("get_setup_status").then((s) => setDataDirLocked(s.python_installed)).catch(() => {});
   }
@@ -1253,6 +1308,18 @@ async function runSetup() {
 function setupSetupWizard() {
   const btn = document.getElementById("btn-run-setup");
   btn?.addEventListener("click", runSetup);
+
+  document.getElementById("btn-pause-setup")?.addEventListener("click", async (e) => {
+    setupPaused = true;
+    (e.currentTarget as HTMLButtonElement).disabled = true;
+    setOverallStatus("Pausing...");
+    await invoke("pause_setup").catch(() => {});
+  });
+
+  // Offer the 2.3 GB CUDA PyTorch only when there is an NVIDIA GPU to use it
+  invoke<GpuInfo>("check_gpu")
+    .then((g) => { if (g.available) document.getElementById("setup-gpu-option")?.classList.remove("hidden"); })
+    .catch(() => {});
 
   // Save path button — lets user change the data directory
   const savePathBtn = document.getElementById("btn-save-path");
@@ -1272,16 +1339,16 @@ function setupSetupWizard() {
   });
 
   // Listen for progress events from Rust backend
-  listen<{ step: string; progress: number; downloaded?: number; total?: number; status?: string; line?: string }>(
+  listen<{ step: string; progress: number; downloaded?: number; total?: number; status?: string; line?: string; retry_in?: number }>(
     "setup-progress",
     (event) => {
-      const { step, progress, downloaded, total, line } = event.payload;
+      const { step, progress, downloaded, total, line, status, retry_in } = event.payload;
       const stepName = step as StepName;
 
-      if (downloaded && total && total > 0) {
-        const mb = (downloaded / 1024 / 1024).toFixed(1);
-        const totalMb = (total / 1024 / 1024).toFixed(1);
-        setStepProgress(stepName, progress, `${mb} / ${totalMb} MB`);
+      if (status === "waiting") {
+        setStepText(stepName, `Connection lost — retrying in ${retry_in}s`);
+      } else if (downloaded && total && total > 0) {
+        setStepProgress(stepName, progress, `${formatBytes(downloaded)} / ${formatBytes(total)}`);
       } else if (line) {
         const shortLine = line.length > 60 ? line.substring(0, 57) + "..." : line;
         setStepProgress(stepName, progress, shortLine);
@@ -1489,11 +1556,16 @@ async function setupQwen3Settings(settings: AppSettings | null) {
     }
   });
 
-  // Handle download button (download or resume)
+  // One button: Download / Pause / Resume
   downloadBtn?.addEventListener("click", async () => {
-    if (qwen3DownloadPaused) {
-      qwen3DownloadPaused = false;
+    if (qwen3Downloading) {
+      qwen3DownloadPaused = true;
+      downloadBtn.disabled = true;
+      downloadBtn.textContent = "Pausing...";
+      try { await invoke("cancel_qwen3_download"); } catch (_) { /* may already be done */ }
+      return;
     }
+    qwen3DownloadPaused = false;
     await downloadQwen3Models();
   });
 }
@@ -1517,7 +1589,7 @@ function updateQwen3DownloadButton(btn: HTMLButtonElement | null, settings: AppS
   if (settings.qwen3_installed) {
     btn.textContent = "Models Installed";
     btn.disabled = true;
-    btn.classList.remove("btn-primary");
+    btn.classList.remove("btn-primary", "btn-warning");
     btn.classList.add("btn-secondary");
   } else {
     btn.innerHTML = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg> Download Qwen3 Models`;
@@ -1533,19 +1605,13 @@ async function downloadQwen3Models() {
   const fillEl = document.getElementById("fill-qwen3") as HTMLElement | null;
   const textEl = document.getElementById("text-qwen3");
 
-  // Show downloading state with a Cancel button
+  // Show downloading state; the same button now pauses (HF keeps partial files)
+  qwen3Downloading = true;
   if (btn) {
     btn.disabled = false;
-    btn.textContent = "Cancel Download";
+    btn.textContent = "Pause Download";
     btn.classList.remove("btn-primary");
     btn.classList.add("btn-warning");
-    // Replace click handler with cancel logic temporarily
-    btn.onclick = async () => {
-      qwen3DownloadPaused = true;
-      btn.disabled = true;
-      btn.textContent = "Cancelling...";
-      try { await invoke("cancel_qwen3_download"); } catch (_) { /* may already be done */ }
-    };
   }
   progressDiv?.classList.remove("hidden");
 
@@ -1563,13 +1629,15 @@ async function downloadQwen3Models() {
         const [, pct, doneMb, totalMb, fileName] = match;
         if (fillEl) fillEl.style.width = `${pct}%`;
         const shortFile = fileName.length > 40 ? fileName.substring(0, 37) + "..." : fileName;
-        textEl.textContent = `${pct}% (${doneMb}/${totalMb} MB) ${shortFile}`;
+        textEl.textContent = Number(totalMb) > 0
+          ? `${pct}% · ${formatBytes(Number(doneMb) * 1048576)} of ${formatBytes(Number(totalMb) * 1048576)} · ${shortFile}`
+          : shortFile;
       }
     } else if (line.startsWith("SIZE:")) {
       // e.g. "SIZE: 3200 MB total across 3 models"
       const match = line.match(/SIZE:\s*(\d+)\s*MB/);
       if (match) {
-        textEl.textContent = `Total download: ~${match[1]} MB`;
+        textEl.textContent = `Total download: ~${formatBytes(Number(match[1]) * 1048576)}`;
       }
     } else if (line.startsWith("DOWNLOAD:")) {
       // e.g. "DOWNLOAD: [2/3] Qwen/Qwen3-TTS-12Hz-0.6B-Base"
@@ -1614,6 +1682,7 @@ async function downloadQwen3Models() {
     }
 
     // Step 2: Download models using the robust downloader script.
+    if (qwen3DownloadPaused) throw new Error("Paused");
     if (textEl) textEl.textContent = "Starting model download...";
     if (fillEl) fillEl.style.width = "10%";
 
@@ -1654,14 +1723,12 @@ async function downloadQwen3Models() {
 
     if (qwen3DownloadPaused) {
       // User paused — show resume button
-      if (textEl) textEl.textContent = "Download paused. Progress is saved — resume anytime.";
-      if (fillEl) fillEl.style.width = "0%";
+      if (textEl) textEl.textContent = "Paused. Progress is saved — resume anytime.";
       if (btn) {
         btn.disabled = false;
         btn.textContent = "Resume Download";
         btn.classList.remove("btn-warning");
         btn.classList.add("btn-primary");
-        btn.onclick = null; // Reset to default handler
       }
     } else {
       // Actual error
@@ -1673,10 +1740,10 @@ async function downloadQwen3Models() {
         btn.textContent = "Retry Download";
         btn.classList.remove("btn-warning");
         btn.classList.add("btn-primary");
-        btn.onclick = null;
       }
     }
   } finally {
+    qwen3Downloading = false;
     unlisten();
   }
 }

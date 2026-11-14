@@ -228,8 +228,11 @@ struct ServerProcess(Option<std::process::Child>, Option<std::time::Instant>);
 /// Whether we intentionally started the server (vs found it running externally)
 struct ServerManagedByUs(bool);
 
-/// PID of the currently running Qwen3 download process (for cancel/pause)
+/// PID of the currently running setup/download process (for pause)
 struct DownloadPid(Option<u32>);
+
+/// Set while the user has paused setup; the downloader and its retry wait stop on it
+struct SetupPaused(std::sync::atomic::AtomicBool);
 
 // ============================================================================
 // Tauri Commands — Called from the frontend via invoke()
@@ -1100,7 +1103,149 @@ async fn get_setup_status(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<
     })
 }
 
-/// Download a file from a URL to a local path, with progress reporting via events
+/// Parse the total size from a Content-Range header ("bytes 100-999/1000" or "bytes */1000")
+fn content_range_total(resp: &reqwest::Response) -> Option<u64> {
+    resp.headers()
+        .get(reqwest::header::CONTENT_RANGE)?
+        .to_str()
+        .ok()?
+        .rsplit('/')
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn file_len(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// One download attempt into `part`, continuing from its current size.
+/// Err((true, msg)) = worth retrying; Err((false, msg)) = give up (HTTP 404, disk error, paused).
+async fn download_attempt(
+    client: &reqwest::Client,
+    url: &str,
+    part: &std::path::Path,
+    paused: &std::sync::atomic::AtomicBool,
+    emit: &(dyn Fn(serde_json::Value) + Sync),
+) -> Result<(), (bool, String)> {
+    use futures_util::StreamExt;
+    use std::io::Write;
+    use std::sync::atomic::Ordering;
+
+    let start = file_len(part);
+    let mut req = client.get(url);
+    if start > 0 {
+        req = req.header(reqwest::header::RANGE, format!("bytes={}-", start));
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| (true, format!("Download failed: {}", e)))?;
+    let status = resp.status();
+
+    let (mut downloaded, total, mut file) = if status.as_u16() == 416 {
+        // Range starts at or past the end: the .part is either complete or garbage
+        if content_range_total(&resp) == Some(start) {
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(part);
+        return Err((true, "Partial file did not match the server, starting over".to_string()));
+    } else if status.as_u16() == 206 {
+        let total = content_range_total(&resp)
+            .or_else(|| resp.content_length().map(|n| start + n))
+            .unwrap_or(0);
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(part)
+            .map_err(|e| (false, format!("Failed to open {}: {}", part.display(), e)))?;
+        (start, total, file)
+    } else if status.is_success() {
+        // 200: the server ignored Range, so start from byte 0
+        let file = std::fs::File::create(part)
+            .map_err(|e| (false, format!("Failed to create {}: {}", part.display(), e)))?;
+        (0, resp.content_length().unwrap_or(0), file)
+    } else {
+        let transient = status.is_server_error() || matches!(status.as_u16(), 408 | 429);
+        return Err((transient, format!("Download failed: HTTP {}", status)));
+    };
+
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        if paused.load(Ordering::SeqCst) {
+            return Err((false, "Paused".to_string()));
+        }
+        let chunk = chunk.map_err(|e| (true, format!("Download error: {}", e)))?;
+        file.write_all(&chunk)
+            .map_err(|e| (false, format!("Write error: {}", e)))?;
+        downloaded += chunk.len() as u64;
+
+        let progress = if total > 0 {
+            (downloaded as f64 / total as f64 * 100.0) as u32
+        } else {
+            0
+        };
+        emit(serde_json::json!({
+            "progress": progress,
+            "downloaded": downloaded,
+            "total": total,
+        }));
+    }
+    if total > 0 && downloaded != total {
+        return Err((true, "Connection closed before the download finished".to_string()));
+    }
+    Ok(())
+}
+
+/// Download `url` to `<dest>.part` and rename it to `dest` once complete.
+/// Resumes an existing .part with a Range request and retries dropped connections
+/// forever (1, 2, 4, 8, 16, 30, 30... s) until it finishes, fails for good, or is paused.
+async fn download_resumable(
+    url: &str,
+    dest: &std::path::Path,
+    paused: &std::sync::atomic::AtomicBool,
+    emit: &(dyn Fn(serde_json::Value) + Sync),
+) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+
+    let part = PathBuf::from(format!("{}.part", dest.display()));
+    // connect/read timeouts instead of a total-time cap, which would kill slow big downloads
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .read_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut attempt = 0usize;
+    loop {
+        if paused.load(Ordering::SeqCst) {
+            return Err("Paused".to_string());
+        }
+        let before = file_len(&part);
+        match download_attempt(&client, url, &part, paused, emit).await {
+            Ok(()) => break,
+            Err((false, msg)) => return Err(msg),
+            Err((true, msg)) => {
+                if file_len(&part) > before {
+                    attempt = 0; // made headway, so start the backoff over
+                }
+                let wait = [1u64, 2, 4, 8, 16, 30][attempt.min(5)];
+                attempt += 1;
+                for left in (1..=wait).rev() {
+                    if paused.load(Ordering::SeqCst) {
+                        return Err("Paused".to_string());
+                    }
+                    emit(serde_json::json!({ "status": "waiting", "retry_in": left, "error": msg }));
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+    std::fs::rename(&part, dest)
+        .map_err(|e| format!("Failed to move {} into place: {}", part.display(), e))
+}
+
+/// Download a file from a URL to a local path, with progress reporting via events.
+/// The partial file is kept as <dest>.part so a retry or Resume continues where it stopped.
 #[tauri::command]
 async fn setup_download_file(
     app: AppHandle,
@@ -1108,66 +1253,18 @@ async fn setup_download_file(
     dest: String,
     step_name: String,
 ) -> Result<String, String> {
-    use std::io::Write;
-
     let dest_path = PathBuf::from(&dest);
-    // Create parent directories
     if let Some(parent) = dest_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Failed to create directory: {}", e))?;
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(600))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("Download failed: {}", e))?;
-
-    let total_size = resp.content_length().unwrap_or(0);
-    let mut downloaded: u64 = 0;
-
-    let mut file = std::fs::File::create(&dest_path)
-        .map_err(|e| format!("Failed to create file {}: {}", dest, e))?;
-
-    let mut stream = resp.bytes_stream();
-    use futures_util::StreamExt;
-    let result: Result<(), String> = async {
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| format!("Download error: {}", e))?;
-            file.write_all(&chunk)
-                .map_err(|e| format!("Write error: {}", e))?;
-            downloaded += chunk.len() as u64;
-
-            // Emit progress event to frontend
-            let progress = if total_size > 0 {
-                (downloaded as f64 / total_size as f64 * 100.0) as u32
-            } else {
-                0
-            };
-            let _ = app.emit(
-                "setup-progress",
-                serde_json::json!({
-                    "step": step_name,
-                    "progress": progress,
-                    "downloaded": downloaded,
-                    "total": total_size,
-                }),
-            );
-        }
-        Ok(())
-    }.await;
-
-    // If download failed, remove the partial/empty file so it doesn't
-    // trick the status check into thinking the model is downloaded.
-    if result.is_err() {
-        let _ = std::fs::remove_file(&dest_path);
-    }
-    result?;
+    let paused = app.state::<SetupPaused>();
+    let emit = |mut payload: serde_json::Value| {
+        payload["step"] = serde_json::json!(step_name);
+        let _ = app.emit("setup-progress", payload);
+    };
+    download_resumable(&url, &dest_path, &paused.0, &emit).await?;
 
     Ok(dest_path.to_string_lossy().to_string())
 }
@@ -1316,12 +1413,10 @@ async fn setup_run_command(
     let mut child = cmd.spawn()
         .map_err(|e| format!("Failed to run {}: {}", program, e))?;
 
-    // Store PID for qwen3 downloads so they can be cancelled/paused
-    if step_name.starts_with("qwen3") {
-        if let Some(pid) = child.id() {
-            if let Ok(mut dl) = app.state::<Mutex<DownloadPid>>().lock() {
-                dl.0 = Some(pid);
-            }
+    // Store the PID so Pause can kill the running step
+    if let Some(pid) = child.id() {
+        if let Ok(mut dl) = app.state::<Mutex<DownloadPid>>().lock() {
+            dl.0 = Some(pid);
         }
     }
 
@@ -1407,10 +1502,8 @@ async fn setup_run_command(
         .map_err(|e| format!("Failed to wait for {}: {}", program, e))?;
 
     // Clear download PID
-    if step_name.starts_with("qwen3") {
-        if let Ok(mut dl) = app.state::<Mutex<DownloadPid>>().lock() {
-            dl.0 = None;
-        }
+    if let Ok(mut dl) = app.state::<Mutex<DownloadPid>>().lock() {
+        dl.0 = None;
     }
 
     let stdout = stdout_task.await.unwrap_or_default();
@@ -1468,7 +1561,21 @@ fn open_setup_terminal(
     Ok(())
 }
 
-/// Cancel/pause the currently running Qwen3 download process.
+/// Pause setup: stop the HTTP downloader and kill the running pip/model process.
+/// Partial files stay on disk, so running setup again continues from there.
+#[tauri::command]
+fn pause_setup(app: AppHandle) {
+    app.state::<SetupPaused>().0.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = cancel_qwen3_download(app);
+}
+
+/// Clear the pause flag before (re)starting setup
+#[tauri::command]
+fn resume_setup(app: AppHandle) {
+    app.state::<SetupPaused>().0.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Cancel/pause the currently running download process (Qwen3 or a setup step).
 /// Uses taskkill /T to also terminate child processes (pip, snapshot_download).
 /// Since huggingface_hub caches partial downloads, re-running will resume.
 #[tauri::command]
@@ -1582,7 +1689,22 @@ fn setup_install_server(app: AppHandle, config: tauri::State<'_, Mutex<AppConfig
 fn setup_mark_deps_installed(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<(), String> {
     let cfg = config.lock().map_err(|e| e.to_string())?;
     std::fs::write(cfg.data_dir().join(".deps_installed"), DEPS_VERSION)
-        .map_err(|e| format!("Failed to write deps marker: {}", e))
+        .map_err(|e| format!("Failed to write deps marker: {}", e))?;
+
+    // The pip cache (holds the multi-GB torch wheel) and temp files were only
+    // needed for retries during the install. Locked files are skipped.
+    for dir in [cfg.data_dir().join("cache").join("pip"), cfg.data_dir().join("tmp")] {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for path in entries.flatten().map(|e| e.path()) {
+                let _ = if path.is_dir() {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Get the paths used by the setup system
@@ -1998,6 +2120,7 @@ pub fn run() {
         .manage(Mutex::new(ServerManagedByUs(false)))
         .manage(Mutex::new(AppConfig::load()))
         .manage(Mutex::new(DownloadPid(None)))
+        .manage(SetupPaused(std::sync::atomic::AtomicBool::new(false)))
         .invoke_handler(tauri::generate_handler![
             get_server_status,
             get_sapi_status,
@@ -2016,6 +2139,8 @@ pub fn run() {
             save_wav_file,
             qwen3_get_status,
             cancel_qwen3_download,
+            pause_setup,
+            resume_setup,
             open_setup_terminal,
             get_setup_status,
             get_setup_paths,
