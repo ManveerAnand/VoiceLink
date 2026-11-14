@@ -1569,7 +1569,7 @@ async function runSetup() {
       // Install kokoro separately (it's a bigger install)
       await runNetworkCommand("deps", {
         program: paths.python_exe,
-        args: ["-m", "pip", "install", "--no-warn-script-location", ...PIP_NET_ARGS, "kokoro>=0.3"],
+        args: ["-m", "pip", "install", "--no-warn-script-location", ...PIP_NET_ARGS, "kokoro==0.9.4"],
       });
 
       // Only now is the package step really complete (an interrupted install

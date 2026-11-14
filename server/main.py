@@ -21,8 +21,14 @@
 # The model stays in memory for the entire lifetime of the server.
 # ============================================================================
 
-import asyncio
 import os
+
+# Must come before numpy is imported. OpenBLAS reserves buffers for every CPU
+# thread when numpy loads (+495 MB committed on a 16-thread PC, +13 MB with 1).
+# We use numpy only for light array work; torch has its own thread pool.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
+import asyncio
 import socket
 import sys
 import time

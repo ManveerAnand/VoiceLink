@@ -5,7 +5,8 @@
 # Install with:  pip install -r server/requirements.txt
 #
 # NOTE: 'kokoro' must be installed separately first (it pins numpy==1.26.4)
-#       pip install kokoro soundfile
+#       pip install kokoro==0.9.4 soundfile   (the lean model loader in
+#       server/models/kokoro_model.py is only tested against 0.9.4)
 #       pip install -r server/requirements.txt
 # ============================================================================
 

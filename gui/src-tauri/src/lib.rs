@@ -1971,6 +1971,8 @@ import runpy; runpy.run_module('server.main', run_name='__main__', alter_sys=Tru
         // asks the network before each cached file load (voice 7 s, startup +6 s).
         // Not in data_env: setup, restore and the Qwen3 download must stay online.
         .env("HF_HUB_OFFLINE", "1")
+        // numpy's BLAS would reserve ~500 MB for its per-CPU thread buffers; torch has its own threads.
+        .env("OPENBLAS_NUM_THREADS", "1")
         .envs(data_env(cfg))
         .stdout(std::process::Stdio::from(log))
         .stderr(std::process::Stdio::from(log_err))
