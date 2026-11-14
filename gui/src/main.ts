@@ -1030,6 +1030,7 @@ async function runSetup() {
           "-m", "pip", "install", "--no-warn-script-location",
           "fastapi>=0.115.0",
           "uvicorn[standard]>=0.34.0",
+          "python-multipart>=0.0.9",
           "pydantic-settings>=2.7.0",
           "pyyaml>=6.0",
           "soundfile>=0.13.0",
