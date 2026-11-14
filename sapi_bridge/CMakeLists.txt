@@ -37,6 +37,9 @@
 cmake_minimum_required(VERSION 3.20)
 project(voicelink_sapi LANGUAGES CXX)
 
+option(BUILD_TESTING "Build VoiceLink bridge tests" OFF)
+include(CTest)
+
 # ----------------------------------------------------------------------------
 # C++ Standard
 # We use C++17 for:
@@ -65,6 +68,7 @@ set(SOURCES
     src/class_factory.cpp
     src/tts_engine.cpp
     src/http_client.cpp
+    src/protocol.cpp
 )
 
 set(HEADERS
@@ -73,6 +77,7 @@ set(HEADERS
     src/class_factory.h
     src/tts_engine.h
     src/http_client.h
+    src/protocol.h
 )
 
 # ----------------------------------------------------------------------------
@@ -176,3 +181,24 @@ set_target_properties(voicelink_sapi PROPERTIES
     OUTPUT_NAME "voicelink_sapi"
     PREFIX ""  # Don't add "lib" prefix (Windows convention)
 )
+
+if(BUILD_TESTING)
+    add_executable(voicelink_protocol_test
+        tests/protocol_test.cpp
+        src/protocol.cpp
+    )
+    target_include_directories(voicelink_protocol_test PRIVATE src)
+    target_link_libraries(voicelink_protocol_test PRIVATE ole32)
+    target_compile_definitions(voicelink_protocol_test PRIVATE
+        UNICODE
+        _UNICODE
+        WIN32_LEAN_AND_MEAN
+    )
+    target_compile_options(voicelink_protocol_test PRIVATE
+        /W4
+        /WX
+        /permissive-
+        /Zc:__cplusplus
+    )
+    add_test(NAME voicelink_protocol_test COMMAND voicelink_protocol_test)
+endif()

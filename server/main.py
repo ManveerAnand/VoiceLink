@@ -28,6 +28,7 @@ import sys
 import time
 import logging
 import warnings
+import asyncio
 from contextlib import asynccontextmanager
 
 # Suppress noisy third-party warnings before any imports trigger them
@@ -82,8 +83,55 @@ def claim_port() -> "socket.socket":
 _port_sock = claim_port() if __name__ == "__main__" else None
 
 from server.models import load_model
-from server.routers.tts import router as tts_router, set_model, set_start_time
+from server.routers.tts import (
+    router as tts_router,
+    set_lookahead_service,
+    set_model,
+    set_start_time,
+)
 from server.routers.qwen3 import router as qwen3_router
+from server.routers.lookahead import create_router
+from server.lookahead.cache import PcmCache
+from server.lookahead.correlation import CorrelationRegistry
+from server.lookahead.scheduler import LookAheadScheduler
+from server.lookahead.service import LookAheadService
+from server.lookahead.store import SnapshotStore
+from server.lookahead.worker import SpeculativeWorker
+
+
+# These objects are intentionally distinct from the authoritative TTS model.
+# Construction has no model-load side effect; the child starts only in lifespan.
+lookahead_worker = SpeculativeWorker(
+    lang_code=settings.model.kokoro_lang_code,
+    device=settings.model.device,
+    max_jobs=settings.lookahead.max_queued_jobs,
+)
+_lookahead_scheduler_holder: dict[str, LookAheadScheduler] = {}
+lookahead_store = SnapshotStore(
+    on_cancel_job=lambda job_id: _lookahead_scheduler_holder["scheduler"].cancel(job_id)
+)
+lookahead_scheduler = LookAheadScheduler(
+    worker=lookahead_worker,
+    store=lookahead_store,
+    cache=PcmCache(
+        max_bytes=settings.lookahead.cache_max_bytes,
+        ttl_seconds=settings.lookahead.cache_ttl_seconds,
+    ),
+    settings=settings.lookahead,
+)
+_lookahead_scheduler_holder["scheduler"] = lookahead_scheduler
+lookahead_registry = CorrelationRegistry(
+    correlation_ttl_seconds=settings.lookahead.correlation_ttl_seconds,
+    binding_ttl_seconds=settings.lookahead.stream_ttl_seconds,
+)
+lookahead_service = LookAheadService(
+    settings=settings.lookahead,
+    store=lookahead_store,
+    scheduler=lookahead_scheduler,
+    registry=lookahead_registry,
+    model_version="Kokoro",
+)
+set_lookahead_service(lookahead_service)
 
 
 def setup_logging():
@@ -138,6 +186,7 @@ async def lifespan(app: FastAPI):
         logger.info("Qwen3: disabled")
 
     # Load the TTS model
+    model = None
     t0 = time.perf_counter()
     try:
         model = load_model(
@@ -159,14 +208,37 @@ async def lifespan(app: FastAPI):
     logger.info(f"API docs at   http://{settings.server.host}:{settings.server.port}/docs")
     logger.info("")
 
-    # --- SERVE REQUESTS ---
-    yield
+    poll_task: asyncio.Task[None] | None = None
+    if settings.lookahead.enabled:
+        if not lookahead_worker.start():
+            logger.warning("Look-ahead unavailable: isolated Kokoro worker did not become ready")
 
-    # --- SHUTDOWN ---
-    logger.info("Server shutting down...")
-    if model is not None:
-        model.unload()
-    logger.info("Goodbye!")
+    async def poll_lookahead_maintenance() -> None:
+        while True:
+            lookahead_service.maintain()
+            if settings.lookahead.enabled:
+                lookahead_scheduler.poll()
+            await asyncio.sleep(0.05)
+
+    poll_task = asyncio.create_task(poll_lookahead_maintenance())
+
+    # --- SERVE REQUESTS ---
+    try:
+        yield
+    finally:
+        if poll_task is not None:
+            poll_task.cancel()
+            try:
+                await poll_task
+            except asyncio.CancelledError:
+                pass
+        lookahead_worker.stop()
+
+        # --- SHUTDOWN ---
+        logger.info("Server shutting down...")
+        if model is not None:
+            model.unload()
+        logger.info("Goodbye!")
 
 
 # --- Create the FastAPI app ---
@@ -182,6 +254,14 @@ app = FastAPI(
 
 # Mount routers
 app.include_router(tts_router)
+app.include_router(
+    create_router(
+        settings=settings.lookahead,
+        store=lookahead_store,
+        worker_ready=lambda: lookahead_scheduler.ready,
+        service=lookahead_service,
+    )
+)
 
 # Qwen3 router is always mounted — the router itself handles lazy loading.
 # If Qwen3 is disabled, requests will still fail gracefully because the model

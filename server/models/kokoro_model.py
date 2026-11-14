@@ -209,7 +209,9 @@ class KokoroModel(TTSModel):
         if voice is None:
             voice = "af_heart"
 
-        logger.debug(f"Synthesizing: voice={voice}, speed={speed}, text={text[:80]}...")
+        logger.debug(
+            f"Synthesizing: voice={voice}, speed={speed}, text_len={len(text)}"
+        )
 
         # --- Run Kokoro pipeline ---
         # pipeline() returns a generator of (graphemes, phonemes, audio) tuples.

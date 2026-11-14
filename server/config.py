@@ -17,7 +17,7 @@
 # ============================================================================
 
 from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic import Field, field_validator
 from pathlib import Path
 
 
@@ -99,12 +99,34 @@ class AudioSettings(BaseSettings):
     )
 
 
+class LookAheadSettings(BaseSettings):
+    """Limits for the disabled-by-default optional snapshot protocol."""
+
+    enabled: bool = False
+    max_active_streams: int = Field(default=8, ge=1)
+    stream_ttl_seconds: int = Field(default=30, ge=1)
+    cache_max_bytes: int = Field(default=268_435_456, ge=1)
+    cache_ttl_seconds: int = Field(default=600, ge=1)
+    max_queued_jobs: int = Field(default=48, ge=1)
+    max_runway_seconds: int = Field(default=60, ge=1)
+    correlation_ttl_seconds: int = Field(default=5)
+    metrics_log_interval_seconds: float = Field(default=30.0, ge=1.0, le=3600.0)
+
+    @field_validator("correlation_ttl_seconds", mode="before")
+    @classmethod
+    def correlation_ttl_must_be_the_normative_integer_five(cls, value: object) -> int:
+        if type(value) is not int or value != 5:
+            raise ValueError("correlation_ttl_seconds must be the integer 5")
+        return value
+
+
 class Settings(BaseSettings):
     """Root settings object — aggregates all sub-settings."""
 
     server: ServerSettings = Field(default_factory=ServerSettings)
     model: ModelSettings = Field(default_factory=ModelSettings)
     audio: AudioSettings = Field(default_factory=AudioSettings)
+    lookahead: LookAheadSettings = Field(default_factory=LookAheadSettings)
 
     model_config = {
         "env_prefix": "VOICELINK_",

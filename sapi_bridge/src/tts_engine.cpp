@@ -40,6 +40,7 @@
 #include <vector>    // for volume scaling buffer
 #include <cstdint>   // int16_t
 #include <cwctype>   // iswspace (word boundary parsing)
+#include <limits>    // numeric_limits (overflow-safe byte counting)
 
 // True when the host process is a Chromium browser (decided once, see rate mapping).
 static bool HostIsChromium()
@@ -66,7 +67,8 @@ static bool HostIsChromium()
 VoiceLinkEngine::VoiceLinkEngine()
     : m_refCount(1) // Start with ref count of 1 (creator holds a reference)
       ,
-      m_pToken(nullptr), m_voiceId("af_heart") // Default voice if token doesn't specify
+      m_pToken(nullptr), m_engineInstanceId(GenerateUuid()),
+      m_voiceId("af_heart") // Default voice if token doesn't specify
       ,
       m_model("kokoro") // Default model backend
       ,
@@ -74,6 +76,9 @@ VoiceLinkEngine::VoiceLinkEngine()
       ,
       m_initialized(false)
 {
+    if (m_engineInstanceId.empty())
+        VERR(L"Failed to create engine instance UUID");
+
     // Track how many of our objects exist globally.
     // DllCanUnloadNow checks this — COM won't unload our DLL while objects exist.
     InterlockedIncrement(&g_objectCount);
@@ -512,16 +517,27 @@ STDMETHODIMP VoiceLinkEngine::Speak(
     // This is a rough fallback estimate. The server reports the EXACT total
     // audio byte count via the X-Audio-Length header, which we use if available.
     // The estimate is only used as a fallback when the header is missing.
-    float estTotalAudioBytes = static_cast<float>(totalTextChars) * 3200.0f / speed;
+    std::uint64_t estSpeechAudioBytes = static_cast<std::uint64_t>(
+        static_cast<double>(totalTextChars) * 3200.0 / static_cast<double>(speed));
     size_t nextWordIdx = 0;
 
-    VLOG(L"Parsed %zu word boundaries, totalChars=%lu, estAudio=%.0f bytes",
-         wordBoundaries.size(), totalTextChars, estTotalAudioBytes);
+    VLOG(L"Parsed %zu word boundaries, totalChars=%lu, estAudio=%llu bytes",
+         wordBoundaries.size(), totalTextChars,
+         static_cast<unsigned long long>(estSpeechAudioBytes));
 
     // -----------------------------------------------------------------------
     // Step 3: Build the JSON request for the inference server
     // -----------------------------------------------------------------------
     std::string jsonBody = BuildTtsRequestJson(textUtf8, m_voiceId, speed);
+
+    if (m_engineInstanceId.empty())
+        return E_FAIL;
+    const RequestMetadata requestMetadata = CreateRequestMetadata(m_engineInstanceId);
+    if (requestMetadata.requestId.empty())
+    {
+        VERR(L"Failed to create request UUID");
+        return E_FAIL;
+    }
 
     // Choose endpoint based on model backend
     // Kokoro: /v1/tts (the original endpoint)
@@ -540,15 +556,43 @@ STDMETHODIMP VoiceLinkEngine::Speak(
     // -----------------------------------------------------------------------
 
     // Track total bytes written (for logging)
-    ULONG totalBytesWritten = 0;
+    std::uint64_t totalBytesWritten = 0;
 
-    // The server reports exact audio length via X-Audio-Length header.
-    // If available, this replaces our rough estimate for perfect timing.
-    ULONGLONG serverAudioBytes = 0;
+    // Protocol-2 responses may split total audio into leading prefix silence
+    // and speech bytes. Invalid or absent timing headers fall back to the
+    // legacy X-Audio-Length value with a zero prefix.
+    AudioResponseMetadata audioMetadata;
+
+    const auto checkAbort = [&]() -> bool
+    {
+        // GetActions() clears the flags after reading, so handle every flag
+        // from a single call.
+        DWORD actions = pOutputSite->GetActions();
+
+        if (actions & SPVES_ABORT)
+        {
+            VLOG(L"Abort requested by SAPI");
+            return true;
+        }
+
+        if (actions & SPVES_SKIP)
+        {
+            SPVSKIPTYPE skipType;
+            long skipCount;
+            if (SUCCEEDED(pOutputSite->GetSkipInfo(&skipType, &skipCount)))
+                pOutputSite->CompleteSkip(skipCount);
+
+            VLOG(L"Skip requested by SAPI - aborting for repositioning");
+            return true;
+        }
+
+        return false;
+    };
 
     HRESULT hr = m_httpClient.StreamSynthesize(
         jsonBody.c_str(),
         static_cast<DWORD>(jsonBody.size()),
+        requestMetadata,
 
         // onChunk: called for each chunk of PCM audio from the server
         [&](const BYTE *data, DWORD size) -> HRESULT
@@ -592,125 +636,128 @@ STDMETHODIMP VoiceLinkEngine::Speak(
             //   - Write() blocks if the buffer is full (backpressure)
             //
             // The &written output tells us how many bytes SAPI accepted.
-            // Usually it's all of them, but we should check.
-            ULONG written = 0;
-            HRESULT writeHr = pOutputSite->Write(writeData, size, &written);
-
-            if (FAILED(writeHr))
+            // A successful call may accept only part of the buffer, so keep
+            // writing the unaccepted suffix until the whole HTTP chunk has
+            // been delivered.
+            AudioChunkWriteProgress writeProgress{0, static_cast<std::uint32_t>(size)};
+            while (writeProgress.remaining > 0)
             {
-                VERR(L"ISpTTSEngineSite::Write failed: 0x%08lX", writeHr);
-                return writeHr;
-            }
+                ULONG written = 0;
+                HRESULT writeHr = pOutputSite->Write(
+                    writeData + writeProgress.offset,
+                    static_cast<ULONG>(writeProgress.remaining),
+                    &written);
 
-            totalBytesWritten += written;
-
-            // ---------------------------------------------------------------
-            // Use server-reported exact audio length if available.
-            //
-            // The server pre-generates all audio and sends the total byte
-            // count in the X-Audio-Length header. Using the EXACT total
-            // instead of our rough estimate gives perfect proportional
-            // word-boundary event timing — no highlight drift.
-            // ---------------------------------------------------------------
-            if (serverAudioBytes > 0 && estTotalAudioBytes != static_cast<float>(serverAudioBytes))
-            {
-                VLOG(L"Updating estTotalAudioBytes: %.0f → %llu (from server)",
-                     estTotalAudioBytes, serverAudioBytes);
-                estTotalAudioBytes = static_cast<float>(serverAudioBytes);
-            }
-
-            // ---------------------------------------------------------------
-            // Fire SPEI_WORD_BOUNDARY (and SPEI_SENTENCE_BOUNDARY) events
-            // for words whose proportional audio offset we have now passed.
-            //
-            // Each word's audio offset is:
-            //   (charPos / totalTextChars) * estTotalAudioBytes
-            //
-            // With the server-reported total, this is exact. With the
-            // fallback estimate, it's approximate.
-            // ---------------------------------------------------------------
-            while (nextWordIdx < wordBoundaries.size())
-            {
-                float fraction = (totalTextChars > 0)
-                                     ? static_cast<float>(wordBoundaries[nextWordIdx].charPos) / totalTextChars
-                                     : 0.0f;
-                ULONGLONG estOffset = static_cast<ULONGLONG>(fraction * estTotalAudioBytes);
-
-                if (estOffset <= totalBytesWritten)
+                if (FAILED(writeHr))
                 {
-                    // Fire sentence boundary before the first word of a sentence
-                    if (wordBoundaries[nextWordIdx].sentStart)
-                    {
-                        // Calculate sentence length (chars to next sentence or end)
-                        ULONG sentLen = 0;
-                        for (size_t si = nextWordIdx + 1; si < wordBoundaries.size(); si++)
-                        {
-                            if (wordBoundaries[si].sentStart)
-                            {
-                                sentLen = wordBoundaries[si].charPos - wordBoundaries[nextWordIdx].charPos;
-                                break;
-                            }
-                        }
-                        if (sentLen == 0 && totalTextChars > wordBoundaries[nextWordIdx].charPos)
-                            sentLen = totalTextChars - wordBoundaries[nextWordIdx].charPos;
+                    VERR(L"ISpTTSEngineSite::Write failed: 0x%08lX", writeHr);
+                    return writeHr;
+                }
 
-                        SPEVENT sentEvt = {};
-                        sentEvt.eEventId = SPEI_SENTENCE_BOUNDARY;
-                        sentEvt.elParamType = SPET_LPARAM_IS_UNDEFINED;
-                        sentEvt.ullAudioStreamOffset = estOffset;
-                        sentEvt.wParam = static_cast<WPARAM>(sentLen);
-                        sentEvt.lParam = static_cast<LPARAM>(wordBoundaries[nextWordIdx].charPos);
-                        pOutputSite->AddEvents(&sentEvt, 1);
-                    }
+                if (!AdvanceAudioChunkWriteProgress(
+                        writeProgress,
+                        static_cast<std::uint32_t>(written)))
+                {
+                    VERR(L"ISpTTSEngineSite::Write made invalid progress: "
+                         L"written=%lu, remaining=%lu",
+                         written,
+                         static_cast<unsigned long>(writeProgress.remaining));
+                    return E_FAIL;
+                }
 
-                    SPEVENT evt = {};
-                    evt.eEventId = SPEI_WORD_BOUNDARY;
-                    evt.elParamType = SPET_LPARAM_IS_UNDEFINED;
-                    evt.ullAudioStreamOffset = estOffset;
-                    evt.wParam = static_cast<WPARAM>(wordBoundaries[nextWordIdx].charLen);
-                    evt.lParam = static_cast<LPARAM>(wordBoundaries[nextWordIdx].charPos);
-                    pOutputSite->AddEvents(&evt, 1);
-                    nextWordIdx++;
+                constexpr std::uint64_t maximumAudioBytes =
+                    (std::numeric_limits<std::uint64_t>::max)();
+                if (static_cast<std::uint64_t>(written) >
+                    maximumAudioBytes - totalBytesWritten)
+                {
+                    totalBytesWritten = maximumAudioBytes;
                 }
                 else
-                    break;
+                {
+                    totalBytesWritten += written;
+                }
+
+                // -----------------------------------------------------------
+                // Use server-reported exact audio length if available.
+                // -----------------------------------------------------------
+                if (audioMetadata.totalBytes > 0 &&
+                    estSpeechAudioBytes != audioMetadata.speechBytes)
+                {
+                    VLOG(L"Updating estimated speech bytes: %llu -> %llu (from server)",
+                         static_cast<unsigned long long>(estSpeechAudioBytes),
+                         static_cast<unsigned long long>(audioMetadata.speechBytes));
+                    estSpeechAudioBytes = audioMetadata.speechBytes;
+                }
+
+                // Fire events after every accepted portion of a short write,
+                // so thresholds reflect bytes SAPI actually received.
+                while (nextWordIdx < wordBoundaries.size())
+                {
+                    const std::uint64_t estOffset = CalculateProportionalAudioOffset(
+                        estSpeechAudioBytes,
+                        audioMetadata.prefixBytes,
+                        wordBoundaries[nextWordIdx].charPos,
+                        totalTextChars);
+
+                    if (estOffset <= totalBytesWritten)
+                    {
+                        // Fire sentence boundary before the first word of a sentence
+                        if (wordBoundaries[nextWordIdx].sentStart)
+                        {
+                            // Calculate sentence length (chars to next sentence or end)
+                            ULONG sentLen = 0;
+                            for (size_t si = nextWordIdx + 1; si < wordBoundaries.size(); si++)
+                            {
+                                if (wordBoundaries[si].sentStart)
+                                {
+                                    sentLen = wordBoundaries[si].charPos -
+                                              wordBoundaries[nextWordIdx].charPos;
+                                    break;
+                                }
+                            }
+                            if (sentLen == 0 &&
+                                totalTextChars > wordBoundaries[nextWordIdx].charPos)
+                            {
+                                sentLen = totalTextChars -
+                                          wordBoundaries[nextWordIdx].charPos;
+                            }
+
+                            SPEVENT sentEvt = {};
+                            sentEvt.eEventId = SPEI_SENTENCE_BOUNDARY;
+                            sentEvt.elParamType = SPET_LPARAM_IS_UNDEFINED;
+                            sentEvt.ullAudioStreamOffset = estOffset;
+                            sentEvt.wParam = static_cast<WPARAM>(sentLen);
+                            sentEvt.lParam = static_cast<LPARAM>(
+                                wordBoundaries[nextWordIdx].charPos);
+                            pOutputSite->AddEvents(&sentEvt, 1);
+                        }
+
+                        SPEVENT evt = {};
+                        evt.eEventId = SPEI_WORD_BOUNDARY;
+                        evt.elParamType = SPET_LPARAM_IS_UNDEFINED;
+                        evt.ullAudioStreamOffset = estOffset;
+                        evt.wParam = static_cast<WPARAM>(
+                            wordBoundaries[nextWordIdx].charLen);
+                        evt.lParam = static_cast<LPARAM>(
+                            wordBoundaries[nextWordIdx].charPos);
+                        pOutputSite->AddEvents(&evt, 1);
+                        nextWordIdx++;
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+
+                if (writeProgress.remaining > 0 && checkAbort())
+                    return E_ABORT;
             }
 
             return S_OK;
         },
 
-        // checkAbort: called between chunks to see if we should stop
-        [&]() -> bool
-        {
-            // GetActions() returns a bitmask of pending actions.
-            // IMPORTANT: GetActions() CLEARS the flags after reading,
-            // so we must handle all flags in a single call.
-            DWORD actions = pOutputSite->GetActions();
-
-            if (actions & SPVES_ABORT)
-            {
-                VLOG(L"Abort requested by SAPI");
-                return true;
-            }
-
-            // SPVES_SKIP: Edge Read Aloud sends this when the user clicks
-            // on a different position in the text. We acknowledge the skip
-            // and abort so Edge can start a new Speak() from that position.
-            if (actions & SPVES_SKIP)
-            {
-                SPVSKIPTYPE skipType;
-                long skipCount;
-                if (SUCCEEDED(pOutputSite->GetSkipInfo(&skipType, &skipCount)))
-                {
-                    pOutputSite->CompleteSkip(skipCount);
-                }
-                VLOG(L"Skip requested by SAPI — aborting for repositioning");
-                return true;
-            }
-
-            return false;
-        },
-        &serverAudioBytes,
+        checkAbort,
+        &audioMetadata,
         endpoint);
 
     // Flush any remaining word-boundary events whose estimated offset
@@ -719,6 +766,14 @@ STDMETHODIMP VoiceLinkEngine::Speak(
     if (SUCCEEDED(hr))
         while (nextWordIdx < wordBoundaries.size())
         {
+            const std::uint64_t finalEventOffset = (std::min)(
+                CalculateProportionalAudioOffset(
+                    estSpeechAudioBytes,
+                    audioMetadata.prefixBytes,
+                    wordBoundaries[nextWordIdx].charPos,
+                    totalTextChars),
+                totalBytesWritten);
+
             if (wordBoundaries[nextWordIdx].sentStart)
             {
                 ULONG sentLen = 0;
@@ -736,7 +791,7 @@ STDMETHODIMP VoiceLinkEngine::Speak(
                 SPEVENT sentEvt = {};
                 sentEvt.eEventId = SPEI_SENTENCE_BOUNDARY;
                 sentEvt.elParamType = SPET_LPARAM_IS_UNDEFINED;
-                sentEvt.ullAudioStreamOffset = totalBytesWritten;
+                sentEvt.ullAudioStreamOffset = finalEventOffset;
                 sentEvt.wParam = static_cast<WPARAM>(sentLen);
                 sentEvt.lParam = static_cast<LPARAM>(wordBoundaries[nextWordIdx].charPos);
                 pOutputSite->AddEvents(&sentEvt, 1);
@@ -745,7 +800,7 @@ STDMETHODIMP VoiceLinkEngine::Speak(
             SPEVENT evt = {};
             evt.eEventId = SPEI_WORD_BOUNDARY;
             evt.elParamType = SPET_LPARAM_IS_UNDEFINED;
-            evt.ullAudioStreamOffset = totalBytesWritten;
+            evt.ullAudioStreamOffset = finalEventOffset;
             evt.wParam = static_cast<WPARAM>(wordBoundaries[nextWordIdx].charLen);
             evt.lParam = static_cast<LPARAM>(wordBoundaries[nextWordIdx].charPos);
             pOutputSite->AddEvents(&evt, 1);
@@ -754,16 +809,18 @@ STDMETHODIMP VoiceLinkEngine::Speak(
 
     if (hr == E_ABORT)
     {
-        VLOG(L"Speak() aborted after %lu bytes", totalBytesWritten);
+        VLOG(L"Speak() aborted after %llu bytes",
+             static_cast<unsigned long long>(totalBytesWritten));
     }
     else if (FAILED(hr))
     {
-        VERR(L"Speak() failed: 0x%08lX (wrote %lu bytes before failure)",
-             hr, totalBytesWritten);
+        VERR(L"Speak() failed: 0x%08lX (wrote %llu bytes before failure)",
+             hr, static_cast<unsigned long long>(totalBytesWritten));
     }
     else
     {
-        VLOG(L"Speak() completed: %lu bytes of audio streamed", totalBytesWritten);
+        VLOG(L"Speak() completed: %llu bytes of audio streamed",
+             static_cast<unsigned long long>(totalBytesWritten));
     }
 
     // Return S_OK even on abort — that's the SAPI convention.
