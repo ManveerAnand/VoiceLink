@@ -2141,7 +2141,7 @@ async fn stop_server(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// Runs when the app exits (tray Quit, window closed, anything else): stop the
+/// Runs when the app exits (tray Quit, Windows logoff/shutdown): stop the
 /// setup/Qwen3 download and the server we started, so nothing is left running
 /// with no parent. A server this app didn't start is left alone. Bounded so
 /// Quit can't hang.
@@ -2719,6 +2719,22 @@ pub fn run() {
             get_settings,
             save_settings,
         ])
+        // X / Alt+F4 hide to the tray; only tray > Quit (or logoff/shutdown) exits,
+        // so the server keeps serving SAPI voices to other apps
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+                // Tell the user once per run where the app went
+                static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !TOLD.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    let _ = window.app_handle().notification().builder()
+                        .title("VoiceLink is still running")
+                        .body("It stays in the tray so your voices keep working. Right-click the tray icon to quit.")
+                        .show();
+                }
+            }
+        })
         .setup(|app| {
             // After an app update the bundled server code is newer than the copy in
             // the data dir: refresh it before anything starts the server.
