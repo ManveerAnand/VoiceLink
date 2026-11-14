@@ -797,9 +797,22 @@ fn toggle_voice(voice_id: String, enabled: bool) -> Result<(), String> {
 // Delete / restore voices, favorites, default voice
 // ============================================================================
 
+/// Voice ids end up in registry paths and file names, so reject anything that
+/// could climb out of them. Clone ids include a user-chosen name, so spaces etc. stay allowed.
+fn valid_voice_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.chars().count() <= 150
+        && !id.contains(['\\', '/'])
+        && !id.contains("..")
+        && !id.chars().any(|c| c.is_control())
+}
+
 /// Remove a Kokoro voicepack from the HF cache: the snapshot entry and, when
 /// nothing else in any snapshot points at it, the blob behind it.
 fn remove_kokoro_voicepack(cfg: &AppConfig, voice_id: &str) {
+    if !valid_voice_id(voice_id) {
+        return;
+    }
     let repo = hf_home(cfg).join("hub").join("models--hexgrad--Kokoro-82M");
     let blobs = std::fs::canonicalize(repo.join("blobs")).ok();
     let voice_dirs: Vec<PathBuf> = std::fs::read_dir(repo.join("snapshots"))
@@ -847,6 +860,10 @@ fn delete_voice(
 
     let is_qwen3 = voice_id.starts_with("qwen3_");
     let is_clone = voice_id.starts_with("qwen3_custom_");
+    if !valid_voice_id(&voice_id) {
+        return Err("Invalid voice id".to_string());
+    }
+    // Kokoro ids also become the voicepack file name
     if !is_qwen3 && !voice_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err("Invalid voice id".to_string());
     }
@@ -940,6 +957,9 @@ fn set_default_voice(voice_id: String) -> Result<(), String> {
     use winreg::enums::*;
     use winreg::RegKey;
 
+    if !valid_voice_id(&voice_id) {
+        return Err("Invalid voice id".to_string());
+    }
     let token = format!("VoiceLink_{}", voice_id);
     RegKey::predef(HKEY_LOCAL_MACHINE)
         .open_subkey_with_flags(format!(r"{}\Tokens\{}", SAPI_VOICES_KEY, token), KEY_READ)
