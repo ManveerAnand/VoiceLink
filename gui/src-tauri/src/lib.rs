@@ -96,6 +96,11 @@ struct AppConfig {
     qwen3_model_tier: String, // "standard" (0.6B) or "full" (1.7B)
     #[serde(default)]
     qwen3_installed: bool,
+    /// Built-in voices the user deleted; hidden from the list until restored
+    #[serde(default)]
+    removed_voices: Vec<String>,
+    #[serde(default)]
+    favorite_voices: Vec<String>,
 }
 
 fn default_qwen3_tier() -> String {
@@ -120,6 +125,8 @@ impl Default for AppConfig {
             qwen3_enabled: false,
             qwen3_model_tier: "standard".to_string(),
             qwen3_installed: false,
+            removed_voices: Vec::new(),
+            favorite_voices: Vec::new(),
         }
     }
 }
@@ -368,9 +375,9 @@ async fn get_server_status() -> Result<ServerStatus, String> {
 /// Merges Kokoro voices from /v1/voices with Qwen3 voices from /v1/qwen3/speakers.
 #[tauri::command]
 async fn get_voices(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<Vec<VoiceInfo>, String> {
-    let qwen3_enabled = {
+    let (qwen3_enabled, removed) = {
         let cfg = config.lock().unwrap();
-        cfg.qwen3_enabled
+        (cfg.qwen3_enabled, cfg.removed_voices.clone())
     };
 
     let client = reqwest::Client::builder()
@@ -413,6 +420,8 @@ async fn get_voices(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<Vec<Vo
             }
         }
     }
+
+    voices.retain(|v| !removed.contains(&v.id));
 
     // Read custom names from registry and override server names
     {
@@ -782,6 +791,185 @@ fn toggle_voice(voice_id: String, enabled: bool) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+// ============================================================================
+// Delete / restore voices, favorites, default voice
+// ============================================================================
+
+/// Voice ids end up in registry paths and file names, so reject anything that
+/// could climb out of them (or, with `'`, break out of the quoted strings in the
+/// elevated PowerShell script). Clone ids include a user-chosen name, so spaces etc. stay allowed.
+fn valid_voice_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.chars().count() <= 150
+        && !id.contains(['\\', '/', '\''])
+        && !id.contains("..")
+        && !id.chars().any(|c| c.is_control())
+}
+
+/// Remove a Kokoro voicepack from the HF cache: the snapshot entry and, when
+/// nothing else in any snapshot points at it, the blob behind it.
+fn remove_kokoro_voicepack(cfg: &AppConfig, voice_id: &str) {
+    if !valid_voice_id(voice_id) {
+        return;
+    }
+    let repo = hf_home(cfg).join("hub").join("models--hexgrad--Kokoro-82M");
+    let blobs = std::fs::canonicalize(repo.join("blobs")).ok();
+    let voice_dirs: Vec<PathBuf> = std::fs::read_dir(repo.join("snapshots"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path().join("voices"))
+        .collect();
+
+    let mut blob_paths = Vec::new();
+    for dir in &voice_dirs {
+        let f = dir.join(format!("{}.pt", voice_id));
+        if let Ok(b) = std::fs::canonicalize(&f) {
+            blob_paths.push(b);
+        }
+        let _ = std::fs::remove_file(&f);
+    }
+    for b in blob_paths {
+        let in_blobs = b.parent().map(|p| Some(p) == blobs.as_deref()).unwrap_or(false);
+        let still_used = voice_dirs.iter().any(|d| {
+            std::fs::read_dir(d)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|e| std::fs::canonicalize(e.path()).ok().as_ref() == Some(&b))
+        });
+        if in_blobs && !still_used {
+            let _ = std::fs::remove_file(&b);
+        }
+    }
+}
+
+/// Delete a voice: unregister it from SAPI (both registry views, UAC if needed),
+/// forget its favorite star, and for built-in voices keep the id in
+/// `removed_voices` so it stays hidden (Kokoro also loses its voicepack file).
+/// Qwen3 clones are deleted on the server by the frontend (`qwen3_delete_clone`)
+/// after this succeeds.
+#[tauri::command]
+fn delete_voice(
+    config: tauri::State<'_, Mutex<AppConfig>>,
+    voice_id: String,
+) -> Result<(), String> {
+    use winreg::enums::*;
+    use winreg::RegKey;
+
+    let is_qwen3 = voice_id.starts_with("qwen3_");
+    let is_clone = voice_id.starts_with("qwen3_custom_");
+    if !valid_voice_id(&voice_id) {
+        return Err("Invalid voice id".to_string());
+    }
+    // Kokoro ids also become the voicepack file name
+    if !is_qwen3 && !voice_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err("Invalid voice id".to_string());
+    }
+
+    // Only prompt for elevation when there is a token to remove
+    let registered = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(
+            format!(r"SOFTWARE\Microsoft\Speech\Voices\Tokens\VoiceLink_{}", voice_id),
+            KEY_READ,
+        )
+        .is_ok();
+    if registered {
+        toggle_voice(voice_id.clone(), false)?;
+    }
+
+    let mut cfg = config.lock().map_err(|e| e.to_string())?;
+    cfg.favorite_voices.retain(|v| v != &voice_id);
+    // Cloned/designed voices are gone for good; built-in voices stay restorable
+    if !is_clone {
+        if !is_qwen3 {
+            remove_kokoro_voicepack(&cfg, &voice_id);
+        }
+        if !cfg.removed_voices.contains(&voice_id) {
+            cfg.removed_voices.push(voice_id);
+        }
+    }
+    cfg.save()
+}
+
+/// Favorites and removed voices, for the dashboard chips and Settings → Restore
+#[tauri::command]
+fn get_voice_prefs(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<serde_json::Value, String> {
+    let cfg = config.lock().map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "favorites": cfg.favorite_voices,
+        "removed": cfg.removed_voices,
+    }))
+}
+
+#[tauri::command]
+fn set_favorite_voice(
+    config: tauri::State<'_, Mutex<AppConfig>>,
+    voice_id: String,
+    favorite: bool,
+) -> Result<(), String> {
+    let mut cfg = config.lock().map_err(|e| e.to_string())?;
+    cfg.favorite_voices.retain(|v| v != &voice_id);
+    if favorite {
+        cfg.favorite_voices.push(voice_id);
+    }
+    cfg.save()
+}
+
+/// Un-hide voices whose files were just re-downloaded
+#[tauri::command]
+fn unremove_voices(
+    config: tauri::State<'_, Mutex<AppConfig>>,
+    voice_ids: Vec<String>,
+) -> Result<(), String> {
+    let mut cfg = config.lock().map_err(|e| e.to_string())?;
+    cfg.removed_voices.retain(|v| !voice_ids.contains(v));
+    cfg.save()
+}
+
+const SAPI_VOICES_KEY: &str = r"SOFTWARE\Microsoft\Speech\Voices";
+const SAPI_TOKEN_PREFIX: &str = r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Speech\Voices\Tokens\";
+
+/// The current user's default SAPI voice: `HKCU\...\Speech\Voices\DefaultTokenId`
+/// holds the full token path, e.g. `HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Speech\Voices\Tokens\VoiceLink_af_heart`.
+/// Returns the VoiceLink voice id (null for other voices) and the token's display name.
+#[tauri::command]
+fn get_default_voice() -> Result<serde_json::Value, String> {
+    use winreg::enums::*;
+    use winreg::RegKey;
+
+    let token: String = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(SAPI_VOICES_KEY, KEY_READ)
+        .and_then(|k| k.get_value("DefaultTokenId"))
+        .unwrap_or_default();
+    let leaf = token.rsplit('\\').next().unwrap_or("");
+    let name: String = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(format!(r"{}\Tokens\{}", SAPI_VOICES_KEY, leaf), KEY_READ)
+        .and_then(|k| k.get_value(""))
+        .unwrap_or_default();
+    Ok(serde_json::json!({ "id": leaf.strip_prefix("VoiceLink_"), "name": name }))
+}
+
+/// Make a registered VoiceLink voice the Windows default SAPI voice (current user only, no elevation)
+#[tauri::command]
+fn set_default_voice(voice_id: String) -> Result<(), String> {
+    use winreg::enums::*;
+    use winreg::RegKey;
+
+    if !valid_voice_id(&voice_id) {
+        return Err("Invalid voice id".to_string());
+    }
+    let token = format!("VoiceLink_{}", voice_id);
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(format!(r"{}\Tokens\{}", SAPI_VOICES_KEY, token), KEY_READ)
+        .map_err(|_| "Turn this voice on in Voice Manager first.".to_string())?;
+    let (key, _) = RegKey::predef(HKEY_CURRENT_USER)
+        .create_subkey(SAPI_VOICES_KEY)
+        .map_err(|e| e.to_string())?;
+    key.set_value("DefaultTokenId", &format!("{}{}", SAPI_TOKEN_PREFIX, token))
+        .map_err(|e| e.to_string())
 }
 
 // ============================================================================
@@ -2129,6 +2317,12 @@ pub fn run() {
             get_registered_voice_ids,
             rename_voice,
             toggle_voice,
+            delete_voice,
+            get_voice_prefs,
+            set_favorite_voice,
+            unremove_voices,
+            get_default_voice,
+            set_default_voice,
             preview_voice,
             qwen3_list_speakers,
             qwen3_clone_voice,
