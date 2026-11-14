@@ -17,10 +17,13 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::os::windows::process::CommandExt;
 use tauri::{
-    menu::{MenuBuilder, MenuItemBuilder},
-    tray::TrayIconEvent,
-    AppHandle, Emitter, Manager,
+    menu::{Menu, MenuBuilder, MenuItem, MenuItemBuilder},
+    tray::{MouseButton, MouseButtonState, TrayIconEvent},
+    window::{ProgressBarState, ProgressBarStatus},
+    AppHandle, Emitter, Manager, Wry,
 };
+use tauri_plugin_notification::NotificationExt;
+use tauri_plugin_opener::OpenerExt;
 
 // ============================================================================
 // Data Types
@@ -1804,6 +1807,7 @@ async fn start_server(app: AppHandle) -> Result<(), String> {
         let mut m = managed.lock().map_err(|e| e.to_string())?;
         m.0 = true;
     }
+    set_server_state(&app, ServerState::Loading);
 
     // Wait a moment for server to start
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -1840,6 +1844,7 @@ async fn stop_server(app: AppHandle) -> Result<(), String> {
         let _ = child.wait();
         proc.0 = None;
     }
+    set_server_state(&app, ServerState::Offline);
 
     Ok(())
 }
@@ -1992,11 +1997,60 @@ const MAX_CONSECUTIVE_RESTARTS: u32 = 5;
 /// health check counts as a crash (first run downloads and loads Kokoro).
 const SERVER_LOAD_GRACE_SECS: u64 = 120;
 
+/// How long the server process we spawned has been alive, if it is still within the
+/// load grace period: it is loading its model, not crashed.
+fn server_loading_secs(app: &AppHandle) -> Option<u64> {
+    let secs = app.state::<Mutex<ServerProcess>>().lock().ok().and_then(|mut p| {
+        let alive = matches!(p.0.as_mut().map(|c| c.try_wait()), Some(Ok(None)));
+        p.1.filter(|_| alive).map(|t| t.elapsed().as_secs())
+    });
+    secs.filter(|s| *s < SERVER_LOAD_GRACE_SECS)
+}
+
+/// Ask /v1/health, show the answer in the tray, and return whether the server answered
+async fn probe_server(app: &AppHandle) -> bool {
+    let resp = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(client) => client
+            .get("http://127.0.0.1:7860/v1/health")
+            .send()
+            .await
+            .ok()
+            .filter(|r| r.status().is_success()),
+        Err(_) => None,
+    };
+    let alive = resp.is_some();
+    let health = match resp {
+        Some(r) => r.json::<ServerHealth>().await.ok(),
+        None => None,
+    };
+    set_server_state(app, match health {
+        Some(h) if h.status != "ok" => ServerState::Loading,
+        Some(h) if h.gpu_available => {
+            let gpu = h.gpu_name.unwrap_or_default();
+            ServerState::Ready(format!("GPU ({})", gpu.trim_start_matches("NVIDIA ").trim_start_matches("GeForce ")))
+        }
+        Some(_) => ServerState::Ready("CPU".into()),
+        None if alive => ServerState::Ready("CPU".into()),
+        None if server_loading_secs(app).is_some() => ServerState::Loading,
+        None => ServerState::Offline,
+    });
+    alive
+}
+
 async fn server_watchdog(app: AppHandle) {
     let mut consecutive_restarts: u32 = 0;
+    // First look soon after launch so the tray is right, then every interval
+    let mut wait = 3;
 
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(WATCHDOG_INTERVAL_SECS)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+        wait = WATCHDOG_INTERVAL_SECS;
+
+        // Always probe (the tray shows it), even when we don't manage the server
+        let server_alive = probe_server(&app).await;
 
         // Check if we're supposed to be managing the server
         let is_managed = {
@@ -2009,19 +2063,6 @@ async fn server_watchdog(app: AppHandle) {
             continue;
         }
 
-        // Health check
-        let server_alive = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-        {
-            Ok(client) => client
-                .get("http://127.0.0.1:7860/v1/health")
-                .send()
-                .await
-                .map_or(false, |r| r.status().is_success()),
-            Err(_) => false,
-        };
-
         if server_alive {
             // Server is healthy, reset restart counter
             if consecutive_restarts > 0 {
@@ -2033,11 +2074,7 @@ async fn server_watchdog(app: AppHandle) {
 
         // A child that is still alive and recently spawned is loading the model,
         // not crashed: don't count it and don't spawn a second one.
-        let loading_secs = app.state::<Mutex<ServerProcess>>().lock().ok().and_then(|mut p| {
-            let alive = matches!(p.0.as_mut().map(|c| c.try_wait()), Some(Ok(None)));
-            p.1.filter(|_| alive).map(|t| t.elapsed().as_secs())
-        });
-        if let Some(secs) = loading_secs.filter(|s| *s < SERVER_LOAD_GRACE_SECS) {
+        if let Some(secs) = server_loading_secs(&app) {
             eprintln!("[watchdog] Server still loading ({}s)...", secs);
             continue;
         }
@@ -2109,6 +2146,171 @@ async fn server_watchdog(app: AppHandle) {
 }
 
 // ============================================================================
+// Tray — status line, tooltip, menu and taskbar progress
+// ============================================================================
+//
+// During setup the frontend reports progress through set_setup_tray; afterwards
+// the watchdog's health probe (and start/stop) report the server state. Both
+// end up in refresh_tray, which is the only place that touches the tray UI.
+
+/// Setup step ids used by the frontend, and their names for the tray
+const SETUP_STEP_IDS: [&str; 5] = ["python", "deps", "server", "model", "start"];
+const SETUP_STEP_NAMES: [&str; 5] = [
+    "Python runtime", "Python packages", "Server files", "Voice models", "Starting server",
+];
+
+#[derive(Clone, PartialEq)]
+enum SetupState { Done, Running, Paused, Failed }
+
+#[derive(Clone, PartialEq)]
+enum ServerState { Offline, Loading, Ready(String) }
+
+#[derive(Clone)]
+struct TrayState {
+    setup: SetupState,
+    step: usize, // index into SETUP_STEP_IDS
+    percent: u32, // progress of the current step
+    server: ServerState,
+    setup_menu_shown: bool,
+}
+
+/// The two tray menus (during setup / after setup) and the items that change
+struct TrayUi {
+    state: Mutex<TrayState>,
+    setup_menu: Menu<Wry>,
+    ready_menu: Menu<Wry>,
+    setup_status: MenuItem<Wry>,
+    ready_status: MenuItem<Wry>,
+    toggle: MenuItem<Wry>,
+    start: MenuItem<Wry>,
+    stop: MenuItem<Wry>,
+    restart: MenuItem<Wry>,
+}
+
+/// Push the current TrayState to the tooltip, menu and taskbar
+fn refresh_tray(app: &AppHandle) {
+    let Some(ui) = app.try_state::<TrayUi>() else { return };
+    // Copy the state out: tray calls wait on the main thread, which may want this lock
+    let (setup_menu_changed, st) = {
+        let mut st = ui.state.lock().unwrap();
+        let in_setup = st.setup != SetupState::Done;
+        let changed = in_setup != st.setup_menu_shown;
+        st.setup_menu_shown = in_setup;
+        (changed, st.clone())
+    };
+    let in_setup = st.setup != SetupState::Done;
+    let (n, name) = (st.step + 1, SETUP_STEP_NAMES[st.step]);
+    let status = match (&st.setup, &st.server) {
+        (SetupState::Running, _) => format!("VoiceLink setup — step {n} of 5: {name} ({}%)", st.percent),
+        (SetupState::Paused, _) => format!("VoiceLink setup paused — step {n} of 5: {name}"),
+        (SetupState::Failed, _) => format!("VoiceLink setup failed — step {n} of 5: {name}"),
+        (SetupState::Done, ServerState::Offline) => "Server offline".into(),
+        (SetupState::Done, ServerState::Loading) => "Server loading…".into(),
+        (SetupState::Done, ServerState::Ready(dev)) => format!("Ready · {dev}"),
+    };
+
+    let _ = ui.setup_status.set_text(&status);
+    let _ = ui.ready_status.set_text(&status);
+    let _ = ui.toggle.set_text(match st.setup {
+        SetupState::Running => "Pause setup",
+        SetupState::Paused => "Resume setup",
+        _ => "Retry setup",
+    });
+    // The last step (starting the server) can't be paused
+    let _ = ui.toggle.set_enabled(!(st.setup == SetupState::Running && st.step == 4));
+    let offline = st.server == ServerState::Offline;
+    let _ = ui.start.set_enabled(offline);
+    let _ = ui.stop.set_enabled(!offline);
+    let _ = ui.restart.set_enabled(!offline);
+
+    if let Some(tray) = app.tray_by_id("voicelink-tray") {
+        let _ = tray.set_tooltip(Some(if in_setup { status } else { format!("VoiceLink — {status}") }));
+        if setup_menu_changed {
+            let _ = tray.set_menu(Some(if in_setup { ui.setup_menu.clone() } else { ui.ready_menu.clone() }));
+        }
+    }
+
+    // Taskbar progress while setup runs, cleared otherwise
+    if let Some(win) = app.get_webview_window("main") {
+        let running = st.setup == SetupState::Running;
+        let _ = win.set_progress_bar(ProgressBarState {
+            status: Some(if running { ProgressBarStatus::Normal } else { ProgressBarStatus::None }),
+            progress: running.then(|| ((st.step as u32 * 100 + st.percent) / 5) as u64),
+        });
+    }
+}
+
+fn set_server_state(app: &AppHandle, server: ServerState) {
+    if let Some(ui) = app.try_state::<TrayUi>() {
+        let mut st = ui.state.lock().unwrap();
+        if st.server == server {
+            return;
+        }
+        st.server = server;
+    }
+    refresh_tray(app);
+}
+
+/// Called by the frontend while setup runs. phase: "step" (a step started),
+/// "progress" (percent of the running step), "paused", "failed" or "done".
+#[tauri::command]
+fn set_setup_tray(app: AppHandle, phase: String, step: Option<String>, percent: Option<u32>, message: Option<String>) {
+    let Some(ui) = app.try_state::<TrayUi>() else { return };
+    let idx = step.and_then(|s| SETUP_STEP_IDS.iter().position(|id| *id == s));
+    {
+        let mut st = ui.state.lock().unwrap();
+        let before = (st.setup.clone(), st.step, st.percent);
+        match (phase.as_str(), idx) {
+            ("step", Some(i)) => {
+                (st.setup, st.step, st.percent) = (SetupState::Running, i, percent.unwrap_or(0));
+            }
+            // Only the running step; never backwards (pip lines report a flat 50%)
+            ("progress", Some(i)) if st.setup == SetupState::Running && st.step == i => {
+                st.percent = st.percent.max(percent.unwrap_or(0).min(100));
+            }
+            ("paused", _) => st.setup = SetupState::Paused,
+            ("failed", _) => st.setup = SetupState::Failed,
+            ("done", _) => st.setup = SetupState::Done,
+            _ => return,
+        }
+        if before == (st.setup.clone(), st.step, st.percent) {
+            return;
+        }
+    }
+    refresh_tray(&app);
+
+    let note = match phase.as_str() {
+        "done" => Some(("VoiceLink setup finished", "VoiceLink is set up and running in the tray.".to_string())),
+        "failed" => {
+            // The error is a whole pip/python transcript: show its last line
+            let msg = message.unwrap_or_default();
+            let last = msg.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("Open VoiceLink to retry.");
+            Some(("VoiceLink setup failed", last.chars().take(150).collect()))
+        }
+        _ => None,
+    };
+    if let Some((title, body)) = note {
+        let _ = app.notification().builder().title(title).body(body).show();
+    }
+    if phase == "done" {
+        // Don't leave "Server loading…" up until the next watchdog tick
+        tauri::async_runtime::spawn(async move { probe_server(&app).await });
+    }
+}
+
+/// Show the main window; during unfinished setup also switch it to the Setup page
+fn show_main_window(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+    let setup_active = app.try_state::<TrayUi>().map_or(false, |ui| ui.state.lock().unwrap().setup != SetupState::Done);
+    if setup_active {
+        let _ = app.emit("tray-action", "open-setup");
+    }
+}
+
+// ============================================================================
 // App Setup — Tray icon, window management
 // ============================================================================
 
@@ -2116,6 +2318,7 @@ async fn server_watchdog(app: AppHandle) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(Mutex::new(ServerProcess(None, None)))
         .manage(Mutex::new(ServerManagedByUs(false)))
         .manage(Mutex::new(AppConfig::load()))
@@ -2151,6 +2354,7 @@ pub fn run() {
             setup_run_command,
             setup_install_server,
             setup_mark_deps_installed,
+            set_setup_tray,
             start_server,
             get_server_log_tail,
             stop_server,
@@ -2172,24 +2376,68 @@ pub fn run() {
                 }
             }
 
-            // Build tray menu
-            let show = MenuItemBuilder::new("Open VoiceLink").id("show").build(app)?;
-            let quit = MenuItemBuilder::new("Quit").id("quit").build(app)?;
-            let menu = MenuBuilder::new(app)
-                .item(&show)
-                .separator()
+            // Tray menus: one while setup is unfinished, one for normal use.
+            // refresh_tray fills in the status lines and enables/disables items.
+            let item = |id: &str, text: &str| MenuItemBuilder::new(text).id(id).build(app);
+            let setup_status = MenuItemBuilder::new("VoiceLink").id("status").enabled(false).build(app)?;
+            let ready_status = MenuItemBuilder::new("VoiceLink").id("status").enabled(false).build(app)?;
+            let toggle = item("setup_toggle", "Pause setup")?;
+            let start = item("start", "Start server")?;
+            let stop = item("stop", "Stop server")?;
+            let restart = item("restart", "Restart server")?;
+            let (show, logs, quit) = (item("show", "Open VoiceLink")?, item("logs", "Open logs folder")?, item("quit", "Quit")?);
+            let setup_menu = MenuBuilder::new(app)
+                .item(&setup_status).separator()
+                .item(&show).item(&toggle).item(&logs).separator()
                 .item(&quit)
                 .build()?;
+            let ready_menu = MenuBuilder::new(app)
+                .item(&ready_status).separator()
+                .item(&show).item(&start).item(&stop).item(&restart).item(&logs).separator()
+                .item(&quit)
+                .build()?;
+            app.manage(TrayUi {
+                state: Mutex::new(TrayState {
+                    setup: SetupState::Done,
+                    step: 0,
+                    percent: 0,
+                    server: ServerState::Offline,
+                    setup_menu_shown: false,
+                }),
+                setup_menu: setup_menu.clone(),
+                ready_menu: ready_menu.clone(),
+                setup_status, ready_status, toggle, start, stop, restart,
+            });
 
             // Attach menu to existing tray icon (defined in tauri.conf.json)
             if let Some(tray) = app.tray_by_id("voicelink-tray") {
-                tray.set_menu(Some(menu))?;
+                tray.set_menu(Some(ready_menu))?;
+                // Left click opens the window (the menu is on right click)
+                tray.set_show_menu_on_left_click(false)?;
                 tray.on_menu_event(move |app, event| match event.id().as_ref() {
-                    "show" => {
-                        if let Some(win) = app.get_webview_window("main") {
-                            let _ = win.show();
-                            let _ = win.set_focus();
-                        }
+                    "show" => show_main_window(app),
+                    "setup_toggle" => {
+                        // The frontend owns the setup run: it presses its own Pause / Resume button
+                        let running = app.state::<TrayUi>().state.lock().unwrap().setup == SetupState::Running;
+                        let _ = app.emit("tray-action", if running { "pause" } else { "resume" });
+                    }
+                    id @ ("start" | "stop" | "restart") => {
+                        let (app, id) = (app.clone(), id.to_string());
+                        tauri::async_runtime::spawn(async move {
+                            if id != "start" {
+                                let _ = stop_server(app.clone()).await;
+                            }
+                            if id != "stop" {
+                                if let Err(e) = start_server(app.clone()).await {
+                                    eprintln!("[tray] Failed to start server: {}", e);
+                                }
+                            }
+                        });
+                    }
+                    "logs" => {
+                        let dir = app.state::<Mutex<AppConfig>>().lock().unwrap().data_dir().join("logs");
+                        let _ = std::fs::create_dir_all(&dir);
+                        let _ = app.opener().open_path(dir.to_string_lossy(), None::<&str>);
                     }
                     "quit" => {
                         app.exit(0);
@@ -2197,14 +2445,12 @@ pub fn run() {
                     _ => {}
                 });
                 tray.on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::DoubleClick { .. } = event {
-                        if let Some(win) = tray.app_handle().get_webview_window("main") {
-                            let _ = win.show();
-                            let _ = win.set_focus();
-                        }
+                    if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = event {
+                        show_main_window(tray.app_handle());
                     }
                 });
             }
+            refresh_tray(app.handle());
 
             // If launched with --minimized (auto-start on login), keep window
             // hidden and just live in the system tray. Otherwise show normally.
