@@ -1813,7 +1813,15 @@ function extractDownloadError(error: string): string {
 // Voice Studio — Clone, Design, and Built-in Qwen3 voice management
 // ============================================================================
 
+// Tabs and forms must be wired once; this runs on every visit to the page
+let studioWired = false;
+
 function setupVoiceStudioTabs() {
+  // Built-in voices list refreshes on every visit
+  loadQwen3Voices();
+  if (studioWired) return;
+  studioWired = true;
+
   // Tab switching
   const tabs = document.querySelectorAll<HTMLElement>(".studio-tab");
   tabs.forEach((tab) => {
@@ -1835,9 +1843,6 @@ function setupVoiceStudioTabs() {
 
   // Design form validation — enable Generate button when fields filled
   setupDesignForm();
-
-  // Load built-in Qwen3 voices list
-  loadQwen3Voices();
 }
 
 // ---- Clone Voice Form ----
