@@ -24,6 +24,10 @@ from dataclasses import dataclass, field
 from typing import Generator
 
 
+class VoiceUnavailableError(RuntimeError):
+    """The requested voice's files are not on this machine."""
+
+
 @dataclass
 class VoiceInfo:
     """
@@ -106,6 +110,10 @@ class TTSModel(ABC):
             - Cancellable: caller can stop iterating = stop generating
         """
         ...
+
+    def single_chunk(self, text: str) -> bool:
+        """True if synthesize(text) yields exactly one chunk (so its length is known up front)."""
+        return False
 
     @abstractmethod
     def list_voices(self) -> list[VoiceInfo]:

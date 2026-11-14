@@ -25,12 +25,15 @@
 
 import time
 import asyncio
+import itertools
 from typing import Generator
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from loguru import logger
+
+from server.models.base import VoiceUnavailableError
 
 
 # ---- Request / Response Models ----
@@ -153,51 +156,68 @@ async def synthesize(request: TTSRequest):
 
     t0 = time.perf_counter()
 
-    def _run_synthesis() -> list[bytes]:
-        """Run blocking synthesis in a thread so the event loop stays responsive."""
-        result: list[bytes] = []
-        for chunk in _model.synthesize(
-            text=request.text,
-            voice=request.voice,
-            speed=request.speed,
-        ):
-            result.append(chunk)
-        return result
+    chunk_iter = _model.synthesize(
+        text=request.text,
+        voice=request.voice,
+        speed=request.speed,
+    )
+    # A text that is one chunk is generated up front so the exact length can go
+    # in X-Audio-Length. Longer texts stream each chunk as soon as it is ready
+    # (the DLL then estimates the length from the text for word highlighting).
+    exact_length = _model.single_chunk(request.text)
 
     try:
-        chunks = await asyncio.to_thread(_run_synthesis)
+        # Blocking synthesis runs in a thread so the event loop stays responsive.
+        # For streamed texts only the first chunk is awaited here, so a missing
+        # voice or a model error still becomes a proper HTTP error.
+        if exact_length:
+            chunks = await asyncio.to_thread(list, chunk_iter)
+        else:
+            first = await asyncio.to_thread(next, chunk_iter, None)
+            chunks = itertools.chain([] if first is None else [first], chunk_iter)
+    except VoiceUnavailableError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         logger.exception(f"Synthesis error: {e}")
         raise HTTPException(status_code=500, detail=f"Synthesis failed: {e}")
 
-    total_bytes = sum(len(c) for c in chunks)
-    elapsed = time.perf_counter() - t0
-    audio_seconds = total_bytes / (24000 * 2)  # 24kHz * 2 bytes/sample
-    logger.info(
-        f"TTS complete: {audio_seconds:.1f}s audio in {elapsed:.2f}s "
-        f"({audio_seconds / elapsed:.1f}x realtime), "
-        f"{total_bytes:,} bytes"
-    )
+    headers = {
+        # Tell the COM DLL the audio format
+        "X-Audio-Sample-Rate": "24000",
+        "X-Audio-Sample-Width": "16",
+        "X-Audio-Channels": "1",
+    }
 
     def stream_chunks() -> Generator[bytes, None, None]:
-        """Yield pre-generated PCM chunks."""
-        for chunk in chunks:
-            yield chunk
+        """Yield PCM chunks; starlette runs this generator in a threadpool."""
+        total_bytes = 0
+        finished = False
+        try:
+            for chunk in chunks:
+                total_bytes += len(chunk)
+                yield chunk
+            finished = True
+        except Exception as e:
+            # Headers are already sent, so all we can do is end the stream.
+            logger.exception(f"Synthesis failed mid-stream, ending the stream: {e}")
+        finally:
+            elapsed = time.perf_counter() - t0
+            audio_seconds = total_bytes / (24000 * 2)  # 24kHz * 2 bytes/sample
+            state = "complete" if finished else "stopped early (client left or error)"
+            logger.info(
+                f"TTS {state}: {audio_seconds:.1f}s audio in {elapsed:.2f}s, "
+                f"{total_bytes:,} bytes"
+            )
 
-    # Return streaming response with audio length header for precise
-    # word-boundary event timing in the COM DLL.
+    if exact_length:
+        # Exact total audio byte count — used by the DLL for
+        # proportional SPEI_WORD_BOUNDARY event offsets.
+        headers["X-Audio-Length"] = str(sum(len(c) for c in chunks))
+
     return StreamingResponse(
         content=stream_chunks(),
         media_type="audio/pcm",
-        headers={
-            # Tell the COM DLL the audio format
-            "X-Audio-Sample-Rate": "24000",
-            "X-Audio-Sample-Width": "16",
-            "X-Audio-Channels": "1",
-            # Exact total audio byte count — used by the DLL for
-            # proportional SPEI_WORD_BOUNDARY event offsets.
-            "X-Audio-Length": str(total_bytes),
-        },
+        headers=headers,
     )
 
 
