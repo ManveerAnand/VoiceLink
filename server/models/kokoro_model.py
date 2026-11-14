@@ -25,11 +25,14 @@
 #   Examples: af_heart, am_adam, bf_emma, jf_alpha
 # ============================================================================
 
+import re
+import threading
+
 import numpy as np
 from typing import Generator
 from loguru import logger
 
-from server.models.base import TTSModel, VoiceInfo
+from server.models.base import TTSModel, VoiceInfo, VoiceUnavailableError
 
 
 # --- Kokoro Voice Catalog ---
@@ -145,6 +148,25 @@ KOKORO_VOICES: list[VoiceInfo] = [
 ]
 
 
+# Kokoro only splits text on newlines (then at ~510 tokens), so a few sentences
+# become ONE chunk and nothing is heard until all of it is generated. We put the
+# first sentence in its own chunk so audio starts early; the rest keeps Kokoro's
+# default chunking (splitting every sentence is ~24 % slower in total on CPU).
+_SENTENCE_END = re.compile(r"[.!?]+[\"')\]]*\s+(?=\S)")
+_MIN_FIRST_CHARS = 15  # shortcut: "Dr. " / "e.g. " would otherwise be spoken alone
+_MAX_SINGLE_CHUNK_CHARS = 400  # well under Kokoro's 510-token limit
+
+
+def _split_first_sentence(text: str) -> str:
+    """Insert a newline after the first sentence (unless the text already has one there)."""
+    text = text.strip()
+    newline = text.find("\n")
+    for m in _SENTENCE_END.finditer(text, 0, len(text) if newline < 0 else newline):
+        if m.end() >= _MIN_FIRST_CHARS:
+            return text[: m.end()].rstrip() + "\n" + text[m.end():]
+    return text
+
+
 class KokoroModel(TTSModel):
     """
     Kokoro TTS backend.
@@ -162,6 +184,10 @@ class KokoroModel(TTSModel):
         self._device = device
         self._pipeline = None
         self._loaded = False
+        # Kokoro isn't documented as thread-safe and streaming requests overlap.
+        # Held per generated chunk (not per request) so concurrent requests
+        # interleave instead of one waiting for another's whole text.
+        self._lock = threading.Lock()
 
     def load(self) -> None:
         """Load the Kokoro pipeline (downloads model on first run)."""
@@ -211,14 +237,29 @@ class KokoroModel(TTSModel):
 
         logger.debug(f"Synthesizing: voice={voice}, speed={speed}, text={text[:80]}...")
 
+        # Load the voice file now so a missing one fails with a clear error.
+        # (The app runs the server with HF_HUB_OFFLINE=1, so it never downloads.)
+        try:
+            with self._lock:
+                self._pipeline.load_voice(voice)
+        except Exception as e:
+            logger.error(f"Voice '{voice}' could not be loaded: {e}")
+            raise VoiceUnavailableError(
+                f"Voice '{voice}' files are missing. Use Settings -> Restore to download them."
+            ) from e
+
         # --- Run Kokoro pipeline ---
         # pipeline() returns a generator of (graphemes, phonemes, audio) tuples.
         # Each tuple corresponds to roughly one sentence/clause.
         # audio is a numpy float32 array in range [-1.0, 1.0] at 24kHz.
         chunk_index = 0
-        for graphemes, phonemes, audio_raw in self._pipeline(
-            text, voice=voice, speed=speed
-        ):
+        results = self._pipeline(_split_first_sentence(text), voice=voice, speed=speed)
+        while True:
+            with self._lock:  # one chunk of inference at a time
+                result = next(results, None)
+            if result is None:
+                break
+            graphemes, phonemes, audio_raw = result
             if audio_raw is None:
                 continue
 
@@ -262,6 +303,10 @@ class KokoroModel(TTSModel):
             yield pcm_bytes
 
         logger.debug(f"Synthesis complete: {chunk_index} chunks yielded.")
+
+    def single_chunk(self, text: str) -> bool:
+        split = _split_first_sentence(text)
+        return "\n" not in split and len(split) <= _MAX_SINGLE_CHUNK_CHARS
 
     def list_voices(self) -> list[VoiceInfo]:
         """Return all known Kokoro voices."""

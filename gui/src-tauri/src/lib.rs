@@ -1967,6 +1967,10 @@ import runpy; runpy.run_module('server.main', run_name='__main__', alter_sys=Tru
         .env("PYTHONPATH", cfg.data_dir())
         .env("PYTHONUNBUFFERED", "1") // so the log is current when the server dies
         .env("NO_COLOR", "1") // the server then logs plain text instead of ANSI colors
+        // Setup already downloaded every model file. Without this, HuggingFace
+        // asks the network before each cached file load (voice 7 s, startup +6 s).
+        // Not in data_env: setup, restore and the Qwen3 download must stay online.
+        .env("HF_HUB_OFFLINE", "1")
         .envs(data_env(cfg))
         .stdout(std::process::Stdio::from(log))
         .stderr(std::process::Stdio::from(log_err))

@@ -148,6 +148,17 @@ async def lifespan(app: FastAPI):
         set_model(model)
         elapsed = time.perf_counter() - t0
         logger.info(f"Model loaded in {elapsed:.1f}s")
+
+        # The first synthesis pays GPU/kernel warm-up (~4 s). Do it now, before
+        # the server accepts requests, so no user request waits for it.
+        t0 = time.perf_counter()
+        try:
+            await asyncio.to_thread(
+                lambda: list(model.synthesize("Warming up the voice engine.", voice=settings.model.kokoro_default_voice))
+            )
+            logger.info(f"Warm-up synthesis took {time.perf_counter() - t0:.1f}s")
+        except Exception as e:
+            logger.warning(f"Warm-up synthesis failed (first request will be slow): {e}")
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
         logger.error("Server will start but TTS will return 503 errors.")
