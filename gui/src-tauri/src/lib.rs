@@ -798,11 +798,12 @@ fn toggle_voice(voice_id: String, enabled: bool) -> Result<(), String> {
 // ============================================================================
 
 /// Voice ids end up in registry paths and file names, so reject anything that
-/// could climb out of them. Clone ids include a user-chosen name, so spaces etc. stay allowed.
+/// could climb out of them (or, with `'`, break out of the quoted strings in the
+/// elevated PowerShell script). Clone ids include a user-chosen name, so spaces etc. stay allowed.
 fn valid_voice_id(id: &str) -> bool {
     !id.is_empty()
         && id.chars().count() <= 150
-        && !id.contains(['\\', '/'])
+        && !id.contains(['\\', '/', '\''])
         && !id.contains("..")
         && !id.chars().any(|c| c.is_control())
 }
