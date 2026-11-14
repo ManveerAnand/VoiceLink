@@ -782,6 +782,16 @@ body {
 }
 
 /* Setup action bar */
+.setup-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
 .setup-actions {
   display: flex;
   align-items: center;
