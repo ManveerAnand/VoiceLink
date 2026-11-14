@@ -2762,15 +2762,16 @@ pub fn run() {
             let stop = item("stop", "Stop server")?;
             let restart = item("restart", "Restart server")?;
             let (show, logs, quit) = (item("show", "Open VoiceLink")?, item("logs", "Open logs folder")?, item("quit", "Quit")?);
+            let restart_app = item("restart_app", "Restart VoiceLink")?;
             let setup_menu = MenuBuilder::new(app)
                 .item(&setup_status).separator()
                 .item(&show).item(&toggle).item(&logs).separator()
-                .item(&quit)
+                .item(&restart_app).item(&quit)
                 .build()?;
             let ready_menu = MenuBuilder::new(app)
                 .item(&ready_status).separator()
                 .item(&show).item(&start).item(&stop).item(&restart).item(&logs).separator()
-                .item(&quit)
+                .item(&restart_app).item(&quit)
                 .build()?;
             app.manage(TrayUi {
                 state: Mutex::new(TrayState {
@@ -2816,6 +2817,12 @@ pub fn run() {
                         let _ = app.opener().open_path(dir.to_string_lossy(), None::<&str>);
                     }
                     "quit" => app.exit(0), // shutdown_app runs from RunEvent::Exit
+                    "restart_app" => {
+                        // restart() on the main thread skips RunEvent::Exit, so clean up first;
+                        // the new instance starts the server again once setup is complete
+                        shutdown_app(app);
+                        app.restart();
+                    }
                     _ => {}
                 });
                 tray.on_tray_icon_event(|tray, event| {
