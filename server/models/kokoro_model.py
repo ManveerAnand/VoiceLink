@@ -173,7 +173,9 @@ class KokoroModel(TTSModel):
 
         from kokoro import KPipeline
 
-        self._pipeline = KPipeline(lang_code=self._lang_code)
+        # Kokoro auto-selects CUDA when device is None
+        device = None if self._device == "auto" else self._device
+        self._pipeline = KPipeline(lang_code=self._lang_code, device=device)
         self._loaded = True
 
         logger.info("Kokoro model loaded successfully.")

@@ -1039,6 +1039,21 @@ async function runSetup() {
         stepName: "deps",
       });
 
+      // pip's default torch on Windows is CPU-only; install the CUDA build first
+      // so kokoro reuses it. cu126 still supports older cards (GTX 10xx).
+      const gpu = await invoke<GpuInfo>("check_gpu").catch(() => null);
+      if (gpu?.available) {
+        setStepProgress("deps", 40, "Installing PyTorch for your GPU (large download)...");
+        await invoke("setup_run_command", {
+          program: paths.python_exe,
+          args: [
+            "-m", "pip", "install", "--no-warn-script-location",
+            "torch", "--index-url", "https://download.pytorch.org/whl/cu126",
+          ],
+          stepName: "deps",
+        });
+      }
+
       setStepProgress("deps", 60, "Installing Kokoro...");
 
       // Install kokoro separately (it's a bigger install)
