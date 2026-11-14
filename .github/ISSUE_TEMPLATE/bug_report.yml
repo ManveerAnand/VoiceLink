@@ -1,0 +1,51 @@
+name: Bug report
+description: Something isn't working
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open Balabolka
+        2. Pick a VoiceLink voice
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: app
+    attributes:
+      label: App you were using VoiceLink in
+      placeholder: Thorium Reader, Edge, Narrator, Balabolka...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: VoiceLink version
+      placeholder: e.g. 0.1.0 (shown in the app or installer name)
+    validations:
+      required: true
+  - type: dropdown
+    id: model
+    attributes:
+      label: Voice model
+      options: [Kokoro, Qwen3, Other / not sure]
+  - type: input
+    id: system
+    attributes:
+      label: Windows version and hardware
+      placeholder: Windows 11 24H2, RTX 3060 (or CPU only)
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: Paste server logs or attach screenshots if you have them.
+      render: text
