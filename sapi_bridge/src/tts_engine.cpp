@@ -41,6 +41,24 @@
 #include <cstdint>   // int16_t
 #include <cwctype>   // iswspace (word boundary parsing)
 
+// True when the host process is a Chromium browser (decided once, see rate mapping).
+static bool HostIsChromium()
+{
+    static const bool isChromium = []()
+    {
+        wchar_t path[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, path, MAX_PATH);
+        const wchar_t *name = wcsrchr(path, L'\\');
+        name = name ? name + 1 : path;
+        for (const wchar_t *n : {L"msedge.exe", L"chrome.exe", L"thorium.exe", L"brave.exe",
+                                 L"vivaldi.exe", L"opera.exe", L"chromium.exe"})
+            if (_wcsicmp(name, n) == 0)
+                return true;
+        return false;
+    }();
+    return isChromium;
+}
+
 // ============================================================================
 // Constructor / Destructor
 // ============================================================================
@@ -387,22 +405,15 @@ STDMETHODIMP VoiceLinkEngine::Speak(
     //   GetRate()   → LONG from -10 to +10 (0 = normal, base rate)
     //   GetVolume() → USHORT from 0 to 100 (100 = full volume)
     //
-    // RATE MAPPING (Thorium/Chromium compatible):
-    //   Chromium maps its Web Speech API rate (0.5x-3x) to SAPI rate using
-    //   approximately: sapi_rate = (int)((web_rate - 1) * 2)
-    //   So Thorium 3x → SAPI rate 4, Thorium 2x → rate 2, etc.
+    // RATE MAPPING (two scales, picked by host app):
+    //   SAPI standard (Balabolka, Narrator, NVDA, native SAPI voices):
+    //     rate +10 = 3x, -10 = 1/3x, logarithmic:  speed = 3^(rate/10)
+    //     Rate -10 → 0.33x, -2 → 0.80x, 0 → 1.00x, +2 → 1.25x, +5 → 1.73x, +10 → 3.00x
     //
-    //   To reverse this, we use a linear mapping:
-    //     speed = 1.0 + effectiveRate * 0.5
+    //   Chromium (Edge, Chrome, Thorium...) sends rate = 10 * log10(web_rate)
+    //   (content/browser/speech/tts_win.cc), so we invert it:  speed = 10^(rate/10)
+    //     Rate 0 → 1.00x, +2 → 1.58x, +3 → 2.00x (web "2x"), +5 → 3.16x, +6 → 3.98x
     //
-    //   This gives:
-    //     Rate -1 → 0.50x (Thorium 0.5x)
-    //     Rate  0 → 1.00x (normal)
-    //     Rate  1 → 1.50x (Thorium 1.5x)
-    //     Rate  2 → 2.00x (Thorium 2x)
-    //     Rate  3 → 2.50x (Thorium 2.5x)
-    //     Rate  4 → 3.00x (Thorium 3x)
-    //     Rate  6 → 4.00x (clamped to server max)
     //   Clamped to [0.25, 4.0] to match server limits.
     //
     //   The effective rate combines the base rate (GetRate) with the
@@ -423,16 +434,16 @@ STDMETHODIMP VoiceLinkEngine::Speak(
     // Combine base rate with fragment-level rate adjustment
     LONG effectiveRate = sapiRate + maxFragRateAdj;
 
-    // Linear mapping: speed = 1 + rate * 0.5
-    // Matches Chromium's inverse: when Thorium says 3x, rate=4, speed=3.0
-    float speed = 1.0f + static_cast<float>(effectiveRate) * 0.5f;
+    // Exponential mapping, base depends on the host (see RATE MAPPING above)
+    const bool chromium = HostIsChromium();
+    float speed = powf(chromium ? 10.0f : 3.0f, static_cast<float>(effectiveRate) / 10.0f);
     speed = (std::max)(0.25f, (std::min)(4.0f, speed)); // Clamp to server limits
 
     // Volume as a fraction for PCM scaling
     float volumeScale = static_cast<float>(sapiVolume) / 100.0f;
 
-    VLOG(L"SAPI baseRate=%ld, fragRateAdj=%ld, effective=%ld → speed=%.2f, volume=%u → scale=%.2f",
-         sapiRate, maxFragRateAdj, effectiveRate, speed, sapiVolume, volumeScale);
+    VLOG(L"SAPI baseRate=%ld, fragRateAdj=%ld, effective=%ld → speed=%.2f (%ls scale), volume=%u → scale=%.2f",
+         sapiRate, maxFragRateAdj, effectiveRate, speed, chromium ? L"Chromium" : L"SAPI", sapiVolume, volumeScale);
 
     // -----------------------------------------------------------------------
     // Step 2b: Parse word boundaries for SAPI text-tracking events
