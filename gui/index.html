@@ -853,6 +853,11 @@ Paragraph breaks (blank lines) will be preserved as natural pauses in the narrat
           </div>
         </div>
 
+        <label id="setup-gpu-option" class="setup-option hidden">
+          <input type="checkbox" id="setup-use-gpu" checked />
+          Use GPU acceleration &mdash; about 10&times; faster, +2.3 GB download
+        </label>
+
         <div class="setup-actions">
           <button id="btn-run-setup" class="btn btn-primary btn-lg">
             <svg
@@ -868,6 +873,9 @@ Paragraph breaks (blank lines) will be preserved as natural pauses in the narrat
               />
             </svg>
             Run Setup
+          </button>
+          <button id="btn-pause-setup" class="btn btn-secondary btn-lg hidden">
+            Pause
           </button>
           <span id="setup-overall-status" class="setup-status-msg"></span>
         </div>
