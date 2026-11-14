@@ -82,6 +82,7 @@
             <circle cx="18" cy="16" r="3" />
           </svg>
           <span>Voice Studio</span>
+          <span id="nav-voice-studio-badge" class="badge badge-accent hidden">NEW</span>
         </li>
         <li class="nav-item hidden" id="nav-narrate" data-page="narrate">
           <svg
@@ -350,13 +351,33 @@ Hello! VoiceLink is ready.</textarea
         </div>
       </section>
 
-      <!-- Voice Studio Page (hidden until Qwen3 enabled + installed) -->
+      <!-- Voice Studio Page (nav shown when an NVIDIA GPU is found; tools need Qwen3 installed) -->
       <section id="page-voice-studio" class="page">
         <h1>Voice Studio</h1>
         <p class="setup-subtitle">
           Create custom voices using Qwen3 TTS. Clone a voice from audio or
           design one from a text description.
         </p>
+
+        <!-- Shown instead of the tools until Qwen3 is installed -->
+        <div id="studio-intro" class="card hidden">
+          <div class="card-body">
+            <p>Clone any voice from a 10-second clip</p>
+            <p>Design new voices from a description</p>
+            <p id="studio-intro-needs" class="muted"></p>
+            <button id="btn-studio-install" class="btn btn-primary">
+              Install Qwen3
+            </button>
+            <div class="step-progress hidden" id="progress-qwen3-studio">
+              <div class="progress-bar">
+                <div class="progress-fill" id="fill-qwen3-studio"></div>
+              </div>
+              <span class="progress-text" id="text-qwen3-studio">0%</span>
+            </div>
+          </div>
+        </div>
+
+        <div id="studio-tools">
 
         <div class="studio-tabs">
           <button class="studio-tab active" data-tab="clone">
@@ -497,6 +518,7 @@ Hello! VoiceLink is ready.</textarea
               </div>
             </div>
           </div>
+        </div>
         </div>
       </section>
 

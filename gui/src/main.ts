@@ -435,7 +435,11 @@ function setupNavigation() {
 
       if (page === "voices") loadVoices();
       if (page === "setup") refreshSetupStatus();
-      if (page === "voice-studio") setupVoiceStudioTabs();
+      if (page === "voice-studio") {
+        setupVoiceStudioTabs();
+        document.getElementById("nav-voice-studio-badge")?.classList.add("hidden");
+        try { localStorage.setItem("voicestudio-seen", "1"); } catch (_) { /* storage blocked */ }
+      }
       if (page === "narrate") setupNarratePage();
 
       // Tour: auto-advance when user navigates to the awaited page
@@ -1450,6 +1454,12 @@ async function setupQwen3Settings(settings: AppSettings | null) {
     return;
   }
 
+  // Voice Studio is discoverable on any NVIDIA PC; "NEW" until its page is first opened
+  voiceStudioNav?.classList.remove("hidden");
+  let seen = false;
+  try { seen = localStorage.getItem("voicestudio-seen") === "1"; } catch (_) { /* storage blocked */ }
+  document.getElementById("nav-voice-studio-badge")?.classList.toggle("hidden", seen);
+
   // GPU is available — show the Qwen3 settings card
   qwen3Card?.classList.remove("hidden");
 
@@ -1488,14 +1498,14 @@ async function setupQwen3Settings(settings: AppSettings | null) {
     // Update status badge
     updateQwen3StatusBadge(statusBadge, settings);
 
-    // Show Voice Studio + Narrate nav if Qwen3 enabled + installed
+    // Show Narrate nav if Qwen3 enabled + installed
     if (settings.qwen3_enabled && settings.qwen3_installed) {
-      voiceStudioNav?.classList.remove("hidden");
       document.getElementById("nav-narrate")?.classList.remove("hidden");
     }
 
     // Update download button state
     updateQwen3DownloadButton(downloadBtn, settings);
+    updateStudioView(settings);
   }
 
   // Tier description update
@@ -1530,12 +1540,8 @@ async function setupQwen3Settings(settings: AppSettings | null) {
       // Refresh settings to update badge and nav
       const newSettings = await invoke<AppSettings>("get_settings");
       updateQwen3StatusBadge(statusBadge, newSettings);
-
-      if (voiceStudioNav) {
-        const showQwen3 = newSettings.qwen3_enabled && newSettings.qwen3_installed;
-        voiceStudioNav.classList.toggle("hidden", !showQwen3);
-        document.getElementById("nav-narrate")?.classList.toggle("hidden", !showQwen3);
-      }
+      updateStudioView(newSettings);
+      document.getElementById("nav-narrate")?.classList.toggle("hidden", !(newSettings.qwen3_enabled && newSettings.qwen3_installed));
     } catch (e) {
       console.error("Failed to save Qwen3 setting:", e);
       qwen3Toggle.checked = !qwen3Toggle.checked;
@@ -1551,23 +1557,74 @@ async function setupQwen3Settings(settings: AppSettings | null) {
       // Re-check download state since tier changed
       const newSettings = await invoke<AppSettings>("get_settings");
       updateQwen3DownloadButton(downloadBtn, newSettings);
+      updateStudioView(newSettings);
     } catch (e) {
       console.error("Failed to save tier:", e);
     }
   });
 
-  // One button: Download / Pause / Resume
-  downloadBtn?.addEventListener("click", async () => {
+  // One button: Download / Pause / Resume (Settings and the Voice Studio intro card share it)
+  async function onQwen3ButtonClick(fromStudio: boolean) {
     if (qwen3Downloading) {
       qwen3DownloadPaused = true;
-      downloadBtn.disabled = true;
-      downloadBtn.textContent = "Pausing...";
+      qwen3Els("btn-download-qwen3", "btn-studio-install").forEach((b) => {
+        b.disabled = true;
+        b.textContent = "Pausing...";
+      });
       try { await invoke("cancel_qwen3_download"); } catch (_) { /* may already be done */ }
       return;
     }
     qwen3DownloadPaused = false;
+    if (fromStudio) {
+      // Settings only offers the download once Qwen3 is enabled, so enable it here too
+      try {
+        await invoke("save_settings", { qwen3Enabled: true });
+      } catch (e) {
+        console.error("Failed to enable Qwen3:", e);
+        return;
+      }
+      if (qwen3Toggle) qwen3Toggle.checked = true;
+      detailsSection?.classList.remove("hidden");
+      const s = await invoke<AppSettings>("get_settings");
+      updateQwen3StatusBadge(statusBadge, s);
+      if (s.qwen3_installed) {
+        updateStudioView(s);
+        document.getElementById("nav-narrate")?.classList.remove("hidden");
+        return;
+      }
+    }
     await downloadQwen3Models();
-  });
+  }
+  downloadBtn?.addEventListener("click", () => onQwen3ButtonClick(false));
+  document.getElementById("btn-studio-install")?.addEventListener("click", () => onQwen3ButtonClick(true));
+}
+
+/** Elements that exist twice (Settings card + Voice Studio intro card) and must stay in sync */
+function qwen3Els(...ids: string[]): HTMLButtonElement[] { // typed as buttons; also used for progress divs/spans
+  return ids.map((id) => document.getElementById(id) as HTMLButtonElement | null).filter((e): e is HTMLButtonElement => !!e);
+}
+
+/** Voice Studio: tools once Qwen3 is enabled + installed, otherwise the install intro card */
+function updateStudioView(settings: AppSettings) {
+  const ready = settings.qwen3_enabled && settings.qwen3_installed;
+  document.getElementById("studio-intro")?.classList.toggle("hidden", ready);
+  document.getElementById("studio-tools")?.classList.toggle("hidden", !ready);
+  if (ready) return;
+
+  const needs = document.getElementById("studio-intro-needs");
+  if (needs) {
+    needs.textContent = settings.qwen3_model_tier === "full"
+      ? "Needs Qwen3 · ~10 GB download · ~5 GB VRAM"
+      : "Needs Qwen3 · ~3 GB download · ~2 GB VRAM";
+  }
+
+  // A download in progress or paused owns the button label
+  const btn = document.getElementById("btn-studio-install") as HTMLButtonElement | null;
+  if (btn && !qwen3Downloading && !qwen3DownloadPaused) {
+    const noVram = !cachedGpuInfo?.can_run_standard;
+    btn.disabled = noVram;
+    btn.textContent = noVram ? "Not enough free VRAM" : settings.qwen3_installed ? "Enable Qwen3" : "Install Qwen3";
+  }
 }
 
 function updateQwen3StatusBadge(badge: HTMLElement | null, settings: AppSettings) {
@@ -1600,25 +1657,28 @@ function updateQwen3DownloadButton(btn: HTMLButtonElement | null, settings: AppS
 }
 
 async function downloadQwen3Models() {
-  const btn = document.getElementById("btn-download-qwen3") as HTMLButtonElement | null;
-  const progressDiv = document.getElementById("progress-qwen3");
-  const fillEl = document.getElementById("fill-qwen3") as HTMLElement | null;
-  const textEl = document.getElementById("text-qwen3");
+  // Settings card + Voice Studio intro card show the same state
+  const btns = qwen3Els("btn-download-qwen3", "btn-studio-install");
+  const fills = qwen3Els("fill-qwen3", "fill-qwen3-studio");
+  const texts = qwen3Els("text-qwen3", "text-qwen3-studio");
+  const setText = (t: string) => texts.forEach((e) => (e.textContent = t));
+  const setFill = (pct: string) => fills.forEach((e) => (e.style.width = pct));
+  const setBtns = (label: string, warn: boolean) => btns.forEach((b) => {
+    b.disabled = false;
+    b.textContent = label;
+    b.classList.toggle("btn-warning", warn);
+    b.classList.toggle("btn-primary", !warn);
+  });
 
   // Show downloading state; the same button now pauses (HF keeps partial files)
   qwen3Downloading = true;
-  if (btn) {
-    btn.disabled = false;
-    btn.textContent = "Pause Download";
-    btn.classList.remove("btn-primary");
-    btn.classList.add("btn-warning");
-  }
-  progressDiv?.classList.remove("hidden");
+  setBtns("Pause Download", true);
+  qwen3Els("progress-qwen3", "progress-qwen3-studio").forEach((p) => p.classList.remove("hidden"));
 
   // Listen for real-time progress from the download script
   const unlisten = await listen<{ step: string; line?: string }>("setup-progress", (event) => {
     const { step, line } = event.payload;
-    if (!line || !textEl) return;
+    if (!line) return;
     // Only handle qwen3 download events
     if (step !== "qwen3-download" && step !== "qwen3-check" && step !== "qwen3-pip") return;
 
@@ -1627,30 +1687,30 @@ async function downloadQwen3Models() {
       const match = line.match(/PROGRESS:\s*(\d+)%\s*(\d+)\/(\d+)\s*MB\s*--\s*(.*)/);
       if (match) {
         const [, pct, doneMb, totalMb, fileName] = match;
-        if (fillEl) fillEl.style.width = `${pct}%`;
+        setFill(`${pct}%`);
         const shortFile = fileName.length > 40 ? fileName.substring(0, 37) + "..." : fileName;
-        textEl.textContent = Number(totalMb) > 0
+        setText(Number(totalMb) > 0
           ? `${pct}% · ${formatBytes(Number(doneMb) * 1048576)} of ${formatBytes(Number(totalMb) * 1048576)} · ${shortFile}`
-          : shortFile;
+          : shortFile);
       }
     } else if (line.startsWith("SIZE:")) {
       // e.g. "SIZE: 3200 MB total across 3 models"
       const match = line.match(/SIZE:\s*(\d+)\s*MB/);
       if (match) {
-        textEl.textContent = `Total download: ~${formatBytes(Number(match[1]) * 1048576)}`;
+        setText(`Total download: ~${formatBytes(Number(match[1]) * 1048576)}`);
       }
     } else if (line.startsWith("DOWNLOAD:")) {
       // e.g. "DOWNLOAD: [2/3] Qwen/Qwen3-TTS-12Hz-0.6B-Base"
       const match = line.match(/\[(\d+)\/(\d+)\]\s*(.*)/);
       if (match) {
         const shortName = match[3].split("/").pop() ?? match[3];
-        textEl.textContent = `Downloading ${shortName} (${match[1]}/${match[2]})...`;
+        setText(`Downloading ${shortName} (${match[1]}/${match[2]})...`);
       }
     } else if (line.startsWith("OK:") && line.includes("->")) {
       const parts = line.match(/OK:\s*(.*?)\s*->/);
       if (parts) {
         const shortName = parts[1].split("/").pop() ?? parts[1];
-        textEl.textContent = `Downloaded ${shortName}`;
+        setText(`Downloaded ${shortName}`);
       }
     }
   });
@@ -1663,8 +1723,8 @@ async function downloadQwen3Models() {
     const pythonExe = "python";
 
     // Step 1: Ensure huggingface_hub is installed (quick, no-op if present)
-    if (textEl) textEl.textContent = "Checking dependencies...";
-    if (fillEl) fillEl.style.width = "5%";
+    setText("Checking dependencies...");
+    setFill("5%");
 
     try {
       await invoke("setup_run_command", {
@@ -1673,7 +1733,7 @@ async function downloadQwen3Models() {
         stepName: "qwen3-check",
       });
     } catch {
-      if (textEl) textEl.textContent = "Installing huggingface_hub...";
+      setText("Installing huggingface_hub...");
       await invoke("setup_run_command", {
         program: pythonExe,
         args: ["-m", "pip", "install", "--no-warn-script-location", "huggingface_hub"],
@@ -1683,8 +1743,8 @@ async function downloadQwen3Models() {
 
     // Step 2: Download models using the robust downloader script.
     if (qwen3DownloadPaused) throw new Error("Paused");
-    if (textEl) textEl.textContent = "Starting model download...";
-    if (fillEl) fillEl.style.width = "10%";
+    setText("Starting model download...");
+    setFill("10%");
 
     const scriptPath = paths.server_dir.replace(/[/\\]$/, "") + "\\download_qwen3.py";
     const result = await invoke<string>("setup_run_command", {
@@ -1701,17 +1761,16 @@ async function downloadQwen3Models() {
     if (isDone || isPartial) {
       await invoke("save_settings", { qwen3Installed: true });
 
-      if (fillEl) fillEl.style.width = "100%";
-      if (textEl) textEl.textContent = isDone ? "All models downloaded!" : "Downloaded (some models had issues)";
+      setFill("100%");
+      setText(isDone ? "All models downloaded!" : "Downloaded (some models had issues)");
 
       const newSettings = await invoke<AppSettings>("get_settings");
       const statusBadge = document.getElementById("qwen3-status-badge");
       updateQwen3StatusBadge(statusBadge, newSettings);
-      updateQwen3DownloadButton(btn, newSettings);
+      updateQwen3DownloadButton(btns[0] ?? null, newSettings);
+      updateStudioView(newSettings);
 
-      const voiceStudioNav = document.getElementById("nav-voice-studio");
       if (newSettings.qwen3_enabled && newSettings.qwen3_installed) {
-        voiceStudioNav?.classList.remove("hidden");
         document.getElementById("nav-narrate")?.classList.remove("hidden");
       }
     } else {
@@ -1723,24 +1782,14 @@ async function downloadQwen3Models() {
 
     if (qwen3DownloadPaused) {
       // User paused — show resume button
-      if (textEl) textEl.textContent = "Paused. Progress is saved — resume anytime.";
-      if (btn) {
-        btn.disabled = false;
-        btn.textContent = "Resume Download";
-        btn.classList.remove("btn-warning");
-        btn.classList.add("btn-primary");
-      }
+      setText("Paused. Progress is saved — resume anytime.");
+      setBtns("Resume Download", false);
     } else {
       // Actual error
       const shortErr = extractDownloadError(errStr);
-      if (textEl) textEl.textContent = `Failed: ${shortErr}`;
-      if (fillEl) fillEl.style.width = "0%";
-      if (btn) {
-        btn.disabled = false;
-        btn.textContent = "Retry Download";
-        btn.classList.remove("btn-warning");
-        btn.classList.add("btn-primary");
-      }
+      setText(`Failed: ${shortErr}`);
+      setFill("0%");
+      setBtns("Retry Download", false);
     }
   } finally {
     qwen3Downloading = false;
@@ -1764,7 +1813,15 @@ function extractDownloadError(error: string): string {
 // Voice Studio — Clone, Design, and Built-in Qwen3 voice management
 // ============================================================================
 
+// Tabs and forms must be wired once; this runs on every visit to the page
+let studioWired = false;
+
 function setupVoiceStudioTabs() {
+  // Built-in voices list refreshes on every visit
+  loadQwen3Voices();
+  if (studioWired) return;
+  studioWired = true;
+
   // Tab switching
   const tabs = document.querySelectorAll<HTMLElement>(".studio-tab");
   tabs.forEach((tab) => {
@@ -1786,9 +1843,6 @@ function setupVoiceStudioTabs() {
 
   // Design form validation — enable Generate button when fields filled
   setupDesignForm();
-
-  // Load built-in Qwen3 voices list
-  loadQwen3Voices();
 }
 
 // ---- Clone Voice Form ----
