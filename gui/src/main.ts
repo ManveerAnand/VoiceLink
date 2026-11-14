@@ -1300,7 +1300,13 @@ function stopElapsedTimer() {
   stepStartTime = null;
 }
 
+/** Tell the tray (tooltip, menu, taskbar, notifications) how setup is going */
+function trayReport(phase: "step" | "progress" | "paused" | "failed" | "done", step?: StepName, percent?: number, message?: string) {
+  invoke("set_setup_tray", { phase, step, percent: percent === undefined ? undefined : Math.round(percent), message }).catch(() => {});
+}
+
 function setStepIcon(step: StepName, state: "pending" | "running" | "done" | "error") {
+  if (state === "running") trayReport("step", step, 0);
   const icon = document.getElementById(`step-icon-${step}`);
   if (!icon) return;
 
@@ -1321,6 +1327,7 @@ function showStepProgress(step: StepName, show: boolean) {
 }
 
 function setStepProgress(step: StepName, percent: number, text?: string) {
+  trayReport("progress", step, percent);
   const fill = document.getElementById(`fill-${step}`) as HTMLElement;
   const txt = document.getElementById(`text-${step}`);
   if (fill) fill.style.width = `${Math.min(100, percent)}%`;
@@ -1618,6 +1625,7 @@ async function runSetup() {
 
     stopElapsedTimer();
     showStepProgress("start", false);
+    trayReport("done");
 
     if (serverReady) {
       setStepIcon("start", "done");
@@ -1635,9 +1643,11 @@ async function runSetup() {
   } catch (e) {
     console.error("Setup failed:", e);
     if (setupPaused) {
+      trayReport("paused");
       setOverallStatus("Paused — progress is saved. Click Resume Setup to continue.");
       if (btn) btn.disabled = false;
     } else {
+      trayReport("failed", undefined, undefined, String(e));
       setOverallStatus(`Setup failed: ${e}`, "error");
       if (btn) {
         btn.textContent = "Retry Setup";
@@ -1685,6 +1695,12 @@ function setupSetupWizard() {
     } catch (e) {
       setOverallStatus(`Failed to save path: ${e}`, "error");
     }
+  });
+
+  // Tray menu / left click: press the same buttons the user would
+  listen<string>("tray-action", (event) => {
+    const id = { pause: "btn-pause-setup", resume: "btn-run-setup", "open-setup": "nav-setup-item" }[event.payload];
+    if (id) document.getElementById(id)?.click();
   });
 
   // Listen for progress events from Rust backend
