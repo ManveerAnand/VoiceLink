@@ -82,6 +82,7 @@
             <circle cx="18" cy="16" r="3" />
           </svg>
           <span>Voice Studio</span>
+          <span id="nav-voice-studio-badge" class="badge badge-accent hidden">NEW</span>
         </li>
         <li class="nav-item hidden" id="nav-narrate" data-page="narrate">
           <svg
@@ -196,29 +197,13 @@
           </div>
         </div>
 
-        <div class="card quick-test">
-          <div class="card-header"><h3>Quick Test</h3></div>
+        <div class="card">
+          <div class="card-header"><h3>Favorite voices</h3></div>
           <div class="card-body">
-            <textarea
-              id="test-text"
-              rows="2"
-              placeholder="Type text to preview..."
-            >
-Hello! VoiceLink is ready.</textarea
-            >
-            <div class="test-controls">
-              <select id="test-voice"></select>
-              <button id="btn-preview" class="btn btn-primary">
-                <svg
-                  viewBox="0 0 24 24"
-                  width="16"
-                  height="16"
-                  fill="currentColor"
-                >
-                  <polygon points="5 3 19 12 5 21 5 3" />
-                </svg>
-                Preview
-              </button>
+            <div id="favorite-chips" class="fav-chips"></div>
+            <div class="fav-footer">
+              <span id="default-voice-line">Default: &mdash;</span>
+              <button id="btn-manage-voices" class="btn btn-secondary btn-sm">Manage voices &rarr;</button>
             </div>
           </div>
         </div>
@@ -242,6 +227,32 @@ Hello! VoiceLink is ready.</textarea
           <button id="btn-refresh-voices" class="btn btn-secondary">
             Refresh
           </button>
+        </div>
+        <div class="card quick-test">
+          <div class="card-header"><h3>Quick Test</h3></div>
+          <div class="card-body">
+            <textarea
+              id="test-text"
+              rows="2"
+              placeholder="Type text to preview..."
+            >
+Hello! VoiceLink is ready.</textarea
+            >
+            <div class="test-controls">
+              <div id="test-voice" class="voice-picker"></div>
+              <button id="btn-preview" class="btn btn-primary">
+                <svg
+                  viewBox="0 0 24 24"
+                  width="16"
+                  height="16"
+                  fill="currentColor"
+                >
+                  <polygon points="5 3 19 12 5 21 5 3" />
+                </svg>
+                Preview
+              </button>
+            </div>
+          </div>
         </div>
         <div id="voices-list" class="voices-grid">
           <p class="placeholder">Loading voices...</p>
@@ -269,6 +280,17 @@ Hello! VoiceLink is ready.</textarea
                 <span class="slider"></span>
               </label>
             </div>
+          </div>
+        </div>
+
+        <div id="restore-voices-card" class="card">
+          <div class="card-header"><h3>Removed voices</h3></div>
+          <div class="card-body settings-form">
+            <div class="setting-row">
+              <label id="restore-voices-label">No removed voices</label>
+              <button id="btn-restore-voices" class="btn btn-secondary btn-sm" disabled>Restore removed voices</button>
+            </div>
+            <div id="restore-voices-status" class="path-hint hidden"></div>
           </div>
         </div>
 
@@ -350,13 +372,33 @@ Hello! VoiceLink is ready.</textarea
         </div>
       </section>
 
-      <!-- Voice Studio Page (hidden until Qwen3 enabled + installed) -->
+      <!-- Voice Studio Page (nav shown when an NVIDIA GPU is found; tools need Qwen3 installed) -->
       <section id="page-voice-studio" class="page">
         <h1>Voice Studio</h1>
         <p class="setup-subtitle">
           Create custom voices using Qwen3 TTS. Clone a voice from audio or
           design one from a text description.
         </p>
+
+        <!-- Shown instead of the tools until Qwen3 is installed -->
+        <div id="studio-intro" class="card hidden">
+          <div class="card-body">
+            <p>Clone any voice from a 10-second clip</p>
+            <p>Design new voices from a description</p>
+            <p id="studio-intro-needs" class="muted"></p>
+            <button id="btn-studio-install" class="btn btn-primary">
+              Install Qwen3
+            </button>
+            <div class="step-progress hidden" id="progress-qwen3-studio">
+              <div class="progress-bar">
+                <div class="progress-fill" id="fill-qwen3-studio"></div>
+              </div>
+              <span class="progress-text" id="text-qwen3-studio">0%</span>
+            </div>
+          </div>
+        </div>
+
+        <div id="studio-tools">
 
         <div class="studio-tabs">
           <button class="studio-tab active" data-tab="clone">
@@ -498,6 +540,7 @@ Hello! VoiceLink is ready.</textarea
             </div>
           </div>
         </div>
+        </div>
       </section>
 
       <!-- Narrate Page -->
@@ -514,7 +557,7 @@ Hello! VoiceLink is ready.</textarea
           <div class="card-body">
             <div class="stat-row">
               <span class="label">Voice</span>
-              <select id="narrate-voice" class="narrate-select"></select>
+              <div id="narrate-voice" class="voice-picker"></div>
             </div>
             <div class="stat-row">
               <span class="label">Language</span>
