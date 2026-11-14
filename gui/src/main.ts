@@ -87,7 +87,26 @@ let qwen3DownloadPaused = false;
 // Setup-incomplete gray-out state
 // ============================================================================
 
+let setupComplete = false;
+
+// Setup lives in the sidebar only until everything is installed; the Settings
+// "Repair / re-run setup" link brings it back. Stay visible while it is open.
+function syncSetupNav() {
+  const onSetup = document.getElementById("page-setup")?.classList.contains("active");
+  document.getElementById("nav-setup-item")?.classList.toggle("hidden", setupComplete && !onSetup);
+}
+
+function wireRepairSetupLink() {
+  document.getElementById("btn-repair-setup")?.addEventListener("click", () => {
+    const nav = document.getElementById("nav-setup-item");
+    nav?.classList.remove("hidden");
+    nav?.click();
+  });
+}
+
 function applySetupIncompleteState(isComplete: boolean) {
+  setupComplete = isComplete;
+  syncSetupNav();
   const dashboard = document.getElementById("page-dashboard");
   const voices = document.getElementById("page-voices");
   const dashBanner = document.getElementById("dashboard-setup-banner");
@@ -410,6 +429,7 @@ function setupNavigation() {
       document.querySelectorAll<HTMLElement>(".page").forEach((p) => {
         p.classList.toggle("active", p.id === `page-${page}`);
       });
+      syncSetupNav();
 
       if (page === "voices") loadVoices();
       if (page === "setup") refreshSetupStatus();
@@ -599,7 +619,7 @@ function renderVoices(container: HTMLElement) {
       return `
     <div class="voice-card card ${isEnabled ? "" : "voice-disabled"}" data-voice-id="${v.id}">
       <div class="voice-header">
-        <span class="voice-name">${escapeHtml(v.name)}</span>
+        <span class="voice-name">${escapeHtml(displayVoiceName(v.name))}</span>
         <div class="voice-header-right">
           ${sourceBadge}
           <span class="voice-badge ${v.gender.toLowerCase()}">${v.gender}</span>
@@ -715,7 +735,7 @@ function populateTestVoiceSelect() {
   // Only show registered (enabled) voices in Quick Test dropdown
   const enabledVoices = currentVoices.filter((v) => registeredVoiceIds.has(v.id));
   select.innerHTML = enabledVoices
-    .map((v) => `<option value="${v.id}">${escapeHtml(v.name)}</option>`)
+    .map((v) => `<option value="${v.id}">${escapeHtml(displayVoiceName(v.name))}</option>`)
     .join("");
 }
 
@@ -2018,7 +2038,7 @@ function setupNarratePage() {
   // Populate voice selector with Qwen3 voices
   const qwen3Voices = currentVoices.filter((v) => v.id.startsWith("qwen3_"));
   voiceSelect.innerHTML = qwen3Voices
-    .map((v) => `<option value="${v.id}">${escapeHtml(v.name)}</option>`)
+    .map((v) => `<option value="${v.id}">${escapeHtml(displayVoiceName(v.name))}</option>`)
     .join("");
 
   if (narrateInitialized) return;
@@ -2356,6 +2376,12 @@ function playPcmAudio(pcmData: Uint8Array) {
 // Utilities
 // ============================================================================
 
+// The registry name other apps see ends in " (Kokoro)" / " (Qwen3)"; the model
+// is already shown as a badge in our own UI, so drop the suffix here.
+function displayVoiceName(name: string): string {
+  return name.replace(/\s*\((Kokoro|Qwen3)\)$/, "");
+}
+
 function escapeHtml(str: string): string {
   const div = document.createElement("div");
   div.textContent = str;
@@ -2383,6 +2409,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   setupSetupWizard();
   setupSettings();
   wireGotoSetupButtons();
+  wireRepairSetupLink();
   wireLogViewers();
   startStatusPolling();
 

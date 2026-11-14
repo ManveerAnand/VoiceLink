@@ -56,6 +56,8 @@ body {
   display: flex;
   flex-direction: column;
   flex-shrink: 0;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .sidebar-header {
@@ -78,7 +80,7 @@ body {
 .nav-items {
   list-style: none;
   padding: 12px 8px;
-  flex: 1;
+  flex: 1 0 auto;
 }
 
 .nav-item {
@@ -112,6 +114,9 @@ body {
 /* ---- Main Content ---- */
 #content {
   flex: 1;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
   padding: 32px;
   overflow-y: auto;
 }
@@ -385,12 +390,12 @@ body {
 
 .voice-badge.female {
   background: rgba(232, 67, 147, 0.15);
-  color: #e84393;
+  color: #f77fb6;
 }
 
 .voice-badge.male {
   background: rgba(9, 132, 227, 0.15);
-  color: #0984e3;
+  color: #5aaeff;
 }
 
 .voice-details {
@@ -420,7 +425,7 @@ body {
   padding: 2px 8px;
   border-radius: 12px;
   background: rgba(108, 92, 231, 0.12);
-  color: var(--accent-hover);
+  color: #a89dff;
   font-weight: 500;
   letter-spacing: 0.3px;
 }
@@ -442,6 +447,8 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 16px;
 }
 
 .setting-row label:first-child {
@@ -928,17 +935,17 @@ body {
 
 .badge-muted {
   background: var(--bg-input);
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
 .badge-success {
   background: rgba(0, 184, 148, 0.15);
-  color: var(--success);
+  color: #1ad3a8;
 }
 
 .badge-accent {
   background: rgba(108, 92, 231, 0.15);
-  color: var(--accent);
+  color: #a89dff;
 }
 
 .badge-warning {
