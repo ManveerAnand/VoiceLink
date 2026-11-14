@@ -21,7 +21,9 @@
 # The model stays in memory for the entire lifetime of the server.
 # ============================================================================
 
+import asyncio
 import os
+import socket
 import sys
 import time
 import logging
@@ -48,10 +50,37 @@ os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
 warnings.filterwarnings("ignore", message=".*flash.attn.*")
 warnings.filterwarnings("ignore", message=".*Torch was not compiled with flash attention.*")
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from loguru import logger
 
 from server.config import settings
+
+
+def claim_port() -> "socket.socket":
+    """
+    Bind the server port before the slow model load, or exit.
+
+    uvicorn only binds after startup finishes, so while the model loads (~30 s)
+    nothing is listening yet and a second copy would also start, loading a
+    second model onto the GPU. A bound socket makes later copies fail at once
+    (no SO_REUSEADDR: on Windows that would let them share the port).
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind((settings.server.host, settings.server.port))
+    except OSError:
+        print(
+            f"VoiceLink server already running on {settings.server.host}:{settings.server.port}; exiting.",
+            file=sys.stderr,
+            flush=True,
+        )
+        sys.exit(1)
+    return sock
+
+
+# Only when run as the server (not when imported, e.g. by tests or uvicorn --reload)
+_port_sock = claim_port() if __name__ == "__main__" else None
+
 from server.models import load_model
 from server.routers.tts import router as tts_router, set_model, set_start_time
 from server.routers.qwen3 import router as qwen3_router
@@ -78,7 +107,7 @@ def setup_logging():
             "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
             "<level>{message}</level>"
         ),
-        colorize=True,
+        colorize="NO_COLOR" not in os.environ,  # the app sets NO_COLOR so server.log is plain text
     )
 
 
@@ -122,6 +151,8 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
         logger.error("Server will start but TTS will return 503 errors.")
+    # The kokoro package replaces our log handler with a colored one when imported
+    setup_logging()
 
     logger.info("")
     logger.info(f"Server ready at http://{settings.server.host}:{settings.server.port}")
@@ -158,13 +189,34 @@ app.include_router(tts_router)
 app.include_router(qwen3_router)
 
 
+@app.post("/v1/shutdown")
+async def shutdown(request: Request):
+    """
+    Stop the server process (used by the VoiceLink app's Stop button).
+
+    Loopback only. The custom header can't be sent by a web page without a CORS
+    preflight, which this server never allows, so a site can't stop it.
+    """
+    if request.client is None or request.client.host != "127.0.0.1":
+        raise HTTPException(status_code=403, detail="Local requests only")
+    if request.headers.get("x-voicelink") != "1":
+        raise HTTPException(status_code=403, detail="Missing X-VoiceLink header")
+    logger.info("Shutdown requested")
+    # Exit after the response is sent. os._exit skips teardown, but the OS frees
+    # the GPU memory with the process.
+    asyncio.get_running_loop().call_later(0.3, os._exit, 0)
+    return {"status": "shutting down"}
+
+
 # --- Direct execution ---
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(
-        "server.main:app",
-        host=settings.server.host,
-        port=settings.server.port,
-        log_level=settings.server.log_level.lower(),
-    )
+    uvicorn.Server(
+        uvicorn.Config(
+            app,
+            host=settings.server.host,
+            port=settings.server.port,
+            log_level=settings.server.log_level.lower(),
+        )
+    ).run(sockets=[_port_sock])  # the socket claimed at startup

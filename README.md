@@ -114,7 +114,7 @@ Everything runs on your computer. No internet needed after the initial setup. No
 ### What You Need
 
 - Windows 10 or 11 (64 bit)
-- About 1.5 GB of free disk space (+ ~3 GB for Qwen3 TTS if enabled)
+- About 1.5 GB of free disk space (+ ~5.3 GB for Qwen3 TTS if enabled)
 - An internet connection for the first setup (to download the AI model)
 - A reasonably modern computer (a dedicated GPU helps but is not required)
 - **For Qwen3 voices / voice cloning:** An NVIDIA GPU with at least 4 GB VRAM

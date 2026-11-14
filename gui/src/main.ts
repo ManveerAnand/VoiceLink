@@ -465,41 +465,57 @@ function setupNavigation() {
 // Server Status
 // ============================================================================
 
+/** Set while a Start/Stop click is running, so the 5 s status poll doesn't re-enable the button */
+let serverBusy: "starting" | "stopping" | null = null;
+
 /** Update the Start/Stop button label and styling based on server state */
 function updateServerToggle(btn: HTMLButtonElement | null, running: boolean) {
   if (!btn) return;
-  btn.disabled = false;
-  if (running) {
+  btn.disabled = serverBusy !== null;
+  if (serverBusy) {
+    btn.textContent = serverBusy === "starting" ? "Starting… (loading model)" : "Stopping…";
+  } else if (running) {
     btn.textContent = "Stop Server";
-    btn.classList.remove("btn-success");
-    btn.classList.add("btn-danger");
   } else {
     btn.textContent = "Start Server";
-    btn.classList.remove("btn-danger");
-    btn.classList.add("btn-success");
   }
+  btn.classList.toggle("btn-danger", running);
+  btn.classList.toggle("btn-success", !running);
+}
+
+/** The model takes ~30 s to load and the server only answers after that: wait for it */
+async function waitForServerReady() {
+  for (let i = 0; i < 60; i++) {
+    const status = await invoke<ServerStatus>("get_server_status");
+    if (status.running) return;
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  throw new Error("The server did not start within 2 minutes. Use 'Show log file' below the status to see why.");
 }
 
 /** Wire up the Start/Stop Server button on the dashboard */
 function setupServerToggle() {
   const btn = document.getElementById("btn-server-toggle") as HTMLButtonElement | null;
   btn?.addEventListener("click", async () => {
-    if (!btn) return;
+    if (!btn || serverBusy) return;
     const isRunning = btn.classList.contains("btn-danger");
-    btn.disabled = true;
-    btn.textContent = isRunning ? "Stopping…" : "Starting…";
+    serverBusy = isRunning ? "stopping" : "starting";
+    updateServerToggle(btn, isRunning);
+    let failure: string | null = null;
     try {
       if (isRunning) {
         await invoke("stop_server");
       } else {
         await invoke("start_server");
-        // Give the server a moment to boot before re-checking
-        await new Promise((r) => setTimeout(r, 2000));
+        await waitForServerReady();
       }
     } catch (e) {
       console.error("Server toggle failed:", e);
+      failure = errorText(e);
     }
+    serverBusy = null;
     await checkServerStatus();
+    if (failure) await showModal(isRunning ? "Could not stop the server" : "Could not start the server", failure, true);
   });
 }
 
@@ -557,12 +573,12 @@ async function checkServerStatus() {
     } else {
       indicator?.classList.remove("online");
       indicator?.classList.add("offline");
-      if (statusEl) statusEl.textContent = "Offline";
+      if (statusEl) statusEl.textContent = serverBusy === "starting" ? "Loading model…" : "Offline";
       if (modelEl) modelEl.textContent = "—";
       if (deviceEl) deviceEl.textContent = "—";
       if (voicesEl) voicesEl.textContent = "—";
       updateServerToggle(toggleBtn, false);
-      updateServerLogHint(true);
+      updateServerLogHint(serverBusy === null);
     }
   } catch (e) {
     indicator?.classList.remove("online");
@@ -771,7 +787,7 @@ async function handleToggleVoice(voiceId: string, enabled: boolean) {
     }
     const container = document.getElementById("voices-list");
     if (container) renderVoices(container);
-    await showModal("Error", `Toggle failed: ${e}`, true);
+    await showModal("Error", `Toggle failed: ${errorText(e)}`, true);
   }
 }
 
@@ -895,24 +911,43 @@ function renderFavorites() {
 // Restore removed voices (Settings)
 // ============================================================================
 
-function updateRestoreCard() {
-  const label = document.getElementById("restore-voices-label");
-  const btn = document.getElementById("btn-restore-voices") as HTMLButtonElement | null;
-  if (label) label.textContent = removedIds.length ? `${removedIds.length} removed voice${removedIds.length === 1 ? "" : "s"}` : "No removed voices";
-  if (btn) btn.disabled = removedIds.length === 0;
+/** "af_heart" -> "Heart", "qwen3_ono_anna" -> "Ono Anna" */
+function removedVoiceName(id: string): string {
+  const words = id.startsWith("qwen3_") ? id.slice(6).split("_") : [id.split("_").pop() ?? id];
+  return words.map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
 }
 
-async function handleRestoreVoices() {
-  const btn = document.getElementById("btn-restore-voices") as HTMLButtonElement | null;
+function updateRestoreCard() {
+  const list = document.getElementById("restore-voices-list");
+  if (!list) return;
+  if (removedIds.length === 0) {
+    list.innerHTML = `<div class="path-hint">No removed voices</div>`;
+    return;
+  }
+  list.innerHTML =
+    removedIds
+      .map(
+        (id) => `<div class="setting-row">
+          <label>${escapeHtml(removedVoiceName(id))} <span class="voice-tag">${id.startsWith("qwen3_") ? "Qwen3" : "Kokoro"}</span></label>
+          <button class="btn btn-secondary btn-sm" data-restore="${escapeHtml(id)}">Restore</button>
+        </div>`
+      )
+      .join("") +
+    (removedIds.length > 1
+      ? `<div class="setting-row"><label>All removed voices</label><button class="btn btn-secondary btn-sm" data-restore-all>Restore all</button></div>`
+      : "");
+}
+
+async function handleRestoreVoices(ids: string[]) {
   const status = document.getElementById("restore-voices-status");
-  const ids = [...removedIds];
-  if (!btn || !status || ids.length === 0) return;
+  const buttons = document.querySelectorAll<HTMLButtonElement>("#restore-voices-list button");
+  if (!status || ids.length === 0) return;
 
   const say = (msg: string) => {
     status.textContent = msg;
     status.classList.remove("hidden");
   };
-  btn.disabled = true;
+  buttons.forEach((b) => (b.disabled = true));
   try {
     // Kokoro voicepacks come back from Hugging Face; built-in Qwen3 voices have no file to fetch
     const kokoro = ids.filter((id) => !id.startsWith("qwen3_"));
@@ -932,7 +967,7 @@ for v in ${JSON.stringify(kokoro)}:
       });
     }
     await invoke("unremove_voices", { voiceIds: ids });
-    removedIds = [];
+    removedIds = removedIds.filter((id) => !ids.includes(id));
 
     say("Registering voices (you may see a permission prompt)...");
     let failed = 0;
@@ -1111,7 +1146,11 @@ function setupQuickTest() {
   document.getElementById("btn-manage-voices")?.addEventListener("click", () => {
     document.querySelector<HTMLElement>('.nav-item[data-page="voices"]')?.click();
   });
-  document.getElementById("btn-restore-voices")?.addEventListener("click", handleRestoreVoices);
+  document.getElementById("restore-voices-list")?.addEventListener("click", (e) => {
+    const btn = (e.target as HTMLElement).closest("button");
+    if (!btn || btn.disabled) return;
+    handleRestoreVoices(btn.hasAttribute("data-restore-all") ? [...removedIds] : [btn.dataset.restore!]);
+  });
 
   const btn = document.getElementById("btn-preview");
   btn?.addEventListener("click", async () => {
@@ -1975,8 +2014,8 @@ function updateStudioView(settings: AppSettings) {
   const needs = document.getElementById("studio-intro-needs");
   if (needs) {
     needs.textContent = settings.qwen3_model_tier === "full"
-      ? "Needs Qwen3 · ~10 GB download · ~5 GB VRAM"
-      : "Needs Qwen3 · ~3 GB download · ~2 GB VRAM";
+      ? "Needs Qwen3 · ~13.3 GB download · ~5 GB VRAM"
+      : "Needs Qwen3 · ~5.3 GB download · ~2 GB VRAM";
   }
 
   // A download in progress or paused owns the button label
@@ -2906,6 +2945,12 @@ function playPcmAudio(pcmData: Uint8Array) {
 // is already shown as a badge in our own UI, so drop the suffix here.
 function displayVoiceName(name: string): string {
   return name.replace(/\s*\((Kokoro|Qwen3)\)$/, "");
+}
+
+/** Message for an error dialog: never empty, so a failure can't show a blank pop-up */
+function errorText(e: unknown): string {
+  const text = (e instanceof Error ? e.message : String(e ?? "")).trim();
+  return text || "No details were reported. The log files are in the VoiceLink data folder.";
 }
 
 function escapeHtml(str: string): string {

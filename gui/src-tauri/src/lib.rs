@@ -583,44 +583,58 @@ fn get_registered_voice_ids() -> Result<Vec<String>, String> {
 
 /// Run a PowerShell command elevated via UAC prompt.
 /// Writes commands to a temp .ps1 file and runs it elevated to avoid quoting issues.
+/// Failures say why: UAC declined, or what the script itself reported.
 fn run_elevated_powershell(commands: &str) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
-    use std::io::Write;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-    // Write commands to a temporary .ps1 script file
     let temp_dir = std::env::temp_dir();
     let script_path = temp_dir.join("voicelink_elevate.ps1");
-    {
-        let mut f = std::fs::File::create(&script_path)
-            .map_err(|e| format!("Failed to create temp script: {}", e))?;
-        f.write_all(commands.as_bytes())
-            .map_err(|e| format!("Failed to write temp script: {}", e))?;
-    }
+    let err_path = temp_dir.join("voicelink_elevate.err");
+    let _ = std::fs::remove_file(&err_path);
 
-    let script_str = script_path.to_string_lossy().to_string();
+    // The BOM makes PowerShell 5.1 read non-ASCII voice names as UTF-8. An error in
+    // the script is written to err_path and gives exit code 1 (Start-Process -Wait
+    // alone would report success even when the script failed).
+    let script = format!(
+        "\u{feff}$ErrorActionPreference = 'Stop'\ntry {{\n{}\n}} catch {{\n$_.Exception.Message | Set-Content -Path '{}' -Encoding UTF8\nexit 1\n}}\n",
+        commands,
+        err_path.to_string_lossy().replace('\'', "''")
+    );
+    std::fs::write(&script_path, script)
+        .map_err(|e| format!("Failed to write temp script: {}", e))?;
 
-    // Use Start-Process to run the script elevated
-    let status = std::process::Command::new("powershell")
+    // Start-Process runs the script elevated and hidden; exit code 2 = it could not start (UAC declined)
+    let output = std::process::Command::new("powershell")
         .args([
             "-NoProfile",
             "-Command",
             &format!(
-                "Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','\"{}\"' -Verb RunAs -Wait",
-                script_str
+                "try {{ $p = Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','\"{}\"' -Verb RunAs -Wait -PassThru -WindowStyle Hidden; exit $p.ExitCode }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 2 }}",
+                script_path.to_string_lossy().replace('\'', "''")
             ),
         ])
         .creation_flags(CREATE_NO_WINDOW)
-        .status()
-        .map_err(|e| format!("Failed to launch elevation prompt: {}", e))?;
+        .output();
 
-    // Clean up temp script
+    let script_err = std::fs::read_to_string(&err_path).unwrap_or_default();
     let _ = std::fs::remove_file(&script_path);
+    let _ = std::fs::remove_file(&err_path);
 
-    if status.success() {
-        Ok(())
-    } else {
-        Err("Elevation was cancelled or failed. Voice toggling requires a one-time permission grant.".to_string())
+    let output = output.map_err(|e| format!("Failed to launch the permission prompt: {}", e))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    match output.status.code() {
+        Some(0) => Ok(()),
+        Some(1) => Err(format!("Windows rejected the change: {}", script_err.trim_start_matches('\u{feff}').trim())),
+        Some(2) => Err(format!(
+            "Administrator permission was declined or could not be requested. {}",
+            stderr.trim()
+        )),
+        code => Err(format!(
+            "The permission helper failed (exit code {}). {}",
+            code.map_or("unknown".to_string(), |c| c.to_string()),
+            stderr.trim()
+        )),
     }
 }
 
@@ -1952,6 +1966,7 @@ import runpy; runpy.run_module('server.main', run_name='__main__', alter_sys=Tru
         .current_dir(cfg.data_dir())
         .env("PYTHONPATH", cfg.data_dir())
         .env("PYTHONUNBUFFERED", "1") // so the log is current when the server dies
+        .env("NO_COLOR", "1") // the server then logs plain text instead of ANSI colors
         .envs(data_env(cfg))
         .stdout(std::process::Stdio::from(log))
         .stderr(std::process::Stdio::from(log_err))
@@ -1976,9 +1991,11 @@ async fn start_server(app: AppHandle) -> Result<(), String> {
         return Err("Server not installed. Run setup first.".to_string());
     }
 
-    // Check if already running
-    if std::net::TcpStream::connect("127.0.0.1:7860").is_ok() {
-        return Ok(()); // Already running
+    // Already running or loading its model (nothing listens during the load, so
+    // look at our child and at who holds the port): a second copy would load a
+    // second model onto the GPU.
+    if server_loading_secs(&app).is_some() || !server_port_free() {
+        return Ok(());
     }
 
     let child = spawn_server(&cfg)?;
@@ -2003,18 +2020,70 @@ async fn start_server(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Drop ANSI escape sequences (colors) from a log line: ESC [ params letter
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // skip "[" and the parameters up to the final letter
+            for n in chars.by_ref() {
+                if n.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Last few lines of server.log plus its path, shown on the Dashboard when the server is down
 #[tauri::command]
 fn get_server_log_tail(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<serde_json::Value, String> {
     let path = config.lock().map_err(|e| e.to_string())?.data_dir().join("logs").join("server.log");
     let bytes = std::fs::read(&path).unwrap_or_default();
-    let text = String::from_utf8_lossy(&bytes);
+    let text = strip_ansi(&String::from_utf8_lossy(&bytes));
     let mut lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).rev().take(5).collect();
     lines.reverse();
     Ok(serde_json::json!({ "path": path, "lines": lines }))
 }
 
-/// Stop the inference server
+/// True when nothing holds the server port. A bind test (not a connect) because
+/// the server claims the port at launch but only listens once its model is loaded.
+fn server_port_free() -> bool {
+    std::net::TcpListener::bind("127.0.0.1:7860").is_ok()
+}
+
+async fn wait_server_port_free(secs: u64) -> bool {
+    for _ in 0..secs * 4 {
+        if server_port_free() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    server_port_free()
+}
+
+/// Kill server processes that run our embedded Python: copies left by an earlier
+/// app run, or ones still loading that can't answer /v1/shutdown. Matches the
+/// executable path and "server.main", so nothing else is touched.
+fn kill_stray_servers(python_dir: &std::path::Path) {
+    let dir = python_dir.to_string_lossy().replace('\'', "''");
+    let script = format!(
+        "Get-CimInstance Win32_Process | Where-Object {{ $_.Name -eq 'python.exe' -and $_.ExecutablePath -and \
+         $_.ExecutablePath.StartsWith('{}\\', 'OrdinalIgnoreCase') -and $_.CommandLine -match 'server\\.main' }} | \
+         ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}",
+        dir.trim_end_matches('\\')
+    );
+    let _ = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .status();
+}
+
+/// Stop the inference server, including copies this app run didn't start
 #[tauri::command]
 async fn stop_server(app: AppHandle) -> Result<(), String> {
     // Clear managed flag first so watchdog doesn't restart
@@ -2023,17 +2092,40 @@ async fn stop_server(app: AppHandle) -> Result<(), String> {
         let mut m = managed.lock().map_err(|e| e.to_string())?;
         m.0 = false;
     }
+    let python_dir = app.state::<Mutex<AppConfig>>().lock().map_err(|e| e.to_string())?.python_dir();
 
-    let state = app.state::<Mutex<ServerProcess>>();
-    let mut proc = state.lock().map_err(|e| e.to_string())?;
+    // Ask whatever answers on the port to exit (also a server left over from an earlier run)
+    if let Ok(client) = reqwest::Client::builder().timeout(std::time::Duration::from_secs(3)).build() {
+        let _ = client
+            .post("http://127.0.0.1:7860/v1/shutdown")
+            .header("X-VoiceLink", "1")
+            .send()
+            .await;
+    }
 
-    if let Some(ref mut child) = proc.0 {
+    // Then the child we spawned (it may still be loading and not answer yet)
+    let child = {
+        let state = app.state::<Mutex<ServerProcess>>();
+        let mut proc = state.lock().map_err(|e| e.to_string())?;
+        proc.1 = None;
+        proc.0.take()
+    };
+    if let Some(mut child) = child {
         let _ = child.kill();
         let _ = child.wait();
-        proc.0 = None;
+    }
+
+    let mut free = wait_server_port_free(3).await;
+    if !free {
+        kill_stray_servers(&python_dir);
+        free = wait_server_port_free(7).await;
+    }
+    if !free {
+        return Err("The server could not be stopped: port 7860 is still in use by another program. \
+                    Close it (Task Manager > python.exe) or restart your PC."
+            .to_string());
     }
     set_server_state(&app, ServerState::Offline);
-
     Ok(())
 }
 
@@ -2666,4 +2758,16 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running VoiceLink");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_ansi;
+
+    #[test]
+    fn strips_log_colors() {
+        let raw = "\u{1b}[32m22:26:01\u{1b}[0m | \u{1b}[1m    INFO\u{1b}[0m | Server ready";
+        assert_eq!(strip_ansi(raw), "22:26:01 |     INFO | Server ready");
+        assert_eq!(strip_ansi("plain line"), "plain line");
+    }
 }
