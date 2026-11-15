@@ -2193,10 +2193,10 @@ fn shutdown_app(app: &AppHandle) {
 
     let managed = app.state::<Mutex<ServerManagedByUs>>().lock().map(|m| m.0).unwrap_or(false);
     if managed {
-        let _ = tauri::async_runtime::block_on(tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            halt_server(app),
-        ));
+        // The timeout must be created inside the runtime (its timer needs the reactor)
+        let _ = tauri::async_runtime::block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), halt_server(app)).await
+        });
     }
 }
 
