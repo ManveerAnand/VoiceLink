@@ -212,6 +212,36 @@ fn hf_home(cfg: &AppConfig) -> PathBuf {
     cfg.data_dir().join("models").join("hf")
 }
 
+/// Version of the Python packages Qwen3 needs at runtime (faster-qwen3-tts and
+/// what it imports), installed from Settings / Voice Studio. Bump it whenever
+/// the list or pins in main.ts (QWEN3_RUNTIME_PACKAGES) change.
+const QWEN3_RUNTIME_VERSION: &str = "1";
+
+/// Hugging Face repos (under Qwen/) the downloader fetches for a tier
+fn qwen3_repos(tier: &str) -> &'static [&'static str] {
+    if tier == "full" {
+        &["Qwen3-TTS-Tokenizer-12Hz", "Qwen3-TTS-12Hz-1.7B-Base", "Qwen3-TTS-12Hz-1.7B-CustomVoice", "Qwen3-TTS-12Hz-1.7B-VoiceDesign"]
+    } else {
+        &["Qwen3-TTS-Tokenizer-12Hz", "Qwen3-TTS-12Hz-0.6B-Base", "Qwen3-TTS-12Hz-0.6B-CustomVoice"]
+    }
+}
+
+/// All model files of the tier are downloaded (a snapshot only links a weights
+/// file once it is complete, so partial downloads don't count)
+fn qwen3_models_ok(cfg: &AppConfig, tier: &str) -> bool {
+    qwen3_repos(tier).iter().all(|repo| {
+        let snapshots = hf_home(cfg).join("hub").join(format!("models--Qwen--{}", repo)).join("snapshots");
+        std::fs::read_dir(snapshots)
+            .map_or(false, |dirs| dirs.flatten().any(|s| s.path().join("model.safetensors").exists()))
+    })
+}
+
+/// The Python packages Qwen3 imports are installed (marker written after the pip step)
+fn qwen3_runtime_ok(cfg: &AppConfig) -> bool {
+    marker_matches(&cfg.data_dir().join(".qwen3_runtime"), QWEN3_RUNTIME_VERSION)
+        && cfg.python_dir().join("Lib").join("site-packages").join("faster_qwen3_tts").exists()
+}
+
 /// Environment for every Python child process, so models, the pip cache and
 /// temp files (pip unpacks multi-GB wheels) stay in the data dir instead of C:.
 fn data_env(cfg: &AppConfig) -> Vec<(String, String)> {
@@ -223,12 +253,37 @@ fn data_env(cfg: &AppConfig) -> Vec<(String, String)> {
         ("TEMP", d.join("tmp")),
         ("VOICELINK_DATA_DIR", d.clone()),
     ];
-    dirs.into_iter()
+    let env = dirs
+        .into_iter()
         .map(|(k, p)| {
             let _ = std::fs::create_dir_all(&p);
             (k.to_string(), p.to_string_lossy().to_string())
         })
-        .collect()
+        .collect();
+    write_qwen3_tier(cfg);
+    env
+}
+
+/// The server reads the chosen Qwen3 tier from this file, so a tier change in
+/// Settings applies without restarting it (and the SAPI route sees it too)
+fn write_qwen3_tier(cfg: &AppConfig) {
+    let _ = std::fs::write(cfg.data_dir().join(".qwen3_tier"), &cfg.qwen3_model_tier);
+}
+
+/// Delete the pip cache and temp files (they only matter for retries during an install).
+/// Locked files are skipped.
+fn clear_pip_scratch(cfg: &AppConfig) {
+    for dir in [cfg.data_dir().join("cache").join("pip"), cfg.data_dir().join("tmp")] {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for path in entries.flatten().map(|e| e.path()) {
+                let _ = if path.is_dir() {
+                    std::fs::remove_dir_all(&path)
+                } else {
+                    std::fs::remove_file(&path)
+                };
+            }
+        }
+    }
 }
 
 /// Holds the server process handle so we can stop it later
@@ -1025,6 +1080,36 @@ fn set_default_voice(voice_id: String) -> Result<(), String> {
 // Qwen3 Commands — Voice Studio API proxies
 // ============================================================================
 
+/// The reason in a server error body (`{"detail": "..."}`), so the UI can show it as is
+fn server_error(status: reqwest::StatusCode, body: &str) -> String {
+    let detail = match serde_json::from_str::<serde_json::Value>(body).ok().map(|v| v["detail"].clone()) {
+        Some(serde_json::Value::String(s)) => s,
+        // request validation errors: [{"loc": [...], "msg": "..."}]
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|i| i["msg"].as_str())
+            .collect::<Vec<_>>()
+            .join("; "),
+        _ => body.trim().to_string(),
+    };
+    if detail.is_empty() {
+        format!("The server answered with an error (HTTP {})", status.as_u16())
+    } else {
+        detail
+    }
+}
+
+/// A request that never reached the server
+fn server_unreachable(e: reqwest::Error) -> String {
+    if e.is_connect() {
+        "VoiceLink's server is not running. Start it from the Dashboard first.".to_string()
+    } else if e.is_timeout() {
+        "The server took too long to answer. The first Qwen3 request after starting can take a minute; try again.".to_string()
+    } else {
+        format!("Could not reach VoiceLink's server: {}", e)
+    }
+}
+
 /// Get list of Qwen3 speakers (built-in + custom)
 #[tauri::command]
 async fn qwen3_list_speakers() -> Result<serde_json::Value, String> {
@@ -1037,7 +1122,7 @@ async fn qwen3_list_speakers() -> Result<serde_json::Value, String> {
         .get("http://127.0.0.1:7860/v1/qwen3/speakers")
         .send()
         .await
-        .map_err(|e| format!("Server not reachable: {}", e))?;
+        .map_err(server_unreachable)?;
 
     let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
     Ok(json)
@@ -1060,11 +1145,37 @@ async fn qwen3_delete_clone(voice_id: String) -> Result<(), String> {
         .delete(format!("http://127.0.0.1:7860/v1/qwen3/clone/{}", profile_name))
         .send()
         .await
-        .map_err(|e| format!("Server error: {}", e))?;
+        .map_err(server_unreachable)?;
 
     if !resp.status().is_success() {
+        let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Delete failed: {}", body));
+        return Err(server_error(status, &body));
+    }
+    Ok(())
+}
+
+/// Keep a freshly cloned/designed voice (until then it only exists for previewing)
+#[tauri::command]
+async fn qwen3_save_clone(voice_id: String) -> Result<(), String> {
+    let profile_name = voice_id.strip_prefix("qwen3_custom_").unwrap_or(&voice_id);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let resp = client
+        .post(reqwest::Url::parse("http://127.0.0.1:7860/v1/qwen3/clone/")
+            .and_then(|u| u.join(&format!("{}/save", profile_name)))
+            .map_err(|e| e.to_string())?)
+        .send()
+        .await
+        .map_err(server_unreachable)?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(server_error(status, &body));
     }
     Ok(())
 }
@@ -1113,12 +1224,12 @@ async fn qwen3_clone_voice(
         .multipart(form)
         .send()
         .await
-        .map_err(|e| format!("Server error: {}", e))?;
+        .map_err(server_unreachable)?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Clone failed ({}): {}", status, body));
+        return Err(server_error(status, &body));
     }
 
     let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
@@ -1133,7 +1244,7 @@ async fn qwen3_design_voice(
     sample_text: String,
 ) -> Result<Vec<u8>, String> {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(300))
         .build()
         .map_err(|e| e.to_string())?;
 
@@ -1148,12 +1259,12 @@ async fn qwen3_design_voice(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Server error: {}", e))?;
+        .map_err(server_unreachable)?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Design failed ({}): {}", status, body));
+        return Err(server_error(status, &body));
     }
 
     let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
@@ -1179,12 +1290,12 @@ async fn qwen3_preview_voice(voice_id: String, text: String) -> Result<Vec<u8>, 
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Server error: {}", e))?;
+        .map_err(server_unreachable)?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Qwen3 TTS failed ({}): {}", status, body));
+        return Err(server_error(status, &body));
     }
 
     let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
@@ -1211,12 +1322,12 @@ async fn qwen3_narrate(voice_id: String, text: String, language: String, speed: 
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Server error: {}", e))?;
+        .map_err(server_unreachable)?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Qwen3 narration failed ({}): {}", status, body));
+        return Err(server_error(status, &body));
     }
 
     let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
@@ -1284,6 +1395,289 @@ async fn qwen3_get_status() -> Result<serde_json::Value, String> {
 
     let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
     Ok(json)
+}
+
+// ============================================================================
+// Remove Qwen3 — put the PC back to Kokoro only
+// ============================================================================
+
+/// What the Qwen3 install added to the embedded Python: pip name and the
+/// site-packages entries it owns (for the size shown before removing). Every
+/// one of these is needed only by faster-qwen3-tts (checked with `pip show`:
+/// nothing else lists them under Required-by), so none is used by Kokoro or the server.
+/// torch, transformers, numpy and huggingface_hub are deliberately not here.
+const QWEN3_PY_PACKAGES: &[(&str, &[&str])] = &[
+    ("faster-qwen3-tts", &["faster_qwen3_tts"]),
+    ("qwen-tts-hf", &["qwen_tts"]),
+    ("accelerate", &["accelerate"]),
+    ("librosa", &["librosa"]),
+    ("torchaudio", &["torchaudio"]),
+    ("onnxruntime", &["onnxruntime"]),
+    ("sox", &["sox"]),
+    ("einops", &["einops"]),
+    ("scipy", &["scipy", "scipy.libs"]),
+    ("scikit-learn", &["sklearn", "scikit_learn.libs"]),
+    ("numba", &["numba"]),
+    ("llvmlite", &["llvmlite"]),
+    ("soxr", &["soxr"]),
+    ("audioread", &["audioread"]),
+    ("pooch", &["pooch"]),
+    ("msgpack", &["msgpack"]),
+    ("lazy_loader", &["lazy_loader"]),
+    ("decorator", &["decorator.py"]),
+    ("flatbuffers", &["flatbuffers"]),
+    ("protobuf", &[]),
+    ("psutil", &["psutil"]),
+    ("narwhals", &["narwhals"]),
+    ("threadpoolctl", &["threadpoolctl.py"]),
+    ("platformdirs", &["platformdirs"]),
+];
+
+/// Total size of a folder or file in bytes (links are not followed)
+fn path_size(p: &std::path::Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(p) else { return 0 };
+    if meta.is_dir() {
+        std::fs::read_dir(p).map_or(0, |d| d.flatten().map(|e| path_size(&e.path())).sum())
+    } else {
+        meta.len()
+    }
+}
+
+fn site_packages(cfg: &AppConfig) -> PathBuf {
+    cfg.python_dir().join("Lib").join("site-packages")
+}
+
+/// Qwen3 model folders in our HF cache (`hub` and the `.locks` of partial downloads)
+fn qwen3_model_dirs(cfg: &AppConfig) -> Vec<PathBuf> {
+    let hub = hf_home(cfg).join("hub");
+    [hub.clone(), hub.join(".locks")]
+        .iter()
+        .flat_map(|dir| std::fs::read_dir(dir).into_iter().flatten().flatten())
+        .map(|e| e.path())
+        .filter(|p| p.file_name().map_or(false, |n| n.to_string_lossy().starts_with("models--Qwen--")))
+        .collect()
+}
+
+/// Collect what every file under `dir` really is (links resolved)
+fn collect_targets(dir: &std::path::Path, out: &mut std::collections::HashSet<PathBuf>) {
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if std::fs::symlink_metadata(&p).map_or(false, |m| m.is_dir()) {
+            collect_targets(&p, out);
+        } else if let Ok(real) = std::fs::canonicalize(&p) {
+            out.insert(real);
+        }
+    }
+}
+
+/// The weight files behind the Qwen3 snapshot links. huggingface_hub 2.x keeps every download
+/// in ONE shared `hub/blobs` store instead of inside each model folder, so deleting the
+/// `models--Qwen--*` folders alone would leave gigabytes behind. A blob another model
+/// (Kokoro) also links to is kept.
+fn qwen3_shared_blobs(cfg: &AppConfig) -> Vec<PathBuf> {
+    let (mut qwen, mut others) = (std::collections::HashSet::new(), std::collections::HashSet::new());
+    for e in std::fs::read_dir(hf_home(cfg).join("hub")).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with("models--") {
+            collect_targets(&e.path().join("snapshots"), if name.starts_with("models--Qwen--") { &mut qwen } else { &mut others });
+        }
+    }
+    // Never delete anything a link resolves to outside our own HF cache
+    let hub = std::fs::canonicalize(hf_home(cfg).join("hub")).ok();
+    qwen.difference(&others)
+        .filter(|p| hub.as_ref().map_or(false, |h| p.starts_with(h)))
+        .filter(|p| !qwen3_model_dirs(cfg).iter().any(|d| std::fs::canonicalize(d).map_or(false, |d| p.starts_with(d))))
+        .cloned()
+        .collect()
+}
+
+/// Package folders of the Qwen3 install that are still on disk
+fn qwen3_package_paths(cfg: &AppConfig) -> Vec<PathBuf> {
+    let sp = site_packages(cfg);
+    QWEN3_PY_PACKAGES
+        .iter()
+        .flat_map(|(_, dirs)| dirs.iter())
+        .map(|d| sp.join(d))
+        .filter(|p| p.exists())
+        .collect()
+}
+
+/// Anything of Qwen3 left on disk (so "Remove Qwen3" also offers itself after an interrupted removal)
+fn qwen3_remnants(cfg: &AppConfig) -> bool {
+    !qwen3_model_dirs(cfg).is_empty()
+        || cfg.data_dir().join(".qwen3_runtime").exists()
+        || !qwen3_package_paths(cfg).is_empty()
+}
+
+/// Sizes for the "Remove Qwen3?" dialog
+#[tauri::command]
+fn qwen3_remove_info(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<serde_json::Value, String> {
+    let cfg = config.lock().map_err(|e| e.to_string())?;
+    let models: u64 = qwen3_model_dirs(&cfg).iter().chain(qwen3_shared_blobs(&cfg).iter()).map(|p| path_size(p)).sum();
+    let packages: u64 = qwen3_package_paths(&cfg).iter().map(|p| path_size(p)).sum();
+    let voices_dir = cfg.voices_dir();
+    let voice_count = std::fs::read_dir(&voices_dir)
+        .map_or(0, |d| d.flatten().filter(|e| e.path().join("meta.json").exists()).count());
+    Ok(serde_json::json!({
+        "models_bytes": models,
+        "package_bytes": packages,
+        "voices_bytes": path_size(&voices_dir),
+        "voice_count": voice_count,
+    }))
+}
+
+/// Remove every Qwen3 voice (built-in and cloned/designed) from Windows SAPI in
+/// ONE operation: a single UAC prompt however many voices there are. Returns how
+/// many voices were removed. Nothing else is touched, so a declined prompt leaves
+/// the PC exactly as it was.
+#[tauri::command]
+fn qwen3_remove_windows_voices() -> Result<usize, String> {
+    use winreg::enums::*;
+    use winreg::RegKey;
+
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let roots = [
+        r"SOFTWARE\Microsoft\Speech\Voices\Tokens",
+        r"SOFTWARE\Microsoft\Speech_OneCore\Voices\Tokens",
+    ];
+    let views: &[u32] = &[KEY_WOW64_64KEY, KEY_WOW64_32KEY];
+
+    // Which tokens exist (reading needs no admin rights)
+    let mut names = std::collections::BTreeSet::new();
+    for root in roots {
+        for &view in views {
+            if let Ok(key) = hklm.open_subkey_with_flags(root, KEY_READ | view) {
+                for n in key.enum_keys().flatten() {
+                    if n.starts_with("VoiceLink_qwen3_") && valid_voice_id(&n) {
+                        names.insert(n);
+                    }
+                }
+            }
+        }
+    }
+    if names.is_empty() {
+        return Ok(0);
+    }
+
+    let has_access = hklm.open_subkey_with_flags(roots[0], KEY_WRITE).is_ok();
+    if has_access {
+        for root in roots {
+            for &view in views {
+                if let Ok(key) = hklm.open_subkey_with_flags(root, KEY_WRITE | view) {
+                    for n in &names {
+                        let _ = key.delete_subkey_all(n);
+                    }
+                }
+            }
+        }
+    } else {
+        let mut ps = Vec::new();
+        for root in roots {
+            for r in [root.to_string(), root.replace(r"SOFTWARE\Microsoft", r"SOFTWARE\WOW6432Node\Microsoft")] {
+                for n in &names {
+                    let path = format!("HKLM:\\{}\\{}", r, n);
+                    ps.push(format!("if (Test-Path -LiteralPath '{0}') {{ Remove-Item -LiteralPath '{0}' -Recurse -Force }}", path));
+                }
+            }
+        }
+        run_elevated_powershell(&ps.join("\n"))?;
+    }
+
+    // Verify instead of trusting the script
+    let left = roots.iter().any(|root| {
+        views.iter().any(|&view| {
+            hklm.open_subkey_with_flags(root, KEY_READ | view)
+                .map_or(false, |k| k.enum_keys().flatten().any(|n| n.starts_with("VoiceLink_qwen3_")))
+        })
+    });
+    if left {
+        return Err("Some Qwen3 voices are still registered in Windows.".to_string());
+    }
+
+    // The Windows default voice must not point at a token that no longer exists
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    if let Ok(key) = hkcu.open_subkey_with_flags(SAPI_VOICES_KEY, KEY_READ | KEY_WRITE) {
+        let token: String = key.get_value("DefaultTokenId").unwrap_or_default();
+        if token.rsplit('\\').next().map_or(false, |leaf| leaf.starts_with("VoiceLink_qwen3_")) {
+            let _ = key.delete_value("DefaultTokenId");
+        }
+    }
+    Ok(names.len())
+}
+
+/// Uninstall the Qwen3 Python packages and delete its model files (and, when asked,
+/// the cloned/designed voices). The server must be stopped first (the app does that):
+/// it holds some of these files open. Safe to run again after an interruption.
+/// Returns the bytes freed.
+#[tauri::command]
+async fn qwen3_remove_files(app: AppHandle, delete_voices: bool) -> Result<u64, String> {
+    let cfg = app.state::<Mutex<AppConfig>>().lock().map_err(|e| e.to_string())?.clone();
+    let blobs = qwen3_shared_blobs(&cfg); // must be found before the folders with the links are gone
+    let before: u64 = qwen3_model_dirs(&cfg).iter().chain(blobs.iter()).chain(qwen3_package_paths(&cfg).iter()).map(|p| path_size(p)).sum::<u64>()
+        + if delete_voices { path_size(&cfg.voices_dir()) } else { 0 };
+
+    // Mark "not installed" first: if this is interrupted the app shows Install, not a broken Ready
+    for marker in [".qwen3_runtime", ".qwen3_ready"] {
+        let _ = std::fs::remove_file(cfg.data_dir().join(marker));
+    }
+
+    // 1. Python packages
+    if cfg.python_exe().exists() && !qwen3_package_paths(&cfg).is_empty() {
+        let mut args: Vec<&str> = vec!["-m", "pip", "uninstall", "-y"];
+        args.extend(QWEN3_PY_PACKAGES.iter().map(|(name, _)| *name));
+        let out = tokio::process::Command::new(cfg.python_exe())
+            .args(&args)
+            .envs(data_env(&cfg))
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .output()
+            .await
+            .map_err(|e| format!("Could not run pip: {}", e))?;
+        if !out.status.success() {
+            return Err(format!(
+                "pip could not uninstall the Qwen3 packages: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+    }
+
+    // 2. Package folders pip left behind (it skips files it cannot delete)
+    let mut stuck: Vec<String> = Vec::new();
+    for p in qwen3_package_paths(&cfg) {
+        let r = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+        if r.is_err() && p.exists() {
+            stuck.push(p.to_string_lossy().to_string());
+        }
+    }
+
+    // 3. Model files: their blobs in the shared store, then the folders named models--Qwen--* in our HF cache
+    for p in &blobs {
+        if std::fs::remove_file(p).is_err() && p.exists() {
+            stuck.push(p.to_string_lossy().to_string());
+        }
+    }
+    for p in qwen3_model_dirs(&cfg) {
+        if std::fs::remove_dir_all(&p).is_err() && p.exists() {
+            stuck.push(p.to_string_lossy().to_string());
+        }
+    }
+
+    // 4. Cloned / designed voices, only on request
+    if delete_voices {
+        let dir = cfg.voices_dir();
+        if std::fs::remove_dir_all(&dir).is_err() && dir.exists() {
+            stuck.push(dir.to_string_lossy().to_string());
+        }
+    }
+
+    clear_pip_scratch(&cfg);
+
+    if !stuck.is_empty() {
+        return Err(format!(
+            "Some files could not be deleted because another program is using them: {}. Close it and press Remove Qwen3 again.",
+            stuck.join(", ")
+        ));
+    }
+    Ok(before)
 }
 
 // ============================================================================
@@ -1928,19 +2322,18 @@ fn setup_mark_deps_installed(config: tauri::State<'_, Mutex<AppConfig>>) -> Resu
     std::fs::write(cfg.data_dir().join(".deps_installed"), DEPS_VERSION)
         .map_err(|e| format!("Failed to write deps marker: {}", e))?;
 
-    // The pip cache (holds the multi-GB torch wheel) and temp files were only
-    // needed for retries during the install. Locked files are skipped.
-    for dir in [cfg.data_dir().join("cache").join("pip"), cfg.data_dir().join("tmp")] {
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for path in entries.flatten().map(|e| e.path()) {
-                let _ = if path.is_dir() {
-                    std::fs::remove_dir_all(&path)
-                } else {
-                    std::fs::remove_file(&path)
-                };
-            }
-        }
-    }
+    // The pip cache holds the multi-GB torch wheel; it was only needed for retries
+    clear_pip_scratch(&cfg);
+    Ok(())
+}
+
+/// Record that the Qwen3 runtime packages are installed
+#[tauri::command]
+fn qwen3_mark_runtime_installed(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<(), String> {
+    let cfg = config.lock().map_err(|e| e.to_string())?;
+    std::fs::write(cfg.data_dir().join(".qwen3_runtime"), QWEN3_RUNTIME_VERSION)
+        .map_err(|e| format!("Failed to write Qwen3 marker: {}", e))?;
+    clear_pip_scratch(&cfg);
     Ok(())
 }
 
@@ -2214,7 +2607,13 @@ fn get_settings(config: tauri::State<'_, Mutex<AppConfig>>) -> Result<serde_json
         "auto_start": cfg.auto_start,
         "qwen3_enabled": cfg.qwen3_enabled,
         "qwen3_model_tier": cfg.qwen3_model_tier,
-        "qwen3_installed": cfg.qwen3_installed,
+        // Ready to use = the Python packages AND this tier's models are on disk
+        "qwen3_installed": qwen3_runtime_ok(&cfg) && qwen3_models_ok(&cfg, &cfg.qwen3_model_tier),
+        "qwen3_runtime_installed": qwen3_runtime_ok(&cfg),
+        "qwen3_models_installed": qwen3_models_ok(&cfg, &cfg.qwen3_model_tier),
+        "qwen3_full_models_installed": qwen3_models_ok(&cfg, "full"),
+        // any piece of Qwen3 on disk, so "Remove Qwen3" also shows after a partial install or removal
+        "qwen3_remnants": qwen3_remnants(&cfg),
     }))
 }
 
@@ -2246,6 +2645,7 @@ fn save_settings(
     }
     if let Some(tier) = qwen3_model_tier {
         cfg.qwen3_model_tier = tier;
+        write_qwen3_tier(&cfg);
     }
     if let Some(installed) = qwen3_installed {
         cfg.qwen3_installed = installed;
@@ -2749,6 +3149,11 @@ pub fn run() {
             setup_run_command,
             setup_install_server,
             setup_mark_deps_installed,
+            qwen3_mark_runtime_installed,
+            qwen3_remove_info,
+            qwen3_remove_windows_voices,
+            qwen3_remove_files,
+            qwen3_save_clone,
             set_setup_tray,
             start_server,
             get_server_log_tail,

@@ -2000,3 +2000,443 @@ body {
   background: var(--border);
   border-radius: 3px;
 }
+
+/* ---- Voice Studio: clone / design forms ---- */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.field-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 190px);
+  gap: 16px;
+}
+
+.field-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.field-tag {
+  margin-left: 6px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.field-hint {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+
+.field-hint strong {
+  color: var(--text-primary);
+}
+
+.clone-form-hint {
+  text-align: right;
+  min-height: 1.45em;
+  margin-top: -8px;
+}
+
+.clone-form textarea,
+.design-form input[type="text"],
+.design-form textarea {
+  width: 100%;
+  background: var(--bg-input);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  font-size: 13px;
+  font-family: inherit;
+  resize: vertical;
+  user-select: text;
+}
+
+.clone-form input[type="text"] {
+  user-select: text;
+}
+
+.clone-form textarea:focus,
+.clone-form select:focus,
+.clone-form input[type="text"]:focus,
+.design-form input[type="text"]:focus,
+.design-form textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+/* Drop zone */
+.drop-zone {
+  position: relative;
+  border: 1.5px dashed var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-input);
+  transition: border-color var(--transition), background var(--transition);
+}
+
+.drop-zone.dragover {
+  border-color: var(--accent);
+  border-style: solid;
+  background: rgba(108, 92, 231, 0.12);
+}
+
+.drop-zone.has-file {
+  border-style: solid;
+}
+
+.drop-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  padding: 22px 16px;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius);
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.drop-empty strong {
+  font-size: 14px;
+  color: var(--text-primary);
+}
+
+.drop-empty svg {
+  color: var(--accent-hover);
+  margin-bottom: 4px;
+  transition: transform var(--transition);
+}
+
+.drop-empty:hover svg,
+.drop-zone.dragover .drop-empty svg {
+  transform: translateY(-2px);
+}
+
+.drop-file {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px 14px;
+}
+
+.drop-file-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.drop-name {
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wave {
+  position: relative;
+  height: 56px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-primary);
+  overflow: hidden;
+}
+
+.wave canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.wave-playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 2px;
+  background: var(--warning);
+  pointer-events: none;
+}
+
+.drop-file audio,
+.voice-result audio {
+  width: 100%;
+  height: 36px;
+  color-scheme: dark;
+}
+
+/* Verdict on the chosen clip */
+.clip-check {
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  line-height: 1.45;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text-secondary);
+}
+
+.clip-check[data-level="ok"] {
+  border-color: rgba(0, 184, 148, 0.5);
+  color: #1ad3a8;
+}
+
+.clip-check[data-level="warn"] {
+  border-color: rgba(253, 203, 110, 0.5);
+  color: var(--warning);
+}
+
+.clip-check[data-level="bad"] {
+  border-color: rgba(231, 76, 60, 0.6);
+  color: #ff7f72;
+}
+
+.tips {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+
+.tips li {
+  position: relative;
+  padding-left: 16px;
+}
+
+.tips li::before {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: 0.55em;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.tips strong {
+  color: var(--text-primary);
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chip {
+  padding: 4px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  transition: all var(--transition);
+}
+
+.chip:hover {
+  color: var(--text-primary);
+  border-color: var(--accent);
+}
+
+/* Busy state while Qwen3 works: a bar that slides back and forth */
+.busy-bar .q3-fill {
+  width: 35%;
+  animation: busySlide 1.6s ease-in-out infinite alternate;
+}
+
+@keyframes busySlide {
+  from { transform: translateX(0); }
+  to { transform: translateX(185%); }
+}
+
+/* Result card of a new voice */
+.voice-result {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  animation: fadeSlideIn 0.3s ease;
+}
+
+.voice-result.saved {
+  border-color: rgba(0, 184, 148, 0.5);
+}
+
+.voice-result-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 10px;
+}
+
+.voice-result-head .clone-temp-name {
+  font-size: 15px;
+}
+
+.voice-result-play {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.voice-result-test {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.voice-result-test input[type="text"] {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg-input);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  font-size: 13px;
+  font-family: inherit;
+  user-select: text;
+}
+
+.voice-result-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.voice-result-note {
+  flex: 1;
+  min-width: 180px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+/* Design tab, Standard tier */
+.locked-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.locked-actions {
+  justify-content: flex-start;
+}
+
+/* Settings: remove Qwen3 */
+.qwen3-remove-row {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.qwen3-remove-row label {
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.modal-wide {
+  width: 460px;
+}
+
+.modal-text {
+  margin-bottom: 14px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+}
+
+.modal-text strong {
+  color: var(--text-primary);
+}
+
+.modal-note {
+  margin: 12px 0 18px;
+}
+
+.check-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.check-row input {
+  margin-top: 3px;
+  accent-color: var(--accent);
+}
+
+/* Keyboard focus for the Voice Studio controls */
+.drop-empty:focus-visible,
+.studio-tab:focus-visible,
+.chip:focus-visible,
+.voice-result .btn:focus-visible,
+.drop-file .btn:focus-visible,
+#btn-clone-create:focus-visible,
+#btn-design-generate:focus-visible,
+#btn-design-switch:focus-visible,
+#btn-remove-qwen3:focus-visible,
+.modal .btn:focus-visible,
+.check-row:focus-within {
+  outline: 2px solid var(--accent-hover);
+  outline-offset: 2px;
+}
+
+.preview-note {
+  padding: 0 16px 14px;
+}
+
+/* The default muted grey is too dim on the card background for text people need to read */
+#page-voice-studio .muted,
+.qwen3-remove-row .muted,
+.modal-note {
+  color: var(--text-secondary);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .busy-bar .q3-fill,
+  .voice-result {
+    animation: none !important;
+  }
+}

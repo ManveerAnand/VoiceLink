@@ -25,3 +25,8 @@ numpy>=1.26.0,<2.0              # Array operations (pinned by kokoro)
 
 # --- Utilities ---
 loguru>=0.7.0                   # Better logging with colors + rotation
+
+# --- Qwen3 (optional) ---
+# Not listed here: the app installs the Qwen3 engine itself from Settings > Qwen3
+# (faster-qwen3-tts and its imports, see QWEN3_RUNTIME_* in gui/src/main.ts).
+# To run the server by hand with Qwen3, install the same packages.

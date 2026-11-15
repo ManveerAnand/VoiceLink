@@ -4,31 +4,38 @@
 #
 # HOW THIS WORKS:
 # 1. Uses faster-qwen3-tts (pip install faster-qwen3-tts) which wraps
-#    Qwen3-TTS with CUDA graph capture for ~6-10x speedup.
+#    Qwen3-TTS with CUDA graph capture for ~6-10x speedup. The app installs it
+#    together with the Qwen3 models (Settings -> Qwen3 / Voice Studio).
 # 2. Supports three modes:
 #    - Built-in voices (9 speakers via CustomVoice model)
-#    - Voice cloning (Base model — clone from 3s audio)
+#    - Voice cloning (Base model — clone from a short reference clip)
 #    - Voice design (VoiceDesign model, 1.7B only — describe a voice)
-# 3. Lazy loaded: model loads on first request, unloads after idle timeout.
-# 4. First inference is slow (~100s) due to CUDA graph capture warmup,
-#    subsequent calls run at ~2x realtime on RTX 4060 Laptop.
+# 3. Lazy loaded: models load on first request, unload after idle timeout.
+# 4. The first inference is slow (CUDA graph capture warmup); later calls
+#    run at roughly realtime.
 #
 # QWEN3-TTS ARCHITECTURE:
 #   Text + Speaker → Qwen3-TTS LM → Discrete Codes → Tokenizer-12Hz → Audio
 #   - Tokenizer-12Hz: 12.5 Hz, 16-layer multi-codebook codec
 #   - Output: 24kHz audio (same as Kokoro — no resampling needed)
 #
-# MODEL VARIANTS:
-#   0.6B-Base: 9 built-in speakers, ~1.2 GB
-#   0.6B-CustomVoice: Voice cloning via 3s audio reference
-#   1.7B-Base: Same 9 speakers, higher quality
-#   1.7B-CustomVoice: Better voice cloning
-#   1.7B-VoiceDesign: Text-described voice generation
+# MODEL VARIANTS (Standard tier = 0.6B, Full tier = 1.7B):
+#   *-CustomVoice: the built-in speakers
+#   *-Base:        voice cloning from a reference clip
+#   1.7B-VoiceDesign: text-described voice generation (Full tier only)
 #
 # BUILT-IN SPEAKERS (from CustomVoice model):
 #   English-friendly: Serena, Aiden, Dylan, Eric, Ryan, Vivian
 #   Other: ono_anna, sohee, uncle_fu
 #   We expose the 6 English speakers for VoiceLink.
+#
+# STATIC KV CACHE LIMIT:
+#   faster-qwen3-tts decodes into a static cache of max_seq_len = 2048
+#   positions: prompt (text + reference-clip codes) + generated codec frames
+#   (12.5 per second of audio). A prompt longer than that raises an error and
+#   a decode that reaches it is cut off silently. Text is therefore generated
+#   in chunks of at most MAX_CHUNK_CHARS (about 20 s of speech, ~250 frames),
+#   and cloning references are limited to 60 s (see routers/qwen3.py).
 # ============================================================================
 
 import os
@@ -38,18 +45,43 @@ import json
 import threading
 import numpy as np
 import torch
-from typing import Generator
+from typing import Callable, Generator
 from pathlib import Path
 from loguru import logger
 
-from faster_qwen3_tts import FasterQwen3TTS
-from server.models.base import TTSModel, VoiceInfo
+from server.models.base import GPU_EXCLUSIVE_LOCK, TTSModel, VoiceInfo, Qwen3Error
+
+
+def _faster_qwen3():
+    """Import the runtime lazily so a missing package is a clear message, not a 500 traceback."""
+    try:
+        from faster_qwen3_tts import FasterQwen3TTS
+    except ImportError as e:
+        raise Qwen3Error(
+            f"The Qwen3 voice engine is not installed (missing Python package '{e.name or e}'). "
+            "Open Settings > Qwen3 and press Install."
+        ) from e
+    return FasterQwen3TTS
+
+
+def _local_model_path(model_id: str) -> str:
+    """Folder of a downloaded model; never starts a surprise multi-GB download."""
+    from huggingface_hub import snapshot_download
+    try:
+        return snapshot_download(model_id, local_files_only=True)
+    except Exception as e:
+        raise Qwen3Error(
+            f"The Qwen3 model {model_id} is not downloaded. Open Settings > Qwen3 and download the models."
+        ) from e
 
 
 # --- Sentence / Paragraph Splitting ---
-# Split on sentence-ending punctuation followed by whitespace.
+# Split on sentence-ending punctuation followed by whitespace (or CJK ones).
 # Only split on . ! ? — NOT on ; or : which often appear mid-sentence.
-_SENTENCE_RE = re.compile(r'(?<=[.!?])\s+')
+_SENTENCE_RE = re.compile(r'(?<=[.!?])\s+|(?<=[。！？])')
+
+# Longest piece sent to the model in one call (see "STATIC KV CACHE LIMIT" above)
+MAX_CHUNK_CHARS = 300
 
 # Crossfade samples between sentences (~10ms at 24kHz)
 _CROSSFADE_SAMPLES = 256
@@ -66,8 +98,25 @@ class _Chunk:
         self.is_para_start = is_para_start
 
 
+def _wrap(s: str, limit: int = MAX_CHUNK_CHARS) -> list[str]:
+    """Break an over-long sentence at a clause boundary, else a space, else mid-word."""
+    out: list[str] = []
+    while len(s) > limit:
+        window = s[:limit]
+        cut = max(window.rfind(", "), window.rfind("; "), window.rfind(": "))
+        if cut < limit // 2:
+            cut = window.rfind(" ")
+        if cut <= 0:  # no spaces at all (e.g. Chinese without punctuation)
+            cut = limit - 1
+        out.append(s[:cut + 1].strip())
+        s = s[cut + 1:].strip()
+    if s:
+        out.append(s)
+    return out
+
+
 def _split_sentences(text: str) -> list[_Chunk]:
-    """Split text into sentences, preserving paragraph boundaries.
+    """Split text into chunks of at most MAX_CHUNK_CHARS, preserving paragraph boundaries.
 
     Paragraph breaks (\\n\\n or more) insert a longer silence gap.
     Within a paragraph, sentences are crossfaded together.
@@ -101,7 +150,8 @@ def _split_sentences(text: str) -> list[_Chunk]:
         if not merged:
             merged = [para]
 
-        for sent_idx, sent in enumerate(merged):
+        pieces = [p for s in merged for p in _wrap(s)]
+        for sent_idx, sent in enumerate(pieces):
             is_para_start = (sent_idx == 0 and para_idx > 0)
             chunks.append(_Chunk(sent, is_para_start))
 
@@ -200,88 +250,90 @@ class Qwen3Model(TTSModel):
         """
         self._tier = tier
         self._device = device
-        self._cv_model = None     # FasterQwen3TTS CustomVoice (built-in speakers)
-        self._base_model_inst = None  # FasterQwen3TTS Base (voice cloning)
+        self._models: dict[str, object] = {}  # kind ("custom" | "base" | "design") -> FasterQwen3TTS
         self._loaded = False
         self._last_used = 0.0
         self._idle_timer: threading.Timer | None = None
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()      # guards loading / unloading
+        self._gen_lock = threading.Lock()  # one generation at a time: the CUDA graphs are shared
         self._sample_rate = 24000  # Updated from model on load
 
         # Model IDs based on tier
         if tier == "full":
-            self._base_model = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
-            self._custom_model = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
-            self._design_model = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+            self._model_ids = {
+                "base": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+                "custom": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+                "design": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+            }
         else:
-            self._base_model = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
-            self._custom_model = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
-            self._design_model = None  # VoiceDesign only available in 1.7B
-
-        self._tokenizer_model = "Qwen/Qwen3-TTS-Tokenizer-12Hz"
+            self._model_ids = {
+                "base": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+                "custom": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+                "design": None,  # VoiceDesign only exists as 1.7B
+            }
 
         # User-created voice profiles directory
         self._voices_dir = Path(
             os.environ.get("VOICELINK_DATA_DIR", r"C:\ProgramData\VoiceLink")
         ).joinpath("voices")
 
+    def _get(self, kind: str):
+        """The loaded model of this kind, loading it first.
+
+        On the Full tier the 1.7B models (~4 GB each) can't sit side by side on
+        an 8 GB card, so loading one drops the others.
+        """
+        with self._lock:
+            model = self._models.get(kind)
+            if model is not None:
+                return model
+
+            model_id = self._model_ids[kind]
+            if model_id is None:
+                raise Qwen3Error(
+                    "Voice design needs the Full (1.7B) Qwen3 tier. Switch to it in Settings > Qwen3.",
+                    status_code=400,
+                )
+            fq = _faster_qwen3()
+            if not torch.cuda.is_available():
+                raise Qwen3Error(
+                    "Qwen3 needs an NVIDIA GPU, but this server's PyTorch cannot use one "
+                    "(the CPU build of PyTorch is installed). Open Settings > Qwen3 and press Install to fix it."
+                )
+            path = _local_model_path(model_id)
+
+            if self._tier == "full" and self._models:
+                self._models.clear()
+                torch.cuda.empty_cache()
+
+            logger.info(f"Loading Qwen3 {kind} model {model_id} on {self._device}...")
+            t0 = time.perf_counter()
+            # Kokoro waits while this runs (see GPU_EXCLUSIVE_LOCK); capturing the CUDA graphs
+            # here, not on the first request, keeps that wait inside the load
+            with GPU_EXCLUSIVE_LOCK:
+                model = fq.from_pretrained(path, device=self._device)
+                model.warmup()
+            logger.info(f"Qwen3 {kind} model loaded in {time.perf_counter() - t0:.1f}s "
+                        "(the first generation also captures CUDA graphs and is slower)")
+            self._models[kind] = model
+            self._loaded = True
+            self._sample_rate = getattr(model, "sample_rate", 24000)
+            return model
+
     def load(self) -> None:
         """Load the CustomVoice model (built-in speakers) with CUDA graphs."""
-        with self._lock:
-            if self._loaded:
-                logger.debug("Qwen3 already loaded, skipping.")
-                return
-
-            logger.info(f"Loading FasterQwen3TTS CustomVoice ({self._tier}) on {self._device}...")
-            t0 = time.perf_counter()
-
-            try:
-                self._cv_model = FasterQwen3TTS.from_pretrained(
-                    self._custom_model,
-                )
-                self._loaded = True
-                self._last_used = time.time()
-
-                elapsed = time.perf_counter() - t0
-                logger.info(f"FasterQwen3TTS CustomVoice loaded in {elapsed:.1f}s")
-                logger.info("Note: First TTS call will be slow (~100s) for CUDA graph capture.")
-
-            except Exception as e:
-                logger.error(f"Failed to load FasterQwen3TTS: {e}")
-                raise
-
-    def _ensure_base_loaded(self):
-        """Lazy-load the Base model for voice cloning with CUDA graphs."""
-        if self._base_model_inst is not None:
-            return
-
-        logger.info(f"Loading FasterQwen3TTS Base ({self._tier}) for voice cloning...")
-        t0 = time.perf_counter()
-        self._base_model_inst = FasterQwen3TTS.from_pretrained(
-            self._base_model,
-        )
-        elapsed = time.perf_counter() - t0
-        logger.info(f"FasterQwen3TTS Base loaded in {elapsed:.1f}s")
-        logger.info("Note: First clone call will be slow (~100s) for CUDA graph capture.")
+        self._get("custom")
+        self._touch()
 
     def unload(self) -> None:
         """Release all Qwen3-TTS models from GPU memory."""
         with self._lock:
-            unloaded = []
-            if self._cv_model is not None:
-                del self._cv_model
-                self._cv_model = None
-                unloaded.append("CustomVoice")
-            if self._base_model_inst is not None:
-                del self._base_model_inst
-                self._base_model_inst = None
-                unloaded.append("Base")
-
+            unloaded = list(self._models)
+            self._models.clear()
             self._loaded = False
 
             if unloaded:
                 try:
-                    import torch
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
                 except Exception:
@@ -311,49 +363,24 @@ class Qwen3Model(TTSModel):
     def _idle_unload(self):
         """Called by the timer when idle timeout expires."""
         elapsed = time.time() - self._last_used
-        if elapsed >= IDLE_TIMEOUT_SECS:
+        if elapsed >= IDLE_TIMEOUT_SECS and not self._gen_lock.locked():
             logger.info(f"Qwen3-TTS idle for {elapsed:.0f}s, unloading to free GPU...")
             self.unload()
         else:
-            # Race condition: request came in just before timer fired
+            # A request came in just before the timer fired (or is still generating)
             self._reset_idle_timer()
 
-    def _ensure_loaded(self):
-        """Lazy load: ensure the model is in memory before use."""
-        if not self._loaded:
-            self.load()
-        self._touch()
-
-    def synthesize(
+    def _stream_chunks(
         self,
         text: str,
-        voice: str | None = None,
-        speed: float = 1.0,
-        language: str = "auto",
+        generate: Callable[[str, int], tuple],
     ) -> Generator[bytes, None, None]:
         """
-        Synthesize text to speech using a Qwen3 built-in speaker.
-        Splits long text into sentences, generates each with full-context
-        decode, and crossfades between them for seamless audio.
+        Split text into chunks, generate each with `generate(chunk_text, max_tokens)`
+        and crossfade between them for seamless audio. One generation at a time.
         """
-        self._ensure_loaded()
-
-        if self._cv_model is None:
-            raise RuntimeError("Qwen3 CustomVoice model failed to load.")
-
-        # Parse voice ID: "qwen3_serena" -> speaker="serena"
-        if voice and voice.startswith("qwen3_"):
-            speaker = voice[6:]  # Strip "qwen3_" prefix
-        else:
-            speaker = "serena"  # Default English speaker
-
-        # Resolve language — capitalize for Qwen3 API (e.g. "english" -> "English")
-        lang = language.strip().capitalize() if language and language != "auto" else "Auto"
-
         sentences = _split_sentences(text)
-        logger.info(f"Qwen3 TTS: speaker={speaker}, lang={lang}, text_len={len(text)}, sentences={len(sentences)}")
-
-        try:
+        with self._gen_lock:
             prev_tail: np.ndarray | None = None
             cf = _CROSSFADE_SAMPLES
             fade_out = np.linspace(1.0, 0.0, cf, dtype=np.float32)
@@ -365,25 +392,14 @@ class Qwen3Model(TTSModel):
                     pcm = self._audio_to_pcm(prev_tail)
                     if pcm:
                         yield pcm
-                    # Insert paragraph silence gap
                     silence = np.zeros(_PARAGRAPH_SILENCE_SAMPLES, dtype=np.float32)
                     yield self._audio_to_pcm(silence)
                     prev_tail = None
 
                 t0 = time.perf_counter()
-                wavs, sample_rate = self._cv_model.generate_custom_voice(
-                    text=chunk.text,
-                    speaker=speaker,
-                    language=lang,
-                    temperature=0.7,
-                    top_p=0.9,
-                    top_k=50,
-                    repetition_penalty=1.1,
-                    max_new_tokens=_estimate_max_tokens(chunk.text),
-                )
+                wavs, sample_rate = generate(chunk.text, _estimate_max_tokens(chunk.text))
                 self._sample_rate = sample_rate
-                elapsed = time.perf_counter() - t0
-                logger.debug(f"  sentence {i+1}/{len(sentences)}: {len(chunk.text)} chars in {elapsed:.2f}s")
+                logger.debug(f"  sentence {i+1}/{len(sentences)}: {len(chunk.text)} chars in {time.perf_counter() - t0:.2f}s")
 
                 audio = np.asarray(wavs[0], dtype=np.float32).flatten()
                 if audio.size == 0:
@@ -398,14 +414,47 @@ class Qwen3Model(TTSModel):
                     prev_tail = audio[-cf:].copy()
                     pcm = self._audio_to_pcm(audio[:-cf])
                 else:
-                    if prev_tail is not None and i == len(sentences) - 1:
-                        pass  # already blended above, emit full
                     prev_tail = None
                     pcm = self._audio_to_pcm(audio)
 
                 if pcm:
                     yield pcm
 
+    def synthesize(
+        self,
+        text: str,
+        voice: str | None = None,
+        speed: float = 1.0,
+        language: str = "auto",
+    ) -> Generator[bytes, None, None]:
+        """Synthesize text to speech using a Qwen3 built-in speaker."""
+        model = self._get("custom")
+        self._touch()
+
+        # Parse voice ID: "qwen3_serena" -> speaker="serena"
+        if voice and voice.startswith("qwen3_"):
+            speaker = voice[6:]  # Strip "qwen3_" prefix
+        else:
+            speaker = "serena"  # Default English speaker
+
+        # Resolve language — capitalize for Qwen3 API (e.g. "english" -> "English")
+        lang = language.strip().capitalize() if language and language != "auto" else "Auto"
+        logger.info(f"Qwen3 TTS: speaker={speaker}, lang={lang}, text_len={len(text)}")
+
+        def generate(chunk_text: str, max_tokens: int):
+            return model.generate_custom_voice(
+                text=chunk_text,
+                speaker=speaker,
+                language=lang,
+                temperature=0.7,
+                top_p=0.9,
+                top_k=50,
+                repetition_penalty=1.1,
+                max_new_tokens=max_tokens,
+            )
+
+        try:
+            yield from self._stream_chunks(text, generate)
         except Exception as e:
             logger.error(f"Qwen3 synthesis failed: {e}")
             raise
@@ -417,82 +466,39 @@ class Qwen3Model(TTSModel):
         ref_text: str,
         speed: float = 1.0,
         language: str = "auto",
+        xvec_only: bool = False,
     ) -> Generator[bytes, None, None]:
         """
         Synthesize text using a cloned voice (Base model + generate_voice_clone).
-        Splits long text into sentences, generates each with full-context
-        decode, and crossfades between them for seamless audio.
 
-        Uses full in-context learning (xvec_only=False) to preserve the original
-        voice's character, accent, and speaking style from the reference audio.
+        By default uses full in-context learning (xvec_only=False): the reference
+        clip and its exact transcript are fed to the model, which preserves the
+        voice's character, accent and speaking style best. With xvec_only=True
+        only a speaker embedding is used: no transcript needed, but the clone
+        is less faithful.
         """
-        self._ensure_loaded()
-        self._ensure_base_loaded()
+        model = self._get("base")
+        self._touch()
 
-        if self._base_model_inst is None:
-            raise RuntimeError("Qwen3 Base model failed to load.")
-
-        # Resolve language
         lang = language.strip().capitalize() if language and language != "auto" else "Auto"
+        logger.info(f"Qwen3 clone TTS: ref={ref_audio_path}, xvec_only={xvec_only}, lang={lang}, text_len={len(text)}")
 
-        sentences = _split_sentences(text)
-        logger.info(f"Qwen3 clone TTS: ref={ref_audio_path}, lang={lang}, text_len={len(text)}, sentences={len(sentences)}")
+        def generate(chunk_text: str, max_tokens: int):
+            return model.generate_voice_clone(
+                text=chunk_text,
+                language=lang,
+                ref_audio=ref_audio_path,
+                ref_text=ref_text,
+                xvec_only=xvec_only,
+                max_new_tokens=max_tokens,
+                temperature=0.6,
+                top_p=0.85,
+                top_k=50,
+                repetition_penalty=1.2,
+            )
 
         try:
-            prev_tail: np.ndarray | None = None
-            cf = _CROSSFADE_SAMPLES
-            fade_out = np.linspace(1.0, 0.0, cf, dtype=np.float32)
-            fade_in  = np.linspace(0.0, 1.0, cf, dtype=np.float32)
-
-            for i, chunk in enumerate(sentences):
-                # At paragraph boundary: flush previous tail + insert silence
-                if chunk.is_para_start and prev_tail is not None:
-                    pcm = self._audio_to_pcm(prev_tail)
-                    if pcm:
-                        yield pcm
-                    silence = np.zeros(_PARAGRAPH_SILENCE_SAMPLES, dtype=np.float32)
-                    yield self._audio_to_pcm(silence)
-                    prev_tail = None
-
-                max_tokens = _estimate_max_tokens(chunk.text)
-                t0 = time.perf_counter()
-                wavs, sample_rate = self._base_model_inst.generate_voice_clone(
-                    text=chunk.text,
-                    language=lang,
-                    ref_audio=ref_audio_path,
-                    ref_text=ref_text,
-                    xvec_only=False,
-                    max_new_tokens=max_tokens,
-                    temperature=0.6,
-                    top_p=0.85,
-                    top_k=50,
-                    repetition_penalty=1.2,
-                )
-                self._sample_rate = sample_rate
-                elapsed = time.perf_counter() - t0
-                logger.debug(f"  sentence {i+1}/{len(sentences)}: {len(chunk.text)} chars in {elapsed:.2f}s")
-
-                audio = np.asarray(wavs[0], dtype=np.float32).flatten()
-                if audio.size == 0:
-                    continue
-
-                # Crossfade with previous sentence tail (within same paragraph)
-                if prev_tail is not None and audio.size >= cf:
-                    audio[:cf] = prev_tail * fade_out + audio[:cf] * fade_in
-
-                # Hold back tail for crossfade with next sentence
-                if i < len(sentences) - 1 and audio.size > cf:
-                    prev_tail = audio[-cf:].copy()
-                    pcm = self._audio_to_pcm(audio[:-cf])
-                else:
-                    if prev_tail is not None and i == len(sentences) - 1:
-                        pass  # already blended above, emit full
-                    prev_tail = None
-                    pcm = self._audio_to_pcm(audio)
-
-                if pcm:
-                    yield pcm
-
+            yield from self._stream_chunks(text, generate)
         except Exception as e:
             logger.error(f"Qwen3 clone synthesis failed: {e}")
             raise
@@ -503,21 +509,27 @@ class Qwen3Model(TTSModel):
         sample_text: str = "Hello, this is a test of my designed voice.",
     ) -> bytes:
         """
-        Design a voice from a text description (1.7B VoiceDesign model only).
-        Returns raw PCM audio of the sample text spoken in the designed voice.
+        Design a voice from a text description (1.7B VoiceDesign model, Full tier only).
+        Returns raw 16-bit PCM of the sample text spoken in the designed voice.
         """
-        if self._design_model is None:
-            raise RuntimeError("Voice design requires the Full (1.7B) model tier.")
-
-        self._ensure_loaded()
-
-        # For voice design, we'd need a separate VoiceDesign model instance.
-        # For now, raise if someone tries this without the full tier.
+        model = self._get("design")
+        self._touch()
         logger.info(f"Qwen3 voice design: desc={description[:80]}")
 
         try:
-            # Voice design would need its own model loaded from self._design_model
-            raise NotImplementedError("Voice design is not yet implemented.")
+            with self._gen_lock:
+                wavs, sample_rate = model.generate_voice_design(
+                    text=sample_text,
+                    instruct=description,
+                    language="Auto",
+                    temperature=0.7,
+                    top_p=0.9,
+                    top_k=50,
+                    repetition_penalty=1.1,
+                    max_new_tokens=_estimate_max_tokens(sample_text),
+                )
+            self._sample_rate = sample_rate
+            return self._audio_to_pcm(wavs[0])
         except Exception as e:
             logger.error(f"Qwen3 voice design failed: {e}")
             raise
@@ -547,6 +559,8 @@ class Qwen3Model(TTSModel):
                     try:
                         with open(meta_path) as f:
                             meta = json.load(f)
+                        if not meta.get("saved", True):
+                            continue
                         source = meta.get("source", "cloned")
                         voices.append(VoiceInfo(
                             id=f"qwen3_custom_{profile_dir.name}",

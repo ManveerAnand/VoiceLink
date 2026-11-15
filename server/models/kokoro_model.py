@@ -32,7 +32,7 @@ import numpy as np
 from typing import Generator
 from loguru import logger
 
-from server.models.base import TTSModel, VoiceInfo, VoiceUnavailableError
+from server.models.base import GPU_EXCLUSIVE_LOCK, TTSModel, VoiceInfo, VoiceUnavailableError
 
 
 # --- Kokoro Voice Catalog ---
@@ -350,7 +350,7 @@ class KokoroModel(TTSModel):
         chunk_index = 0
         results = self._pipeline(_split_first_sentence(text), voice=voice, speed=speed)
         while True:
-            with self._lock:  # one chunk of inference at a time
+            with self._lock, GPU_EXCLUSIVE_LOCK:  # one chunk of inference at a time, not while Qwen3 loads
                 result = next(results, None)
             if result is None:
                 break
