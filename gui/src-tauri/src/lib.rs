@@ -1482,7 +1482,10 @@ fn qwen3_shared_blobs(cfg: &AppConfig) -> Vec<PathBuf> {
             collect_targets(&e.path().join("snapshots"), if name.starts_with("models--Qwen--") { &mut qwen } else { &mut others });
         }
     }
+    // Never delete anything a link resolves to outside our own HF cache
+    let hub = std::fs::canonicalize(hf_home(cfg).join("hub")).ok();
     qwen.difference(&others)
+        .filter(|p| hub.as_ref().map_or(false, |h| p.starts_with(h)))
         .filter(|p| !qwen3_model_dirs(cfg).iter().any(|d| std::fs::canonicalize(d).map_or(false, |d| p.starts_with(d))))
         .cloned()
         .collect()
