@@ -167,6 +167,28 @@ def _split_first_sentence(text: str) -> str:
     return text
 
 
+# Segments for synthesize_segments(): one sentence each (shorter ones are joined to the
+# next), so a segment is a few seconds of audio and the SAPI bridge's word timing is
+# exact at every segment edge instead of drifting over a long text.
+_SEGMENT_BREAK = re.compile(r"[.!?]+[\"')\]]*\s+(?=\S)|\s*\n\s*")
+_MIN_SEGMENT_CHARS = 30
+_MAX_SEGMENT_CHARS = 300
+
+
+def _segment_ends(text: str) -> list[int]:
+    """End index (in `text`) of each segment; the last one is len(text)."""
+    ends, start = [], 0
+    for cut in [m.end() for m in _SEGMENT_BREAK.finditer(text)] + [len(text)]:
+        while cut - start > _MAX_SEGMENT_CHARS:
+            wrap = text.rfind(" ", start + _MAX_SEGMENT_CHARS // 2, start + _MAX_SEGMENT_CHARS)
+            start = wrap + 1 if wrap > 0 else start + _MAX_SEGMENT_CHARS
+            ends.append(start)
+        if cut > start and (cut - start >= _MIN_SEGMENT_CHARS or cut == len(text)):
+            ends.append(cut)
+            start = cut
+    return ends
+
+
 def _build_kmodel(device: str):
     """
     Build Kokoro's acoustic model directly on `device`, without the memory spike.
@@ -376,6 +398,23 @@ class KokoroModel(TTSModel):
             yield pcm_bytes
 
         logger.debug(f"Synthesis complete: {chunk_index} chunks yielded.")
+
+    def synthesize_segments(
+        self,
+        text: str,
+        voice: str | None = None,
+        speed: float = 1.0,
+    ) -> Generator[tuple[int, bytes], None, None]:
+        """
+        Like synthesize(), but yields (end, pcm) per segment: `pcm` is the exact audio of
+        the text up to `end`, counted in UTF-16 units (what Windows/SAPI counts) from the
+        previous segment's end. Lets a client place word timings against real audio lengths.
+        """
+        start = units = 0
+        for end in _segment_ends(text):
+            units += len(text[start:end].encode("utf-16-le")) // 2
+            yield units, b"".join(self.synthesize(text[start:end], voice, speed))
+            start = end
 
     def release_cache(self) -> None:
         """Hand the GPU memory PyTorch cached for the last request back to the driver."""

@@ -647,7 +647,7 @@ async function loadVoices() {
 /** Re-draw everything that shows voices outside the Voice Manager grid */
 function refreshVoiceViews() {
   testPicker?.setVoices(currentVoices.filter((v) => registeredVoiceIds.has(v.id)));
-  narratePicker?.setVoices(currentVoices.filter((v) => v.id.startsWith("qwen3_")));
+  refreshNarrateVoices();
   renderFavorites();
   updateRestoreCard();
 }
@@ -975,7 +975,8 @@ for v in ${JSON.stringify(kokoro)}:
 // ============================================================================
 
 interface VoicePicker {
-  setVoices(voices: VoiceInfo[]): void;
+  /** `preferred` is picked when the current choice isn't in the list (else the first voice) */
+  setVoices(voices: VoiceInfo[], preferred?: string): void;
   readonly value: string;
 }
 
@@ -984,7 +985,7 @@ interface VoicePicker {
  * option via aria-activedescendant). Listeners are added once here; setVoices
  * only re-draws the list contents.
  */
-function createVoicePicker(host: HTMLElement, label: string): VoicePicker {
+function createVoicePicker(host: HTMLElement, label: string, onChange?: (id: string) => void): VoicePicker {
   const uid = host.id;
   host.innerHTML = `
     <button type="button" class="vp-trigger" role="combobox" aria-haspopup="listbox" aria-expanded="false" aria-controls="${uid}-list" aria-label="${label}">
@@ -1058,6 +1059,7 @@ function createVoicePicker(host: HTMLElement, label: string): VoicePicker {
       value = flat[i].id;
       current.textContent = displayVoiceName(flat[i].name);
       renderList();
+      onChange?.(value);
     }
     close();
   }
@@ -1103,12 +1105,13 @@ function createVoicePicker(host: HTMLElement, label: string): VoicePicker {
   });
 
   return {
-    setVoices(vs) {
+    setVoices(vs, preferred) {
       voices = vs;
-      if (!vs.some((v) => v.id === value)) value = vs[0]?.id ?? "";
+      if (!vs.some((v) => v.id === value)) value = (vs.some((v) => v.id === preferred) ? preferred : vs[0]?.id) ?? "";
       current.textContent = vs.length ? displayVoiceName(vs.find((v) => v.id === value)!.name) : "No voices";
       renderList();
       if (isOpen()) setActive(active);
+      onChange?.(value);
     },
     get value() {
       return value;
@@ -1124,7 +1127,7 @@ function setupQuickTest() {
   const testHost = document.getElementById("test-voice");
   if (testHost) testPicker = createVoicePicker(testHost, "Voice");
   const narrateHost = document.getElementById("narrate-voice");
-  if (narrateHost) narratePicker = createVoicePicker(narrateHost, "Voice");
+  if (narrateHost) narratePicker = createVoicePicker(narrateHost, "Voice", syncNarrateLanguage);
 
   document.getElementById("btn-manage-voices")?.addEventListener("click", () => {
     document.querySelector<HTMLElement>('.nav-item[data-page="voices"]')?.click();
@@ -1924,7 +1927,6 @@ async function setupQwen3Settings(settings: AppSettings | null) {
       const newSettings = await invoke<AppSettings>("get_settings");
       updateQwen3StatusBadge(statusBadge, newSettings);
       updateStudioView(newSettings);
-      document.getElementById("nav-narrate")?.classList.toggle("hidden", !(newSettings.qwen3_enabled && newSettings.qwen3_installed));
     } catch (e) {
       console.error("Failed to save Qwen3 setting:", e);
       qwen3Toggle.checked = !qwen3Toggle.checked;
@@ -2679,10 +2681,33 @@ let narrateStartTime = 0;
 let narrateOffset = 0;
 let narratePlaying = false;
 let narrateRafId = 0;
+let narrateQwen3Ok = false; // Qwen3 voices are offered only when it is enabled and installed
+
+/** Kokoro voices (plus Qwen3's when usable); starts on the default / a favorite Kokoro voice */
+function refreshNarrateVoices() {
+  const vs = currentVoices.filter((v) => v.model !== "qwen3" || narrateQwen3Ok);
+  const preferred = [defaultVoice.id, ...favoriteIds].find((id) => vs.some((v) => v.id === id && v.model !== "qwen3"));
+  narratePicker?.setVoices(vs, preferred ?? undefined);
+}
+
+/** Language only applies to Qwen3; a Kokoro voice carries its own language */
+function syncNarrateLanguage(voiceId: string) {
+  const qwen3 = voiceId.startsWith("qwen3_");
+  const select = document.getElementById("narrate-language") as HTMLSelectElement | null;
+  if (select) select.disabled = !qwen3;
+  document.getElementById("narrate-language-hint")?.classList.toggle("hidden", qwen3);
+}
 
 /** Runs on every visit to the Narrate page: refresh the voice list, wire listeners once */
 function setupNarratePage() {
-  narratePicker?.setVoices(currentVoices.filter((v) => v.id.startsWith("qwen3_")));
+  refreshNarrateVoices();
+  if (!voicesLoaded) loadVoices();
+  invoke<AppSettings>("get_settings")
+    .then((s) => {
+      narrateQwen3Ok = s.qwen3_enabled && s.qwen3_installed;
+      refreshNarrateVoices();
+    })
+    .catch(console.error);
   if (narrateWired) return;
   narrateWired = true;
 
@@ -2745,12 +2770,9 @@ function setupNarratePage() {
     narrateStopPlayback();
 
     try {
-      const pcmBytes = await invoke<number[]>("qwen3_narrate", {
-        voiceId,
-        text,
-        language,
-        speed,
-      });
+      const pcmBytes = voiceId.startsWith("qwen3_")
+        ? await invoke<number[]>("qwen3_narrate", { voiceId, text, language, speed })
+        : await invoke<number[]>("kokoro_narrate", { voiceId, text, speed });
 
       if (progressBar) progressBar.style.width = "100%";
       if (statusEl) statusEl.textContent = "Done!";

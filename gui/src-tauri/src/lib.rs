@@ -544,6 +544,38 @@ async fn preview_voice(voice_id: String, text: String) -> Result<Vec<u8>, String
     Ok(bytes.to_vec())
 }
 
+/// Narrate long text with a Kokoro voice (the whole text, generated before it is returned)
+#[tauri::command]
+async fn kokoro_narrate(voice_id: String, text: String, speed: f64) -> Result<Vec<u8>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let body = serde_json::json!({
+        "text": text,
+        "voice": voice_id,
+        "speed": speed,
+        "format": "pcm_24k_16bit"
+    });
+
+    let resp = client
+        .post("http://127.0.0.1:7860/v1/tts")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Server error: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Narration failed ({}): {}", status, body));
+    }
+
+    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    Ok(bytes.to_vec())
+}
+
 /// Get list of voice IDs currently registered in SAPI registry
 #[tauri::command]
 fn get_registered_voice_ids() -> Result<Vec<String>, String> {
@@ -2701,6 +2733,7 @@ pub fn run() {
             qwen3_design_voice,
             qwen3_preview_voice,
             qwen3_narrate,
+            kokoro_narrate,
             save_wav_file,
             qwen3_get_status,
             cancel_qwen3_download,

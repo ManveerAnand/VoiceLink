@@ -40,6 +40,7 @@
 #include <vector>    // for volume scaling buffer
 #include <cstdint>   // int16_t
 #include <cwctype>   // iswspace (word boundary parsing)
+#include <cstring>   // memcpy (frame header parsing)
 
 // True when the host process is a Chromium browser (decided once, see rate mapping).
 static bool HostIsChromium()
@@ -465,12 +466,23 @@ STDMETHODIMP VoiceLinkEngine::Speak(
         ULONG charPos;  // Character offset in original input text
         ULONG charLen;  // Word length in characters
         bool sentStart; // Is this the first word of a sentence?
+        ULONG extPos;   // Offset in the text sent to the server (UTF-16 units), see ExtractText
     };
     std::vector<WordBoundary> wordBoundaries;
     ULONG totalTextChars = 0; // Total character span of all fragments
+    ULONG extBase = 0;        // Where this fragment starts in the text ExtractText builds
 
     for (const SPVTEXTFRAG *frag = pTextFragList; frag; frag = frag->pNext)
     {
+        const ULONG extOff = extBase;
+        if (frag->pTextStart && frag->ulTextLen > 0)
+        {
+            if (frag->State.eAction == SPVA_Speak)
+                extBase += frag->ulTextLen + 1; // text + the space ExtractText adds
+            else if (frag->State.eAction == SPVA_SpellOut)
+                extBase += frag->ulTextLen * 3; // each char becomes "c. "
+        }
+
         if (frag->State.eAction != SPVA_Speak || !frag->pTextStart || frag->ulTextLen == 0)
             continue;
 
@@ -495,7 +507,7 @@ STDMETHODIMP VoiceLinkEngine::Speak(
             while (i < len && !std::iswspace(t[i]))
                 i++;
 
-            wordBoundaries.push_back({baseOff + ws, i - ws, nextIsSentStart});
+            wordBoundaries.push_back({baseOff + ws, i - ws, nextIsSentStart, extOff + ws});
             nextIsSentStart = false;
 
             // Check if this word ends with sentence-ending punctuation
@@ -521,7 +533,9 @@ STDMETHODIMP VoiceLinkEngine::Speak(
     // -----------------------------------------------------------------------
     // Step 3: Build the JSON request for the inference server
     // -----------------------------------------------------------------------
-    std::string jsonBody = BuildTtsRequestJson(textUtf8, m_voiceId, speed);
+    // Kokoro can send the audio in per-sentence frames (real length of each sentence),
+    // which makes the word highlighting exact at any speed and text length.
+    std::string jsonBody = BuildTtsRequestJson(textUtf8, m_voiceId, speed, m_model != "qwen3");
 
     // Choose endpoint based on model backend
     // Kokoro: /v1/tts (the original endpoint)
@@ -546,12 +560,17 @@ STDMETHODIMP VoiceLinkEngine::Speak(
     // If available, this replaces our rough estimate for perfect timing.
     ULONGLONG serverAudioBytes = 0;
 
-    HRESULT hr = m_httpClient.StreamSynthesize(
-        jsonBody.c_str(),
-        static_cast<DWORD>(jsonBody.size()),
+    // Framed mode (server sets X-Audio-Framed): the body is a series of frames
+    //   [u32 pcmBytes][u32 textEnd][pcm...]   (little endian)
+    // where textEnd is where this sentence ends in the text we sent. Each sentence's
+    // words are then spread over that sentence's real audio, so an error can never
+    // build up over a long text, and speed needs no estimating at all.
+    bool framed = false;
+    std::vector<ULONGLONG> framedOffsets; // audio offset of each word, filled per frame
+    size_t framedKnown = 0;               // words that have an offset so far
 
-        // onChunk: called for each chunk of PCM audio from the server
-        [&](const BYTE *data, DWORD size) -> HRESULT
+    // writeAudio: volume-scales PCM, hands it to SAPI and fires the word events it reached
+    auto writeAudio = [&](const BYTE *data, DWORD size) -> HRESULT
         {
             // ---------------------------------------------------------------
             // Apply volume scaling if needed
@@ -631,10 +650,20 @@ STDMETHODIMP VoiceLinkEngine::Speak(
             // ---------------------------------------------------------------
             while (nextWordIdx < wordBoundaries.size())
             {
-                float fraction = (totalTextChars > 0)
-                                     ? static_cast<float>(wordBoundaries[nextWordIdx].charPos) / totalTextChars
-                                     : 0.0f;
-                ULONGLONG estOffset = static_cast<ULONGLONG>(fraction * estTotalAudioBytes);
+                ULONGLONG estOffset;
+                if (framed)
+                {
+                    if (nextWordIdx >= framedKnown)
+                        break; // this word's sentence hasn't arrived yet
+                    estOffset = framedOffsets[nextWordIdx];
+                }
+                else
+                {
+                    float fraction = (totalTextChars > 0)
+                                         ? static_cast<float>(wordBoundaries[nextWordIdx].charPos) / totalTextChars
+                                         : 0.0f;
+                    estOffset = static_cast<ULONGLONG>(fraction * estTotalAudioBytes);
+                }
 
                 if (estOffset <= totalBytesWritten)
                 {
@@ -677,7 +706,65 @@ STDMETHODIMP VoiceLinkEngine::Speak(
             }
 
             return S_OK;
-        },
+        };
+
+    // onChunk: called for each piece of the response body (any size, frame edges not aligned)
+    BYTE frameHdr[8];
+    DWORD frameHdrFill = 0;  // bytes of the current frame header read so far
+    DWORD frameLeft = 0;     // PCM bytes left in the current frame
+    ULONG segStartChar = 0;  // text position where the current sentence starts
+    auto onChunk = [&](const BYTE *data, DWORD size) -> HRESULT
+    {
+        if (!framed)
+            return writeAudio(data, size);
+
+        while (size > 0)
+        {
+            if (frameLeft == 0)
+            {
+                DWORD take = (std::min)(size, 8 - frameHdrFill);
+                memcpy(frameHdr + frameHdrFill, data, take);
+                frameHdrFill += take;
+                data += take;
+                size -= take;
+                if (frameHdrFill < 8)
+                    break;
+                frameHdrFill = 0;
+
+                DWORD nbytes, textEnd;
+                memcpy(&nbytes, frameHdr, 4);
+                memcpy(&textEnd, frameHdr + 4, 4);
+
+                // Words in [segStartChar, textEnd) land proportionally inside
+                // [totalBytesWritten, totalBytesWritten + nbytes) of the audio.
+                const ULONGLONG span = (textEnd > segStartChar) ? textEnd - segStartChar : 1;
+                for (; framedKnown < wordBoundaries.size() && wordBoundaries[framedKnown].extPos < textEnd; ++framedKnown)
+                {
+                    ULONG pos = wordBoundaries[framedKnown].extPos;
+                    ULONGLONG into = (pos > segStartChar) ? pos - segStartChar : 0;
+                    framedOffsets.push_back((totalBytesWritten + into * nbytes / span) & ~1ULL);
+                }
+                segStartChar = textEnd;
+                frameLeft = nbytes;
+            }
+            else
+            {
+                DWORD take = (std::min)(size, frameLeft);
+                HRESULT wr = writeAudio(data, take);
+                if (FAILED(wr))
+                    return wr;
+                data += take;
+                size -= take;
+                frameLeft -= take;
+            }
+        }
+        return S_OK;
+    };
+
+    HRESULT hr = m_httpClient.StreamSynthesize(
+        jsonBody.c_str(),
+        static_cast<DWORD>(jsonBody.size()),
+        onChunk,
 
         // checkAbort: called between chunks to see if we should stop
         [&]() -> bool
@@ -711,7 +798,8 @@ STDMETHODIMP VoiceLinkEngine::Speak(
             return false;
         },
         &serverAudioBytes,
-        endpoint);
+        endpoint,
+        &framed);
 
     // Flush any remaining word-boundary events whose estimated offset
     // exceeded the actual audio length (our estimate was too high).

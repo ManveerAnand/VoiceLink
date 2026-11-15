@@ -111,7 +111,8 @@ public:
         const std::function<HRESULT(const BYTE *data, DWORD size)> &onChunk,
         const std::function<bool()> &checkAbort,
         ULONGLONG *pTotalAudioBytes = nullptr,
-        const wchar_t *endpoint = L"/v1/tts");
+        const wchar_t *endpoint = L"/v1/tts",
+        bool *pFramed = nullptr);
 
     // -----------------------------------------------------------------------
     // IsInitialized — Check if Init() has been called successfully
@@ -126,7 +127,8 @@ private:
         const std::function<HRESULT(const BYTE *data, DWORD size)> &onChunk,
         const std::function<bool()> &checkAbort,
         ULONGLONG *pTotalAudioBytes,
-        const wchar_t *endpoint);
+        const wchar_t *endpoint,
+        bool *pFramed);
 
     HINTERNET m_hSession = nullptr; // WinHTTP session (like a browser instance)
     HINTERNET m_hConnect = nullptr; // Connection to localhost:7860
@@ -156,9 +158,11 @@ private:
 std::string JsonEscapeUtf8(const std::string &input);
 
 // Build the complete JSON body for a TTS request.
+// `framed` asks the server for per-sentence frames (see TTSRequest.framed).
 std::string BuildTtsRequestJson(const std::string &text,
                                 const std::string &voiceId,
-                                float speed);
+                                float speed,
+                                bool framed = false);
 
 // ============================================================================
 // Encoding Helpers

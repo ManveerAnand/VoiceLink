@@ -26,6 +26,7 @@
 import time
 import asyncio
 import itertools
+import struct
 from typing import Generator
 
 from fastapi import APIRouter, HTTPException, Request
@@ -70,6 +71,14 @@ class TTSRequest(BaseModel):
     format: str = Field(
         default="pcm_24k_16bit",
         description="Audio format. Currently only 'pcm_24k_16bit' is supported.",
+    )
+    framed: bool = Field(
+        default=False,
+        description=(
+            "Stream as frames, one per sentence: 4-byte little-endian PCM byte count, "
+            "4-byte end of the sentence in the text (UTF-16 units), then the PCM. "
+            "Lets the SAPI bridge time word highlighting against the real audio."
+        ),
     )
 
 
@@ -156,15 +165,23 @@ async def synthesize(request: TTSRequest):
 
     t0 = time.perf_counter()
 
-    chunk_iter = _model.synthesize(
-        text=request.text,
-        voice=request.voice,
-        speed=request.speed,
-    )
-    # A text that is one chunk is generated up front so the exact length can go
-    # in X-Audio-Length. Longer texts stream each chunk as soon as it is ready
-    # (the DLL then estimates the length from the text for word highlighting).
-    exact_length = _model.single_chunk(request.text)
+    segments = getattr(_model, "synthesize_segments", None) if request.framed else None
+    if segments:
+        chunk_iter = (
+            struct.pack("<II", len(pcm), end) + pcm
+            for end, pcm in segments(request.text, request.voice, request.speed)
+        )
+        exact_length = False
+    else:
+        chunk_iter = _model.synthesize(
+            text=request.text,
+            voice=request.voice,
+            speed=request.speed,
+        )
+        # A text that is one chunk is generated up front so the exact length can go
+        # in X-Audio-Length. Longer texts stream each chunk as soon as it is ready
+        # (a client then has to estimate the length from the text for word highlighting).
+        exact_length = _model.single_chunk(request.text)
 
     try:
         # Blocking synthesis runs in a thread so the event loop stays responsive.
@@ -187,6 +204,8 @@ async def synthesize(request: TTSRequest):
         "X-Audio-Sample-Width": "16",
         "X-Audio-Channels": "1",
     }
+    if segments:
+        headers["X-Audio-Framed"] = "1"
 
     def stream_chunks() -> Generator[bytes, None, None]:
         """Yield PCM chunks; starlette runs this generator in a threadpool."""
