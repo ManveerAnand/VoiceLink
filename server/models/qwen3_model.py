@@ -157,11 +157,24 @@ def _split_sentences(text: str) -> list[_Chunk]:
 
     return chunks if chunks else [_Chunk(text)]
 
+# The 12Hz codec makes 12.5 frames per second of audio (1920 samples at 24 kHz)
+CODEC_FPS = 12.5
+
+# Extra attempts for a built-in voice whose generation never stopped
+_RETRIES = 2
+
+
 def _estimate_max_tokens(text: str) -> int:
-    """Estimate max codec tokens for text to prevent degenerate overgeneration.
-    English speech ~12-15 chars/sec, codec at 12 Hz. Allow 3x headroom."""
-    estimated_secs = max(len(text) / 12, 2.0)
-    return min(int(estimated_secs * 12 * 3), 2048)
+    """Safety cap on codec frames for `text`.
+
+    A healthy generation stops by itself (the model emits its end-of-speech token)
+    at 10-20 characters per second of speech. This cap allows down to 8 chars/s
+    (3 for Chinese/Japanese/Korean) plus 1 s, so reaching it means the model
+    never stopped (or rambled on) and the audio is garbage.
+    """
+    cjk = sum(1 for c in text if ord(c) >= 0x2E80) > len(text) / 3
+    secs = 1.0 + len(text) / (3.0 if cjk else 8.0)
+    return min(int(secs * CODEC_FPS), 2048)
 
 # Supported languages (from Qwen3-TTS model.get_supported_languages())
 SUPPORTED_LANGUAGES = [
@@ -257,6 +270,8 @@ class Qwen3Model(TTSModel):
         self._lock = threading.Lock()      # guards loading / unloading
         self._gen_lock = threading.Lock()  # one generation at a time: the CUDA graphs are shared
         self._sample_rate = 24000  # Updated from model on load
+        self._icl_failed: set[tuple[str, str]] = set()  # (reference clip, transcript) pairs the model cannot continue
+        self.clone_downgraded = False  # set by synthesize_cloned when it had to drop the transcript
 
         # Model IDs based on tier
         if tier == "full":
@@ -370,14 +385,43 @@ class Qwen3Model(TTSModel):
             # A request came in just before the timer fired (or is still generating)
             self._reset_idle_timer()
 
+    def _generate_chunk(
+        self,
+        text: str,
+        generate: Callable[[str, int], tuple],
+        fallback: Callable[[str, int], tuple] | None = None,
+    ) -> tuple:
+        """
+        Run `generate(text, max_tokens)` until the model stops by itself.
+
+        If it runs into the cap instead, it never emitted its end-of-speech token and the
+        audio is garbage: warn, then try `fallback` (a clone without its transcript), or
+        else generate again (a built-in voice only fails by bad luck). Raises when every
+        attempt ran away.
+        """
+        max_tokens = _estimate_max_tokens(text)
+        attempts = [generate, fallback] if fallback else [generate] * (1 + _RETRIES)
+        for n, attempt in enumerate(attempts, 1):
+            wavs, sample_rate = attempt(text, max_tokens)
+            frames = round(np.asarray(wavs[0]).size / (sample_rate / CODEC_FPS))
+            if frames < max_tokens:
+                return wavs, sample_rate
+            logger.warning(
+                f"Qwen3 never stopped on a {len(text)}-char chunk (hit the {max_tokens}-frame cap, "
+                f"attempt {n}/{len(attempts)}); discarding that audio"
+            )
+        raise Qwen3Error("Qwen3 could not produce clean audio for this text. Try again or use another voice.")
+
     def _stream_chunks(
         self,
         text: str,
         generate: Callable[[str, int], tuple],
+        fallback: Callable[[str, int], tuple] | None = None,
     ) -> Generator[bytes, None, None]:
         """
         Split text into chunks, generate each with `generate(chunk_text, max_tokens)`
-        and crossfade between them for seamless audio. One generation at a time.
+        (see _generate_chunk for `fallback`) and crossfade between them for seamless
+        audio. One generation at a time.
         """
         sentences = _split_sentences(text)
         with self._gen_lock:
@@ -397,7 +441,7 @@ class Qwen3Model(TTSModel):
                     prev_tail = None
 
                 t0 = time.perf_counter()
-                wavs, sample_rate = generate(chunk.text, _estimate_max_tokens(chunk.text))
+                wavs, sample_rate = self._generate_chunk(chunk.text, generate, fallback)
                 self._sample_rate = sample_rate
                 logger.debug(f"  sentence {i+1}/{len(sentences)}: {len(chunk.text)} chars in {time.perf_counter() - t0:.2f}s")
 
@@ -481,15 +525,19 @@ class Qwen3Model(TTSModel):
         self._touch()
 
         lang = language.strip().capitalize() if language and language != "auto" else "Auto"
+        key = (ref_audio_path, ref_text)
+        self.clone_downgraded = False
+        if key in self._icl_failed:
+            xvec_only = True
         logger.info(f"Qwen3 clone TTS: ref={ref_audio_path}, xvec_only={xvec_only}, lang={lang}, text_len={len(text)}")
 
-        def generate(chunk_text: str, max_tokens: int):
+        def generate(chunk_text: str, max_tokens: int, xvec: bool = xvec_only):
             return model.generate_voice_clone(
                 text=chunk_text,
                 language=lang,
                 ref_audio=ref_audio_path,
                 ref_text=ref_text,
-                xvec_only=xvec_only,
+                xvec_only=xvec,
                 max_new_tokens=max_tokens,
                 temperature=0.6,
                 top_p=0.85,
@@ -497,8 +545,14 @@ class Qwen3Model(TTSModel):
                 repetition_penalty=1.2,
             )
 
+        def without_transcript(chunk_text: str, max_tokens: int):
+            self._icl_failed.add(key)
+            self.clone_downgraded = True
+            logger.warning("Qwen3 cannot continue from this clip and transcript (do they match?); cloning from the voice alone")
+            return generate(chunk_text, max_tokens, xvec=True)
+
         try:
-            yield from self._stream_chunks(text, generate)
+            yield from self._stream_chunks(text, generate, None if xvec_only else without_transcript)
         except Exception as e:
             logger.error(f"Qwen3 clone synthesis failed: {e}")
             raise
@@ -517,17 +571,20 @@ class Qwen3Model(TTSModel):
         logger.info(f"Qwen3 voice design: desc={description[:80]}")
 
         try:
-            with self._gen_lock:
-                wavs, sample_rate = model.generate_voice_design(
-                    text=sample_text,
+            def generate(chunk_text: str, max_tokens: int):
+                return model.generate_voice_design(
+                    text=chunk_text,
                     instruct=description,
                     language="Auto",
                     temperature=0.7,
                     top_p=0.9,
                     top_k=50,
                     repetition_penalty=1.1,
-                    max_new_tokens=_estimate_max_tokens(sample_text),
+                    max_new_tokens=max_tokens,
                 )
+
+            with self._gen_lock:
+                wavs, sample_rate = self._generate_chunk(sample_text, generate)
             self._sample_rate = sample_rate
             return self._audio_to_pcm(wavs[0])
         except Exception as e:
