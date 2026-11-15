@@ -350,6 +350,15 @@ Hello! VoiceLink is ready.</textarea
                 <div class="step-progress hidden" id="progress-qwen3"></div>
               </div>
             </div>
+            <!-- Also shown after a partial install or an interrupted removal -->
+            <div id="qwen3-remove-row" class="setting-row qwen3-remove-row hidden">
+              <div>
+                <label for="btn-remove-qwen3">Remove Qwen3</label>
+                <p class="muted">Delete the Qwen3 engine and models and go back to Kokoro only.</p>
+              </div>
+              <button id="btn-remove-qwen3" class="btn btn-danger btn-sm">Remove Qwen3&hellip;</button>
+            </div>
+            <div id="qwen3-remove-status" class="path-hint hidden" role="status" aria-live="polite"></div>
           </div>
         </div>
 
@@ -389,133 +398,187 @@ Hello! VoiceLink is ready.</textarea
 
         <div id="studio-tools">
 
-        <div class="studio-tabs">
-          <button class="studio-tab active" data-tab="clone">
+        <div class="studio-tabs" role="tablist" aria-label="Voice Studio tools">
+          <button class="studio-tab active" data-tab="clone" role="tab" aria-selected="true" aria-controls="studio-clone">
             Clone a Voice
           </button>
-          <button class="studio-tab" data-tab="design">Design a Voice</button>
-          <button class="studio-tab" data-tab="builtin">Qwen3 Voices</button>
+          <button class="studio-tab" data-tab="design" role="tab" aria-selected="false" aria-controls="studio-design">Design a Voice</button>
+          <button class="studio-tab" data-tab="builtin" role="tab" aria-selected="false" aria-controls="studio-builtin">Qwen3 Voices</button>
         </div>
 
         <!-- Clone Tab -->
-        <div id="studio-clone" class="studio-panel active">
+        <div id="studio-clone" class="studio-panel active" role="tabpanel">
           <div class="card">
             <div class="card-header"><h3>Clone a Voice</h3></div>
             <div class="card-body">
               <p class="muted">
-                Upload a short audio clip of someone speaking. Qwen3 will learn
-                their voice characteristics and create a new TTS voice. Supports
-                WAV, MP3, M4A, FLAC, OGG, and more.
+                Make a copy of a voice from a short recording. Everything runs
+                on this PC; the clip is never uploaded anywhere.
               </p>
-              <div class="clone-form">
-                <div class="setting-row">
-                  <label>Voice name</label>
-                  <input type="text" id="clone-name" placeholder="My Voice" />
+
+              <form id="clone-form" class="clone-form" novalidate>
+                <!-- 1. The recording -->
+                <div class="field">
+                  <span class="field-label" id="clone-audio-label">1. The recording</span>
+                  <div id="clone-drop" class="drop-zone" aria-labelledby="clone-audio-label">
+                    <input type="file" id="clone-audio" class="sr-only" tabindex="-1" aria-hidden="true"
+                      accept="audio/*,.wav,.mp3,.m4a,.flac,.ogg,.aac,.opus" />
+                    <button type="button" id="drop-browse" class="drop-empty">
+                      <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
+                        <path d="M12 16V4" /><polyline points="7 9 12 4 17 9" />
+                        <path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" />
+                      </svg>
+                      <strong>Drop an audio clip here</strong>
+                      <span>or click to browse &middot; WAV, MP3, M4A, FLAC, OGG</span>
+                    </button>
+                    <div id="drop-file" class="drop-file hidden">
+                      <div class="drop-file-head">
+                        <span id="drop-name" class="drop-name"></span>
+                        <span id="drop-dur" class="badge badge-muted"></span>
+                        <button type="button" id="drop-change" class="btn btn-secondary btn-sm">Choose another</button>
+                      </div>
+                      <div class="wave" id="drop-wave" aria-hidden="true">
+                        <canvas id="wave-canvas"></canvas>
+                        <div id="wave-playhead" class="wave-playhead"></div>
+                      </div>
+                      <audio id="clone-player" controls preload="metadata" aria-label="Preview the uploaded clip"></audio>
+                    </div>
+                  </div>
+                  <div id="clone-clip-check" class="clip-check hidden" role="status" aria-live="polite"></div>
+                  <ul class="tips" aria-label="What makes a good clip">
+                    <li><strong>Best: 10&ndash;20 seconds</strong> of one person speaking clearly. 3 seconds is the minimum, 60 the limit.</li>
+                    <li>Only that person: no music, no other voices, no echo or background noise.</li>
+                    <li>Natural, continuous speech in full sentences, not single words and not singing.</li>
+                  </ul>
                 </div>
-                <div class="setting-row">
-                  <label>Gender</label>
-                  <select id="clone-gender">
-                    <option value="female">Female</option>
-                    <option value="male">Male</option>
-                    <option value="unknown">Other / Unknown</option>
-                  </select>
+
+                <!-- 2. What is said -->
+                <div class="field">
+                  <label class="field-label" for="clone-transcript">
+                    2. What is said in the clip <span class="field-tag">recommended</span>
+                  </label>
+                  <textarea id="clone-transcript" rows="3" maxlength="2000"
+                    placeholder="Type exactly what the speaker says, word for word..."></textarea>
+                  <p id="clone-transcript-hint" class="field-hint" aria-live="polite"></p>
                 </div>
-                <div class="setting-row">
-                  <label>Reference audio (3s+)</label>
-                  <input type="file" id="clone-audio" accept="audio/*" />
+
+                <!-- 3. Name -->
+                <div class="field-row">
+                  <div class="field">
+                    <label class="field-label" for="clone-name">3. Name the voice</label>
+                    <input type="text" id="clone-name" maxlength="100" placeholder="My Voice" autocomplete="off" />
+                  </div>
+                  <div class="field">
+                    <label class="field-label" for="clone-gender">Gender</label>
+                    <select id="clone-gender">
+                      <option value="female">Female</option>
+                      <option value="male">Male</option>
+                      <option value="unknown">Not specified</option>
+                    </select>
+                  </div>
                 </div>
-                <div class="setting-row">
-                  <label>What is said in the audio</label>
-                  <input
-                    type="text"
-                    id="clone-transcript"
-                    placeholder="The exact words spoken in the audio..."
-                  />
-                </div>
-                <div class="setting-row">
-                  <label>Description (optional)</label>
-                  <input
-                    type="text"
-                    id="clone-description"
-                    placeholder="e.g. Warm, deep male narrator voice"
-                  />
-                </div>
+
                 <div class="clone-actions">
-                  <button id="btn-clone-create" class="btn btn-accent" disabled>
-                    <svg
-                      viewBox="0 0 24 24"
-                      width="16"
-                      height="16"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="2"
-                    >
-                      <path
-                        d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"
-                      />
-                      <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                      <line x1="12" y1="19" x2="12" y2="23" />
-                      <line x1="8" y1="23" x2="16" y2="23" />
-                    </svg>
-                    Clone Voice
+                  <button type="submit" id="btn-clone-create" class="btn btn-primary btn-lg" disabled>
+                    Clone voice
                   </button>
                 </div>
-              </div>
+                <p id="clone-form-hint" class="field-hint clone-form-hint" aria-live="polite"></p>
+
+                <!-- Shown while cloning -->
+                <div id="clone-busy" class="step-progress q3 hidden" data-state="downloading" role="status">
+                  <div class="q3-head">
+                    <div class="q3-eq" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+                    <span class="q3-state">Cloning the voice&hellip;</span>
+                    <span class="q3-meta" id="clone-busy-time"></span>
+                  </div>
+                  <div class="q3-bar busy-bar"><div class="q3-fill"></div></div>
+                  <div class="q3-text" id="clone-busy-text"></div>
+                </div>
+              </form>
             </div>
           </div>
 
-          <!-- Temp cloned voices appear here -->
-          <div id="clone-temp-voices" class="clone-temp-voices"></div>
+          <!-- New clones appear here: preview, save or discard -->
+          <div id="clone-results" class="clone-temp-voices"></div>
         </div>
 
         <!-- Design Tab -->
-        <div id="studio-design" class="studio-panel">
-          <div class="card">
+        <div id="studio-design" class="studio-panel" role="tabpanel">
+          <!-- Standard tier (or Full models not downloaded): explain and offer the switch -->
+          <div id="design-locked" class="card hidden">
             <div class="card-header">
               <h3>Design a Voice</h3>
-              <span class="badge badge-accent">1.7B only</span>
+              <span class="badge badge-accent">Full tier</span>
             </div>
-            <div class="card-body">
-              <p class="muted">
-                Describe the voice you want and Qwen3 will generate it. Requires
-                the Full (1.7B) model tier.
-              </p>
-              <div class="design-form">
-                <div class="setting-row">
-                  <label>Voice name</label>
-                  <input
-                    type="text"
-                    id="design-name"
-                    placeholder="My Designed Voice"
-                  />
-                </div>
-                <div class="setting-row">
-                  <label>Description</label>
-                  <textarea
-                    id="design-description"
-                    rows="3"
-                    placeholder="A warm female voice with a slight British accent, speaks calmly and clearly..."
-                  ></textarea>
-                </div>
-                <div class="clone-actions">
-                  <button
-                    id="btn-design-generate"
-                    class="btn btn-secondary"
-                    disabled
-                  >
-                    Generate
-                  </button>
-                  <button id="btn-design-save" class="btn btn-primary" disabled>
-                    Save to Library
-                  </button>
-                </div>
+            <div class="card-body locked-body">
+              <p><strong>Describe a voice in words and Qwen3 creates it.</strong>
+                For example &ldquo;a calm woman in her thirties with a soft British accent&rdquo;.</p>
+              <p class="muted" id="design-locked-why"></p>
+              <p class="muted" id="design-locked-note"></p>
+              <div class="clone-actions locked-actions">
+                <button type="button" id="btn-design-switch" class="btn btn-primary">Switch to Full tier</button>
+              </div>
+              <!-- Filled in by startQwen3Progress() in main.ts -->
+              <div class="step-progress hidden" id="progress-qwen3-design"></div>
+            </div>
+          </div>
+
+          <div id="design-ready">
+            <div class="card">
+              <div class="card-header">
+                <h3>Design a Voice</h3>
+                <span class="badge badge-accent">1.7B</span>
+              </div>
+              <div class="card-body">
+                <p class="muted">
+                  Describe the voice you want and Qwen3 generates it, then
+                  speaks a sample sentence so you can hear it before saving.
+                </p>
+                <form id="design-form" class="design-form" novalidate>
+                  <div class="field">
+                    <label class="field-label" for="design-description">1. Describe the voice</label>
+                    <textarea id="design-description" rows="3" maxlength="2000"
+                      placeholder="A warm female voice with a slight British accent, speaks calmly and clearly..."></textarea>
+                    <p class="field-hint">Mention gender, age, tone, pace and accent. English descriptions work best.</p>
+                    <div class="chips" id="design-examples" aria-label="Example descriptions">
+                      <button type="button" class="chip" data-text="A warm, calm woman in her thirties with a soft British accent, speaking slowly and clearly like an audiobook narrator.">Audiobook narrator</button>
+                      <button type="button" class="chip" data-text="A deep, confident man in his forties with a slight rasp, speaking at a steady pace like a documentary host.">Documentary host</button>
+                      <button type="button" class="chip" data-text="A cheerful young woman, bright and energetic, speaking quickly with a friendly American accent.">Cheerful and bright</button>
+                    </div>
+                  </div>
+                  <div class="field">
+                    <label class="field-label" for="design-sample">2. Sample sentence</label>
+                    <input type="text" id="design-sample" maxlength="500"
+                      value="Hello, this is a preview of my new voice. I hope you like how it sounds." />
+                    <p class="field-hint">What the voice says in the preview. The saved voice reuses this sentence as its reference, so use a natural, complete sentence.</p>
+                  </div>
+                  <div class="field">
+                    <label class="field-label" for="design-name">3. Name the voice</label>
+                    <input type="text" id="design-name" maxlength="100" placeholder="My Designed Voice" autocomplete="off" />
+                  </div>
+                  <div class="clone-actions">
+                    <button type="submit" id="btn-design-generate" class="btn btn-primary btn-lg" disabled>Design voice</button>
+                  </div>
+                  <p id="design-form-hint" class="field-hint clone-form-hint" aria-live="polite"></p>
+                  <div id="design-busy" class="step-progress q3 hidden" data-state="downloading" role="status">
+                    <div class="q3-head">
+                      <div class="q3-eq" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+                      <span class="q3-state">Designing the voice&hellip;</span>
+                      <span class="q3-meta" id="design-busy-time"></span>
+                    </div>
+                    <div class="q3-bar busy-bar"><div class="q3-fill"></div></div>
+                    <div class="q3-text" id="design-busy-text"></div>
+                  </div>
+                </form>
               </div>
             </div>
+            <div id="design-results" class="clone-temp-voices"></div>
           </div>
         </div>
 
         <!-- Built-in Qwen3 Voices Tab -->
-        <div id="studio-builtin" class="studio-panel">
+        <div id="studio-builtin" class="studio-panel" role="tabpanel">
           <div class="card">
             <div class="card-header"><h3>Built-in Qwen3 Voices</h3></div>
             <div class="card-body">
@@ -942,6 +1005,23 @@ Paragraph breaks (blank lines) will be preserved as natural pauses in the narrat
         </div>
       </section>
     </main>
+
+    <!-- ===== Remove Qwen3 dialog ===== -->
+    <div id="qwen3-remove-overlay" class="modal-overlay hidden">
+      <div class="modal modal-wide" role="dialog" aria-modal="true" aria-labelledby="qwen3-remove-title">
+        <h3 id="qwen3-remove-title">Remove Qwen3?</h3>
+        <p id="qwen3-remove-body" class="modal-text"></p>
+        <label class="check-row" id="qwen3-remove-voices-row">
+          <input type="checkbox" id="qwen3-remove-voices" />
+          <span id="qwen3-remove-voices-text"></span>
+        </label>
+        <p class="muted modal-note">Your Kokoro voices are not touched. You can install Qwen3 again later.</p>
+        <div class="modal-actions">
+          <button id="qwen3-remove-cancel" class="btn btn-secondary">Cancel</button>
+          <button id="qwen3-remove-ok" class="btn btn-danger">Remove Qwen3</button>
+        </div>
+      </div>
+    </div>
 
     <!-- ===== Rename Modal ===== -->
     <div id="modal-overlay" class="modal-overlay hidden">

@@ -19,6 +19,7 @@
 # the model finishes generating the entire sentence.
 # ============================================================================
 
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Generator
@@ -26,6 +27,21 @@ from typing import Generator
 
 class VoiceUnavailableError(RuntimeError):
     """The requested voice's files are not on this machine."""
+
+
+# Loading a Qwen3 model changes torch's process-wide default dtype for a while, and
+# capturing its CUDA graphs stops every other thread from using the GPU. Kokoro
+# inference running at that moment fails ("expected Float but found BFloat16"). So the
+# Qwen3 load/capture and each Kokoro inference chunk take turns on this lock.
+GPU_EXCLUSIVE_LOCK = threading.Lock()
+
+
+class Qwen3Error(RuntimeError):
+    """A Qwen3 problem the user can act on; `status_code` and the message go to the client as-is."""
+
+    def __init__(self, message: str, status_code: int = 503):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 @dataclass

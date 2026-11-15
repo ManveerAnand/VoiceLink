@@ -57,6 +57,7 @@ warnings.filterwarnings("ignore", message=".*flash.attn.*")
 warnings.filterwarnings("ignore", message=".*Torch was not compiled with flash attention.*")
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from loguru import logger
 
 from server.config import settings
@@ -88,8 +89,9 @@ def claim_port() -> "socket.socket":
 _port_sock = claim_port() if __name__ == "__main__" else None
 
 from server.models import load_model
+from server.models.base import Qwen3Error
 from server.routers.tts import router as tts_router, set_model, set_start_time
-from server.routers.qwen3 import router as qwen3_router
+from server.routers.qwen3 import router as qwen3_router, purge_unsaved_voices
 
 
 def setup_logging():
@@ -142,6 +144,8 @@ async def lifespan(app: FastAPI):
         logger.info(f"Qwen3: enabled (tier={settings.model.qwen3_tier}, lazy-loaded)")
     else:
         logger.info("Qwen3: disabled")
+
+    purge_unsaved_voices()
 
     # Load the TTS model
     t0 = time.perf_counter()
@@ -204,6 +208,12 @@ app.include_router(tts_router)
 # If Qwen3 is disabled, requests will still fail gracefully because the model
 # won't be installed. This avoids conditional import issues.
 app.include_router(qwen3_router)
+
+
+@app.exception_handler(Qwen3Error)
+async def qwen3_error_handler(request: Request, exc: Qwen3Error):
+    """Qwen3 problems the user can fix (engine missing, models not downloaded...) reach the app as a readable `detail`."""
+    return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
 
 
 @app.post("/v1/shutdown")
