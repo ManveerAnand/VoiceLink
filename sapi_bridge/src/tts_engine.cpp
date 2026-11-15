@@ -52,7 +52,8 @@ static bool HostIsChromium()
         const wchar_t *name = wcsrchr(path, L'\\');
         name = name ? name + 1 : path;
         for (const wchar_t *n : {L"msedge.exe", L"chrome.exe", L"thorium.exe", L"brave.exe",
-                                 L"vivaldi.exe", L"opera.exe", L"chromium.exe"})
+                                 L"vivaldi.exe", L"opera.exe", L"chromium.exe",
+                                 L"msedgewebview2.exe"}) // WebView2 apps (Readest, Tauri/WPF apps)
             if (_wcsicmp(name, n) == 0)
                 return true;
         return false;
