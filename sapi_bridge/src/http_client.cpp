@@ -141,7 +141,8 @@ HRESULT TtsHttpClient::StreamSynthesize(
     const std::function<HRESULT(const BYTE *data, DWORD size)> &onChunk,
     const std::function<bool()> &checkAbort,
     ULONGLONG *pTotalAudioBytes,
-    const wchar_t *endpoint)
+    const wchar_t *endpoint,
+    bool *pFramed)
 {
     if (!m_hConnect)
     {
@@ -174,7 +175,7 @@ HRESULT TtsHttpClient::StreamSynthesize(
         }
 
         lastHr = StreamSynthesizeOnce(jsonBody, jsonBodyLen, onChunk,
-                                      checkAbort, pTotalAudioBytes, endpoint);
+                                      checkAbort, pTotalAudioBytes, endpoint, pFramed);
 
         // Success or user abort: stop retrying
         if (SUCCEEDED(lastHr) || lastHr == E_ABORT)
@@ -200,7 +201,8 @@ HRESULT TtsHttpClient::StreamSynthesizeOnce(
     const std::function<HRESULT(const BYTE *data, DWORD size)> &onChunk,
     const std::function<bool()> &checkAbort,
     ULONGLONG *pTotalAudioBytes,
-    const wchar_t *endpoint)
+    const wchar_t *endpoint,
+    bool *pFramed)
 {
 
     // -----------------------------------------------------------------------
@@ -340,6 +342,17 @@ HRESULT TtsHttpClient::StreamSynthesizeOnce(
             *pTotalAudioBytes = static_cast<ULONGLONG>(_wtoi64(headerBuf));
             VLOG(L"Server reported X-Audio-Length: %llu bytes", *pTotalAudioBytes);
         }
+    }
+
+    // X-Audio-Framed: the body is per-sentence frames, not bare PCM (the server
+    // only does this when the request asked for it with "framed": true).
+    if (pFramed)
+    {
+        wchar_t framedBuf[8] = {};
+        DWORD framedBufSize = sizeof(framedBuf);
+        *pFramed = WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_CUSTOM, L"X-Audio-Framed",
+                                       framedBuf, &framedBufSize, WINHTTP_NO_HEADER_INDEX) &&
+                   framedBuf[0] == L'1';
     }
 
     if (statusCode != 200)
@@ -499,7 +512,8 @@ std::string JsonEscapeUtf8(const std::string &input)
 
 std::string BuildTtsRequestJson(const std::string &text,
                                 const std::string &voiceId,
-                                float speed)
+                                float speed,
+                                bool framed)
 {
     // Build JSON by hand. This is simple enough that a library would be
     // overkill, and we avoid adding any dependencies.
@@ -511,7 +525,8 @@ std::string BuildTtsRequestJson(const std::string &text,
     json << "{\"text\": \"" << JsonEscapeUtf8(text)
          << "\", \"voice\": \"" << JsonEscapeUtf8(voiceId)
          << "\", \"speed\": " << std::fixed << std::setprecision(2) << speed
-         << ", \"format\": \"pcm_24k_16bit\"}";
+         << ", \"format\": \"pcm_24k_16bit\""
+         << (framed ? ", \"framed\": true}" : "}");
 
     return json.str();
 }
