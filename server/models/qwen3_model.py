@@ -173,7 +173,9 @@ def _estimate_max_tokens(text: str) -> int:
     never stopped (or rambled on) and the audio is garbage.
     """
     cjk = sum(1 for c in text if ord(c) >= 0x2E80) > len(text) / 3
-    secs = 1.0 + len(text) / (3.0 if cjk else 8.0)
+    # Digits are read as whole words ("555" -> "five five five"), so weigh them more
+    size = len(text) + 4 * sum(c.isdigit() for c in text)
+    secs = 1.0 + size / (3.0 if cjk else 8.0)
     return min(int(secs * CODEC_FPS), 2048)
 
 # Supported languages (from Qwen3-TTS model.get_supported_languages())
