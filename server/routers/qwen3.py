@@ -373,7 +373,7 @@ async def qwen3_synthesize(request: Qwen3TTSRequest):
     )
 
 
-def _pcm_response(pcm: bytes, safe_name: str, name: str) -> StreamingResponse:
+def _pcm_response(pcm: bytes, safe_name: str, name: str, voice_only: bool = False) -> StreamingResponse:
     """Preview audio of a freshly created voice, as the clone/design endpoints return it."""
     return StreamingResponse(
         content=iter([pcm]),
@@ -385,6 +385,7 @@ def _pcm_response(pcm: bytes, safe_name: str, name: str) -> StreamingResponse:
             "X-Audio-Length": str(len(pcm)),
             "X-Voice-Id": f"qwen3_custom_{safe_name}",
             "X-Voice-Name": quote(name),
+            "X-Voice-Only": "1" if voice_only else "0",  # clone fell back to voice-only (transcript did not match)
         },
     )
 
@@ -502,7 +503,7 @@ async def qwen3_clone_voice(
         f"Voice cloned: {name} ({secs:.1f}s clip, {'x-vector only' if xvec_only else 'with transcript'}, "
         f"{len(preview_pcm)} bytes preview, {time.perf_counter() - t0:.1f}s)"
     )
-    return _pcm_response(preview_pcm, safe_name, name)
+    return _pcm_response(preview_pcm, safe_name, name, voice_only=xvec_only)
 
 
 def purge_unsaved_voices() -> None:

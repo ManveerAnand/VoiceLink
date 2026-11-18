@@ -2583,6 +2583,7 @@ interface NewVoice {
   pcm: Uint8Array;
   badges: string[];
   sampleText: string;
+  notice?: string; // shown under the name, e.g. why a clone is voice-only
 }
 
 /** Card for a voice that was just created: preview it right away, then save it to the library or discard it */
@@ -2596,6 +2597,7 @@ function addVoiceResult(container: HTMLElement, v: NewVoice) {
       ${v.badges.map((b) => `<span class="badge badge-warning">${escapeHtml(b)}</span>`).join("")}
       <span class="clone-temp-badge temp" data-role="state">Not saved yet</span>
     </div>
+    ${v.notice ? '<p class="field-hint" role="status"></p>' : ""}
     <div class="voice-result-play">
       <button type="button" class="btn btn-primary" data-act="preview">&#9654; Preview the new voice</button>
       <span class="muted">${seconds} s sample</span>
@@ -2610,6 +2612,8 @@ function addVoiceResult(container: HTMLElement, v: NewVoice) {
       <button type="button" class="btn btn-primary" data-act="save">Save to library</button>
     </div>`;
   container.prepend(card);
+  // Filled after the card is in the page so screen readers announce it
+  if (v.notice) card.querySelector<HTMLElement>('[role="status"].field-hint')!.textContent = v.notice;
 
   const $ = (act: string) => card.querySelector<HTMLButtonElement>(`[data-act="${act}"]`)!;
   const note = card.querySelector<HTMLElement>(".voice-result-note")!;
@@ -2805,7 +2809,7 @@ function setupCloneForm() {
   function updateState() {
     // The transcript field explains its own trade-off: with text the clone copies accent and rhythm, without it only the sound
     transcriptHint!.innerHTML = transcript!.value.trim()
-      ? "Used word for word next to the audio, so Qwen3 can match the accent and rhythm. <strong>A wrong word lowers the quality.</strong>"
+      ? "Used word for word next to the audio, so Qwen3 can match the accent and rhythm. <strong>A wrong word can break the clone, and VoiceLink then falls back to voice-only mode.</strong>"
       : "<strong>No transcript: voice-only mode.</strong> Copies the sound of the voice but less of its accent and speaking style. Fine for a quick try; type what is said for the best match.";
 
     const missing = busy ? "" : !clip ? "Add a recording to continue."
@@ -2931,7 +2935,7 @@ function setupCloneForm() {
       [120, "Still working. If this goes past five minutes, check the Dashboard that the server is running."],
     ]);
     try {
-      const pcm = await invoke<number[]>("qwen3_clone_voice", {
+      const clone = await invoke<{ pcm: number[]; voice_only: boolean }>("qwen3_clone_voice", {
         name,
         transcript: text,
         audioData: Array.from(clip.wav),
@@ -2943,9 +2947,13 @@ function setupCloneForm() {
       addVoiceResult(results, {
         voiceId: `qwen3_custom_${voiceFolderName(name)}`,
         name,
-        pcm: new Uint8Array(pcm),
-        badges: text ? ["Cloned"] : ["Cloned", "voice-only"],
+        pcm: new Uint8Array(clone.pcm),
+        badges: clone.voice_only ? ["Cloned", "voice-only"] : ["Cloned"],
         sampleText: "This is how my cloned voice sounds when it reads a new sentence.",
+        // Only when the user typed a transcript: without one, voice-only is what they asked for
+        notice: text && clone.voice_only
+          ? "Qwen3 could not follow this transcript, so this voice uses voice-only mode (the sound of the voice, less of its accent). For a closer match, check the transcript says exactly what the clip says, word for word, and clone again."
+          : undefined,
       });
       clearClip();
       nameInput.value = "";
