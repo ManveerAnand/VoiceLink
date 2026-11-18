@@ -217,12 +217,17 @@ def _load_reference(src: Path, dst: Path) -> float:
             detail=f"Could not read that audio file ({type(e).__name__}). Use a WAV, MP3, FLAC or OGG file.",
         )
     secs = len(data) / 24000
-    if secs < MIN_REF_SECONDS:
-        raise HTTPException(status_code=400, detail=f"The clip is only {secs:.1f} s long. Use at least 3 seconds of speech.")
     if secs > MAX_REF_SECONDS:
         raise HTTPException(status_code=400, detail=f"The clip is {secs:.0f} s long; the limit is {MAX_REF_SECONDS} s. 10 to 20 seconds is ideal.")
     if float(abs(data).max()) < 0.003:
         raise HTTPException(status_code=400, detail="The clip is silent or almost silent. Check the recording level.")
+    # Silence before and after the speech (every microphone recording has some) makes the
+    # cloned voice open each sentence with a long pause, so keep only 0.1 s around the speech.
+    _, (start, end) = librosa.effects.trim(data, top_db=35)
+    data = data[max(start - 2400, 0):end + 2400]
+    secs = len(data) / 24000
+    if secs < MIN_REF_SECONDS:
+        raise HTTPException(status_code=400, detail=f"The clip has only {secs:.1f} s of speech. Use at least 3 seconds of speech.")
     sf.write(str(dst), data, 24000, subtype="PCM_16")
     return secs
 
@@ -446,6 +451,17 @@ async def qwen3_clone_voice(
         wav_path = profile_dir / "reference.wav"
         secs = await asyncio.to_thread(_load_reference, upload, wav_path)
         upload.unlink(missing_ok=True)
+        # Cloning with a transcript only works when it says what the clip says; a transcript far too
+        # long or too short for the clip cannot (normal speech is 10-18 characters per second)
+        if transcript and not 3 <= len(transcript) / secs <= 20:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"The transcript has {len(transcript)} characters but the clip has {secs:.0f} s of speech "
+                    "(about 10-18 characters per second is normal). It must be exactly what is said in the clip. "
+                    "Fix it, or leave it empty to clone from the voice alone."
+                ),
+            )
 
         t0 = time.perf_counter()
         preview_pcm = await asyncio.to_thread(lambda: b"".join(model.synthesize_cloned(
@@ -456,6 +472,8 @@ async def qwen3_clone_voice(
         )))
         if not preview_pcm:
             raise HTTPException(status_code=500, detail="Qwen3 produced no audio from this clip. Try a clearer recording.")
+        if model.clone_downgraded:  # the model could not continue from the transcript, so don't use it
+            xvec_only = True
 
         meta = {
             "name": name,
