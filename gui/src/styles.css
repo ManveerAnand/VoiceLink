@@ -2101,6 +2101,19 @@ body {
   border-style: solid;
 }
 
+.mic-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+#clone-record-time {
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
 .drop-empty {
   display: flex;
   flex-direction: column;

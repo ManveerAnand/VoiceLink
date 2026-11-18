@@ -23,7 +23,7 @@ npm run tauri dev
 npm run tauri build
 ```
 
-Produces `VoiceLink_0.1.0_x64-setup.exe` in `src-tauri/target/release/bundle/nsis/`.
+Produces `VoiceLink_0.1.1_x64-setup.exe` in `src-tauri/target/release/bundle/nsis/`.
 
 ## Architecture
 

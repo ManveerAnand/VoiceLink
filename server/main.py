@@ -197,7 +197,7 @@ app = FastAPI(
         "Local TTS inference server that bridges neural text-to-speech models "
         "with Windows SAPI. Provides streaming PCM audio from models like Kokoro."
     ),
-    version="0.1.0",
+    version="0.1.1",
     lifespan=lifespan,
 )
 
