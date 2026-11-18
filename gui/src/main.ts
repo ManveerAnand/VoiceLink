@@ -2389,6 +2389,12 @@ async function downloadQwen3Models(tierOverride?: string) {
     }
   });
 
+  let serverWasRunning = false;
+  const restartServer = () => {
+    if (serverWasRunning) invoke("start_server").catch((e) => console.error("Restarting the server failed:", e));
+    serverWasRunning = false;
+  };
+
   try {
     // Get paths and tier
     const settings = await invoke<AppSettings>("get_settings");
@@ -2405,6 +2411,12 @@ async function downloadQwen3Models(tierOverride?: string) {
         program: pythonExe,
         args: ["-m", "pip", "install", "--no-warn-script-location", ...PIP_NET_ARGS, ...extra, ...packages],
       }, ui);
+
+      // pip cannot replace files the running server has open, and transformers only looks for
+      // accelerate when the server starts: stop it now and start it again once the engine is in
+      setText("Stopping the server...");
+      serverWasRunning = await invoke<{ running: boolean }>("get_server_status").then((s) => s.running, () => false);
+      if (serverWasRunning) await invoke("stop_server");
 
       // Qwen3 needs CUDA PyTorch; a setup done without GPU acceleration has the CPU build
       setText("Checking PyTorch...");
@@ -2434,6 +2446,7 @@ async function downloadQwen3Models(tierOverride?: string) {
           : `The Qwen3 engine did not install correctly: ${extractDownloadError(String(e))}`);
       });
       await invoke("qwen3_mark_runtime_installed");
+      restartServer(); // Kokoro is back while the models download
     }
     q3.done = 1;
     renderQwen3Progress();
@@ -2486,6 +2499,7 @@ async function downloadQwen3Models(tierOverride?: string) {
       setBtns("Retry Download", false);
     }
   } finally {
+    restartServer(); // after a pause or error in the engine step
     qwen3Downloading = false;
     unlisten();
   }
