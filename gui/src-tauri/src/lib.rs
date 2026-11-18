@@ -64,6 +64,13 @@ pub struct ServerStatus {
     pub health: Option<ServerHealth>,
 }
 
+/// Preview audio of a new cloned voice, plus whether it ended up voice-only (the transcript was not used)
+#[derive(Debug, Serialize)]
+pub struct CloneResult {
+    pub pcm: Vec<u8>,
+    pub voice_only: bool,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SapiStatus {
     pub registered: bool,
@@ -1190,7 +1197,7 @@ async fn qwen3_clone_voice(
     gender: String,
     description: String,
     preview_text: String,
-) -> Result<Vec<u8>, String> {
+) -> Result<CloneResult, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build()
@@ -1232,8 +1239,9 @@ async fn qwen3_clone_voice(
         return Err(server_error(status, &body));
     }
 
+    let voice_only = resp.headers().get("x-voice-only").is_some_and(|v| v == "1");
     let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-    Ok(bytes.to_vec())
+    Ok(CloneResult { pcm: bytes.to_vec(), voice_only })
 }
 
 /// Design a voice via Qwen3 from a text description (1.7B only)
