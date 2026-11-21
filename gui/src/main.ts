@@ -1578,7 +1578,7 @@ async function runSetup() {
           program: paths.python_exe,
           args: [
             "-m", "pip", "install", "--no-warn-script-location", ...PIP_NET_ARGS,
-            "torch", "--index-url", "https://download.pytorch.org/whl/cu126",
+            CUDA_TORCH, "--index-url", "https://download.pytorch.org/whl/cu126",
           ],
         });
       }
@@ -2210,6 +2210,8 @@ const Q3_STEPS: Record<string, string[]> = {
   full: ["Engine", "Tokenizer", "Base", "CustomVoice", "VoiceDesign"],
 };
 
+const CUDA_TORCH = "torch==2.14.1+cu126"; // The exact CUDA build makes pip replace an existing CPU build.
+
 // What faster-qwen3-tts needs at runtime. Bump QWEN3_RUNTIME_VERSION in lib.rs when this changes.
 // faster-qwen3-tts and qwen-tts-hf go in with --no-deps: their own dependency lists pull in
 // gradio (a demo UI with ~60 packages) and let pip swap the PyTorch build. These are the imports
@@ -2426,7 +2428,7 @@ async function downloadQwen3Models(tierOverride?: string) {
       }).then(() => true, () => false);
       if (!hasCudaTorch) {
         setText("Installing PyTorch for your GPU (large download)...");
-        await pip(["torch"], ["--index-url", "https://download.pytorch.org/whl/cu126"]);
+        await pip([CUDA_TORCH], ["--index-url", "https://download.pytorch.org/whl/cu126"]);
       }
       if (qwen3DownloadPaused) throw new Error("Paused");
 
