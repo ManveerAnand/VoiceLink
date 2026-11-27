@@ -2,7 +2,7 @@
 # VoiceLink SAPI Bridge — CMake Build
 # ============================================================================
 #
-# This builds a COM DLL that registers as a Windows SAPI TTS voice.
+# This COM DLL registers a TTS engine and voice enumerators for SAPI and OneCore.
 # When any app (Thorium Reader, Edge, Narrator) asks the voice to speak,
 # it forwards the text to our Python inference server and streams the
 # AI-generated audio back through SAPI.
@@ -54,7 +54,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # The DLL is built from these files, each with a clear responsibility:
 #
 #   dllmain.cpp         — DLL entry point + 4 COM exports + registry
-#   class_factory.cpp   — IClassFactory: creates VoiceLinkEngine instances
+#   class_factory.cpp   — IClassFactory: creates the engine or a voice enumerator
 #   tts_engine.cpp      — ISpTTSEngine: the actual TTS engine
 #   http_client.cpp     — WinHTTP wrapper for talking to inference server
 #
@@ -64,6 +64,9 @@ set(SOURCES
     src/dllmain.cpp
     src/class_factory.cpp
     src/tts_engine.cpp
+    src/token_enum.cpp
+    src/voice_data_key.cpp
+    src/voice_manifest.cpp
     src/http_client.cpp
 )
 
@@ -72,6 +75,9 @@ set(HEADERS
     src/debug.h
     src/class_factory.h
     src/tts_engine.h
+    src/token_enum.h
+    src/voice_data_key.h
+    src/voice_manifest.h
     src/http_client.h
 )
 
@@ -176,3 +182,9 @@ set_target_properties(voicelink_sapi PROPERTIES
     OUTPUT_NAME "voicelink_sapi"
     PREFIX ""  # Don't add "lib" prefix (Windows convention)
 )
+
+# Registration-free smoke test. Build explicitly with --target enum_smoke.
+add_executable(enum_smoke EXCLUDE_FROM_ALL tests/enum_smoke.cpp)
+target_include_directories(enum_smoke PRIVATE src)
+target_link_libraries(enum_smoke PRIVATE sapi ole32 oleaut32 advapi32 uuid)
+add_dependencies(enum_smoke voicelink_sapi)
