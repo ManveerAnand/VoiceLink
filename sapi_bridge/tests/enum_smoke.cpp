@@ -3,6 +3,7 @@
 #include <initguid.h>
 #include "guids.h"
 #include <sapi.h>
+#include <sperror.h>
 #include <wrl/client.h>
 #include <cstdio>
 #include <stdexcept>
@@ -86,6 +87,20 @@ void Verify(FactoryFn factoryFn, REFCLSID clsid, const wchar_t *category, ULONG 
         CHECK_HR(token->OpenKey(L"Attributes", &attrs));
         CHECK(Read(attrs.Get(), L"Name") == name);
         CHECK(Read(attrs.Get(), L"Vendor") == L"VoiceLink");
+        DWORD port = 0;
+        CHECK_HR(token->GetDWORD(L"VoiceLinkServerPort", &port));
+        CHECK(port == (custom ? 2468u : 7860u));
+        ULONG bytes = 0;
+        CHECK_HR(attrs->GetData(L"Vendor", &bytes, nullptr));
+        wchar_t vendor[10]{};
+        CHECK(bytes == sizeof(vendor));
+        CHECK_HR(attrs->GetData(L"Vendor", &bytes, reinterpret_cast<BYTE *>(vendor)));
+        CHECK(wcscmp(vendor, L"VoiceLink") == 0);
+        wchar_t *valueName{};
+        CHECK_HR(attrs->EnumValues(4, &valueName));
+        const bool lastIsVendor = wcscmp(valueName, L"Vendor") == 0;
+        CoTaskMemFree(valueName);
+        CHECK(lastIsVendor && attrs->EnumValues(5, &valueName) == SPERR_NO_MORE_ITEMS);
         CHECK(attrs->SetStringValue(L"Name", L"changed") == E_ACCESSDENIED);
         BOOL matches = FALSE;
         CHECK_HR(token->MatchesAttributes(L"Vendor=VoiceLink", &matches));
@@ -130,6 +145,10 @@ void Suite(FactoryFn fn)
     bad.Create(voices.key, L"broken");
     bad.Number(L"Name", 23);
     verifyBoth(1, true);
+    const BYTE shortVersion = 1;
+    CHECK(RegSetValueExW(root.key, L"ManifestVersion", 0, REG_DWORD, &shortVersion, 1) == ERROR_SUCCESS);
+    verifyBoth(0);
+    root.Number(L"ManifestVersion", 1);
     good.String(L"Language", L"zzzz");
     verifyBoth(0);
 }

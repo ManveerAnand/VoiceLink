@@ -137,7 +137,7 @@ std::vector<VoiceEntry> LoadVoices(DWORD &port) noexcept
         {
             DWORD configured = 0;
             if (RegGetValueW(root.handle, nullptr, L"ServerPort", RRF_RT_REG_DWORD, nullptr, &configured, &bytes) ==
-                    ERROR_SUCCESS && configured >= 1 && configured <= 65535)
+                    ERROR_SUCCESS && bytes == sizeof(configured) && configured >= 1 && configured <= 65535)
                 port = configured;
             bytes = sizeof(version);
             result = RegGetValueW(root.handle, nullptr, L"ManifestVersion", RRF_RT_REG_DWORD, nullptr, &version, &bytes);
@@ -148,7 +148,7 @@ std::vector<VoiceEntry> LoadVoices(DWORD &port) noexcept
             for (const auto &v : kBuiltinVoices)
                 voices.push_back({v.id, v.name, v.gender, v.lang, L"Adult", L"kokoro"});
         }
-        else if (result == ERROR_SUCCESS && version == 1)
+        else if (result == ERROR_SUCCESS && bytes == sizeof(version) && version == 1)
             ReadEntries(root.handle, voices);
 
         SortAndDisambiguate(voices);
