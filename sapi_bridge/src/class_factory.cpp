@@ -1,31 +1,21 @@
-// ============================================================================
-// VoiceLink SAPI Bridge — Class Factory (Implementation)
-// ============================================================================
-//
-// This is a textbook COM class factory. Its only real method is
-// CreateInstance(), which does: new VoiceLinkEngine() → QueryInterface().
-//
-// Everything else (IUnknown, LockServer) is standard boilerplate that
-// every COM DLL implements identically.
-// ============================================================================
-
 #include "class_factory.h"
 #include "tts_engine.h"
+#include "token_enum.h"
 #include "debug.h"
 
 // ============================================================================
 // Constructor / Destructor
 // ============================================================================
 
-VoiceLinkClassFactory::VoiceLinkClassFactory()
-    : m_refCount(1)
+VoiceLinkClassFactory::VoiceLinkClassFactory(Kind kind)
+    : m_kind(kind), m_refCount(1)
 {
-    VLOG(L"VoiceLinkClassFactory created");
+    InterlockedIncrement(&g_objectCount);
 }
 
 VoiceLinkClassFactory::~VoiceLinkClassFactory()
 {
-    VLOG(L"VoiceLinkClassFactory destroyed");
+    InterlockedDecrement(&g_objectCount);
 }
 
 // ============================================================================
@@ -75,46 +65,32 @@ STDMETHODIMP VoiceLinkClassFactory::CreateInstance(
     REFIID riid,
     void **ppv)
 {
-    // COM aggregation is an advanced feature where one object can appear
-    // to be part of another object. We don't support it.
-    // If pUnkOuter is non-null, the caller is trying to aggregate us.
-    if (pUnkOuter != nullptr)
-    {
-        return CLASS_E_NOAGGREGATION;
-    }
-
-    if (!ppv)
-        return E_POINTER;
+    if (!ppv) return E_POINTER;
     *ppv = nullptr;
+    if (pUnkOuter) return CLASS_E_NOAGGREGATION;
 
-    // Create the engine object
-    // The constructor sets ref count to 1
-    auto *engine = new (std::nothrow) VoiceLinkEngine();
-    if (!engine)
+    try
     {
-        VERR(L"Failed to allocate VoiceLinkEngine");
+        IUnknown *object;
+        if (m_kind == Kind::Engine)
+        {
+            object = static_cast<ISpTTSEngine *>(new VoiceLinkEngine());
+        }
+        else
+        {
+            auto *enumerator = new VoiceLinkTokenEnum();
+            enumerator->Init(m_kind == Kind::EnumSapi ? VoiceLinkTokenEnum::Category::Sapi :
+                                                        VoiceLinkTokenEnum::Category::OneCore);
+            object = enumerator;
+        }
+        HRESULT hr = object->QueryInterface(riid, ppv);
+        object->Release();
+        return hr;
+    }
+    catch (const std::bad_alloc &)
+    {
         return E_OUTOFMEMORY;
     }
-
-    // Ask the engine for the interface the caller wants.
-    // This also AddRef's the returned interface pointer.
-    HRESULT hr = engine->QueryInterface(riid, ppv);
-
-    // Release our initial reference. If QI succeeded, the object survives
-    // (ref count goes from 2 back to 1). If QI failed, this destroys it
-    // (ref count goes from 1 to 0).
-    engine->Release();
-
-    if (FAILED(hr))
-    {
-        VERR(L"VoiceLinkEngine doesn't support requested interface");
-    }
-    else
-    {
-        VLOG(L"VoiceLinkEngine instance created successfully");
-    }
-
-    return hr;
 }
 
 STDMETHODIMP VoiceLinkClassFactory::LockServer(BOOL fLock)
