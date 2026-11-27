@@ -1,6 +1,6 @@
 [package]
 name = "voicelink-gui"
-version = "0.1.0"
+version = "0.1.1"
 description = "VoiceLink — AI TTS Management App"
 authors = ["Manveer Anand"]
 edition = "2021"

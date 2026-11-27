@@ -13,7 +13,7 @@
     <nav id="sidebar">
       <div class="sidebar-header">
         <h2>VoiceLink</h2>
-        <span class="version">v0.1.0</span>
+        <span class="version">v0.1.1</span>
       </div>
       <ul class="nav-items">
         <li class="nav-item active" data-page="dashboard" id="nav-dashboard-item">
@@ -365,7 +365,7 @@ Hello! VoiceLink is ready.</textarea
         <div class="card">
           <div class="card-header"><h3>About</h3></div>
           <div class="card-body">
-            <p>VoiceLink v0.1.0</p>
+            <p>VoiceLink v0.1.1</p>
             <p class="muted">Neural TTS for Windows SAPI</p>
             <button id="btn-repair-setup" class="btn btn-secondary btn-sm" style="margin-top: 10px">
               Repair / re-run setup
@@ -441,8 +441,13 @@ Hello! VoiceLink is ready.</textarea
                         <canvas id="wave-canvas"></canvas>
                         <div id="wave-playhead" class="wave-playhead"></div>
                       </div>
-                      <audio id="clone-player" controls preload="metadata" aria-label="Preview the uploaded clip"></audio>
+                      <audio id="clone-player" controls preload="metadata" aria-label="Preview the reference clip"></audio>
                     </div>
+                  </div>
+                  <div class="mic-controls">
+                    <button type="button" id="clone-record" class="btn btn-secondary btn-sm">Record with microphone</button>
+                    <span id="clone-record-time" role="timer" aria-label="Recording time"></span>
+                    <button type="button" id="clone-record-cancel" class="btn btn-secondary btn-sm hidden">Cancel recording</button>
                   </div>
                   <div id="clone-clip-check" class="clip-check hidden" role="status" aria-live="polite"></div>
                   <ul class="tips" aria-label="What makes a good clip">

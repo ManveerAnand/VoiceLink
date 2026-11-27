@@ -1578,7 +1578,7 @@ async function runSetup() {
           program: paths.python_exe,
           args: [
             "-m", "pip", "install", "--no-warn-script-location", ...PIP_NET_ARGS,
-            "torch", "--index-url", "https://download.pytorch.org/whl/cu126",
+            CUDA_TORCH, "--index-url", "https://download.pytorch.org/whl/cu126",
           ],
         });
       }
@@ -2210,6 +2210,8 @@ const Q3_STEPS: Record<string, string[]> = {
   full: ["Engine", "Tokenizer", "Base", "CustomVoice", "VoiceDesign"],
 };
 
+const CUDA_TORCH = "torch==2.14.1+cu126"; // The exact CUDA build makes pip replace an existing CPU build.
+
 // What faster-qwen3-tts needs at runtime. Bump QWEN3_RUNTIME_VERSION in lib.rs when this changes.
 // faster-qwen3-tts and qwen-tts-hf go in with --no-deps: their own dependency lists pull in
 // gradio (a demo UI with ~60 packages) and let pip swap the PyTorch build. These are the imports
@@ -2426,7 +2428,7 @@ async function downloadQwen3Models(tierOverride?: string) {
       }).then(() => true, () => false);
       if (!hasCudaTorch) {
         setText("Installing PyTorch for your GPU (large download)...");
-        await pip(["torch"], ["--index-url", "https://download.pytorch.org/whl/cu126"]);
+        await pip([CUDA_TORCH], ["--index-url", "https://download.pytorch.org/whl/cu126"]);
       }
       if (qwen3DownloadPaused) throw new Error("Paused");
 
@@ -2793,6 +2795,9 @@ function setupCloneForm() {
   const drop = el("clone-drop");
   const fileInput = el<HTMLInputElement>("clone-audio");
   const browse = el<HTMLButtonElement>("drop-browse");
+  const recordBtn = el<HTMLButtonElement>("clone-record");
+  const cancelBtn = el<HTMLButtonElement>("clone-record-cancel");
+  const recordTime = el("clone-record-time");
   const fileBox = el("drop-file");
   const nameEl = el("drop-name");
   const durEl = el("drop-dur");
@@ -2809,10 +2814,17 @@ function setupCloneForm() {
   const formHint = el("clone-form-hint");
   const results = el("clone-results");
   if (!form || !drop || !fileInput || !browse || !fileBox || !nameEl || !durEl || !changeBtn || !canvas || !playhead
-      || !player || !check || !transcript || !transcriptHint || !nameInput || !gender || !submit || !formHint || !results) return;
+      || !player || !check || !transcript || !transcriptHint || !nameInput || !gender || !submit || !formHint || !results
+      || !recordBtn || !cancelBtn || !recordTime) return;
 
   let clip: Clip | null = null;
   let busy = false;
+  let reading = false;
+  // Keep the request identity even before permission is granted. A cancelled request
+  // can still resolve later with a live microphone that must be released.
+  type MicrophoneTake = { recorder?: MediaRecorder };
+  let take: MicrophoneTake | null = null;
+  let clock = 0;
 
   function setCheck(level: string, text: string) {
     check!.dataset.level = level;
@@ -2831,7 +2843,12 @@ function setupCloneForm() {
       : !voiceFolderName(nameInput!.value) ? "Give the voice a name (letters or numbers)."
       : "";
     formHint!.textContent = missing;
-    submit!.disabled = busy || !!missing;
+    const locked = busy || reading || !!take;
+    submit!.disabled = locked || !!missing;
+    browse!.disabled = changeBtn!.disabled = locked;
+    recordBtn!.disabled = busy || reading || (!!take && take.recorder?.state !== "recording");
+    recordBtn!.textContent = take?.recorder ? "Stop recording" : take ? "Opening microphone…" : clip ? "Record again" : "Record with microphone";
+    cancelBtn!.classList.toggle("hidden", !take);
   }
 
   function clearClip() {
@@ -2847,7 +2864,8 @@ function setupCloneForm() {
     updateState();
   }
 
-  async function loadClip(file: File) {
+  async function loadClip(file: File, fromMicrophone = false) {
+    if (busy || reading || take) return;
     if (!(file.type.startsWith("audio/") || /\.(wav|mp3|m4a|flac|ogg|aac|opus)$/i.test(file.name))) {
       setCheck("bad", "That is not an audio file. Use WAV, MP3, M4A, FLAC or OGG.");
       return;
@@ -2858,13 +2876,20 @@ function setupCloneForm() {
     }
     setCheck("", "Reading the clip...");
     check!.classList.remove("hidden");
+    reading = true;
+    updateState();
     let samples: Float32Array;
     try {
       samples = await decodeClip(file);
+      // The stop timer and the encoder can both run a little past the 60-second limit.
+      if (fromMicrophone) samples = samples.subarray(0, CLIP_MAX_S * CLONE_RATE);
     } catch (e) {
-      clearClip();
-      setCheck("bad", "VoiceLink could not read this file. Try saving it as WAV or MP3 and add it again.");
+      setCheck("bad", fromMicrophone ? "Could not read the recording. Record again or add an audio file."
+        : "VoiceLink could not read this file. Try saving it as WAV or MP3 and add it again.");
       return;
+    } finally {
+      reading = false;
+      updateState();
     }
     if (clip) URL.revokeObjectURL(clip.url);
     const verdict = judgeClip(samples);
@@ -2901,12 +2926,94 @@ function setupCloneForm() {
     updateState();
   }
 
+  function releaseMic() {
+    const recorder = take?.recorder;
+    take = null;
+    if (recorder?.state === "recording") recorder.stop();
+    recorder?.stream.getTracks().forEach(track => track.stop());
+    window.clearInterval(clock);
+    recordTime!.textContent = "";
+    updateState();
+  }
+
+  function cancelTake() {
+    if (!take) return;
+    releaseMic();
+    setCheck("", "Recording cancelled.");
+  }
+
+  recordBtn.addEventListener("click", async () => {
+    if (take?.recorder?.state === "recording") {
+      take.recorder.stop();
+      updateState();
+      return;
+    }
+    if (take || reading || busy) return;
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      setCheck("bad", "Microphone recording is unavailable here. Add an audio file instead.");
+      return;
+    }
+    const current: MicrophoneTake = {};
+    take = current;
+    player.pause();
+    stopCurrentPlayback();
+    updateState();
+    setCheck("", "Waiting for microphone access…");
+    let stream: MediaStream | undefined;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (take !== current) {
+        stream.getTracks().forEach(track => track.stop());
+        return;
+      }
+      const recorder = new MediaRecorder(stream);
+      current.recorder = recorder;
+      const parts: Blob[] = [];
+      recorder.ondataavailable = e => { if (e.data.size) parts.push(e.data); };
+      recorder.onerror = () => {
+        if (take !== current) return;
+        releaseMic();
+        setCheck("bad", "The microphone stopped working. Check the connection and record again.");
+      };
+      recorder.onstop = () => {
+        if (take !== current) return;
+        releaseMic();
+        if (parts.length) {
+          void loadClip(new File(parts, "Microphone recording", { type: parts[0].type || recorder.mimeType || "audio/webm" }), true);
+        } else {
+          setCheck("bad", "No audio was captured. Check your microphone and record again.");
+        }
+      };
+      recorder.start();
+      const started = performance.now();
+      recordTime.textContent = `0 / ${CLIP_MAX_S} s`;
+      clock = window.setInterval(() => {
+        const seconds = Math.floor((performance.now() - started) / 1000);
+        recordTime.textContent = `${Math.min(seconds, CLIP_MAX_S)} / ${CLIP_MAX_S} s`;
+        if (seconds >= CLIP_MAX_S && recorder.state === "recording") recorder.stop();
+      }, 250);
+      setCheck("", "Recording from your microphone.");
+      updateState();
+    } catch (e) {
+      stream?.getTracks().forEach(track => track.stop());
+      if (take !== current) return;
+      releaseMic();
+      const denied = e instanceof DOMException && e.name === "NotAllowedError";
+      setCheck("bad", denied ? "Microphone access was denied. Allow microphone access for VoiceLink in Windows and try again, or add an audio file."
+        : "Could not open a microphone. Check the selected Windows input device, or add an audio file.");
+    }
+  });
+  cancelBtn.addEventListener("click", cancelTake);
+  new ResizeObserver(() => { if (!form.offsetWidth) cancelTake(); }).observe(form);
+  document.addEventListener("visibilitychange", () => { if (document.hidden) cancelTake(); });
+  window.addEventListener("pagehide", cancelTake);
+
   // Choose / replace: click or keyboard on the buttons, or drop a file on the zone
   browse.addEventListener("click", () => fileInput.click());
   changeBtn.addEventListener("click", () => fileInput.click());
   fileInput.addEventListener("change", () => { const f = fileInput.files?.[0]; if (f) loadClip(f); });
   for (const type of ["dragenter", "dragover"]) {
-    drop.addEventListener(type, (e) => { e.preventDefault(); if (!busy) drop.classList.add("dragover"); });
+    drop.addEventListener(type, (e) => { e.preventDefault(); if (!browse.disabled) drop.classList.add("dragover"); });
   }
   drop.addEventListener("dragleave", (e) => { if (!drop.contains(e.relatedTarget as Node | null)) drop.classList.remove("dragover"); });
   drop.addEventListener("drop", (e) => {
@@ -2936,7 +3043,7 @@ function setupCloneForm() {
 
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
-    if (busy || !clip || clip.blocked) return;
+    if (busy || reading || take || !clip || clip.blocked) return;
     const name = nameInput.value.trim();
     const text = transcript.value.trim();
     busy = true;
